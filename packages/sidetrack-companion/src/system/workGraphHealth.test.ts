@@ -18,6 +18,8 @@ import {
   type TopicRevision,
 } from '../producers/topic-revision.js';
 import { FEATURE_SCHEMA_VERSION } from '../ranker/feature-schema.js';
+import { NAVIGATION_COMMITTED } from '../navigation/events.js';
+import { BROWSER_TIMELINE_OBSERVED } from '../timeline/events.js';
 import { fingerprintFeedbackTrainingLabels } from '../ranker/retrain.js';
 import {
   writeRecallImpressionRetrainState,
@@ -393,6 +395,197 @@ describe('work graph diagnostic candidates', () => {
     expect(row?.metrics['baseRevisionId']).toBe('topic-rev-served');
     expect(typeof row?.metrics['churnP90']).toBe('number');
     expect(row?.metrics['churnP90']).toBeGreaterThan(0);
+  });
+
+  describe('aggregator.learned-stats-shadow (learned per-node aggregator stats)', () => {
+    const AGGREGATOR_REPLICA_ID = '44444444-4444-4444-8444-444444444444';
+    const AGGREGATOR_PEER_REPLICA_ID = '55555555-5555-4555-8555-555555555555';
+
+    const nav = (input: {
+      readonly seq: number;
+      readonly visitId: string;
+      readonly canonicalUrl: string;
+      readonly openerVisitId?: string;
+      readonly commitTimestamp: number;
+    }): AcceptedEvent => ({
+      clientEventId: `nav-${input.visitId}`,
+      dot: { replicaId: AGGREGATOR_PEER_REPLICA_ID, seq: input.seq },
+      deps: {},
+      aggregateId: `visit:${input.visitId}`,
+      type: NAVIGATION_COMMITTED,
+      payload: {
+        payloadVersion: 1,
+        visitId: input.visitId,
+        url: input.canonicalUrl,
+        canonicalUrl: input.canonicalUrl,
+        documentId: `doc-${input.visitId}`,
+        parentDocumentId: null,
+        tabSessionIdHash: 'tab-a',
+        windowSessionIdHash: 'window-a',
+        openerVisitId: input.openerVisitId ?? null,
+        previousVisitId: null,
+        navigationSequence: 1,
+        transitionType: 'link',
+        transitionQualifiers: [],
+        commitTimestamp: input.commitTimestamp,
+      },
+      acceptedAtMs: input.commitTimestamp,
+    });
+
+    const timeline = (input: {
+      readonly seq: number;
+      readonly canonicalUrl: string;
+      readonly title: string;
+      readonly observedAtMs: number;
+    }): AcceptedEvent => ({
+      clientEventId: `timeline-${input.canonicalUrl}-${String(input.seq)}`,
+      dot: { replicaId: AGGREGATOR_PEER_REPLICA_ID, seq: input.seq },
+      deps: {},
+      aggregateId: `timeline:${input.canonicalUrl}:${String(input.seq)}`,
+      type: BROWSER_TIMELINE_OBSERVED,
+      payload: {
+        eventId: `timeline-${input.canonicalUrl}-${String(input.seq)}`,
+        observedAt: new Date(input.observedAtMs).toISOString(),
+        url: input.canonicalUrl,
+        canonicalUrl: input.canonicalUrl,
+        title: input.title,
+        provider: 'generic',
+        transition: 'activated',
+        payloadVersion: 1,
+      },
+      acceptedAtMs: input.observedAtMs,
+    });
+
+    it('reports agreement on a registry-covered hub, an under-reached registry-only feed page, and a learned-only hub the registry has never heard of', async () => {
+      let seq = 0;
+      const eventLog = createEventLog(vaultRoot, {
+        replicaId: AGGREGATOR_REPLICA_ID,
+        created: true,
+        nextSeq: async () => {
+          seq += 1;
+          return seq;
+        },
+        peekSeq: () => seq,
+        observeSeq: async (incoming: number) => {
+          seq = Math.max(seq, incoming);
+        },
+      });
+
+      const T0 = Date.parse('2026-05-16T15:00:00.000Z');
+      let importSeq = 0;
+      const nextSeq = (): number => {
+        importSeq += 1;
+        return importSeq;
+      };
+
+      // HN (registry-covered, ranker/aggregatorProfiles.ts hnProfile): a
+      // root visit that fans out to 8 distinct /item?id= pages. Both the
+      // registry (isItemUrl: /item + id param) and the learned classifier
+      // (reached-from-hub, low own fan-out) agree feed/item on every URL —
+      // 9 agreements.
+      await eventLog.importPeerEvent(
+        nav({ seq: nextSeq(), visitId: 'hn-root', canonicalUrl: 'https://news.ycombinator.com/', commitTimestamp: T0 }),
+      );
+      await eventLog.importPeerEvent(
+        timeline({ seq: nextSeq(), canonicalUrl: 'https://news.ycombinator.com/', title: 'Hacker News', observedAtMs: T0 + 1_000 }),
+      );
+      await eventLog.importPeerEvent(
+        timeline({ seq: nextSeq(), canonicalUrl: 'https://news.ycombinator.com/', title: 'Hacker News (updated)', observedAtMs: T0 + 2_000 }),
+      );
+      for (let index = 1; index <= 8; index += 1) {
+        await eventLog.importPeerEvent(
+          nav({
+            seq: nextSeq(),
+            visitId: `hn-item-${String(index)}`,
+            canonicalUrl: `https://news.ycombinator.com/item?id=${String(index)}`,
+            openerVisitId: 'hn-root',
+            commitTimestamp: T0 + 3_000 + index,
+          }),
+        );
+      }
+
+      // twitter.com (registry-covered, FEED_ONLY_DOMAINS — every URL is
+      // 'feed' by definition) but only ONE URL ever observed here: the
+      // learned classifier's domain-level hub gate (distinctUrlCount >= 5)
+      // never clears, so it stays the conservative 'not-aggregator' —
+      // exactly the documented "known limitation" (learned under-reaches
+      // the registry on sparse evidence). 1 registry-only disagreement.
+      await eventLog.importPeerEvent(
+        timeline({ seq: nextSeq(), canonicalUrl: 'https://twitter.com/someuser/status/1', title: 'A post', observedAtMs: T0 + 20_000 }),
+      );
+
+      // hub.test — NOT in the registry at all (classifyAggregatorPageForUrl
+      // always 'not-aggregator' here) but behaves exactly like HN: a root
+      // fanning out to 8 distinct same-domain leaves. The learned
+      // classifier calls the root 'feed' and the leaves 'item' from
+      // behavior alone — 9 learned-only disagreements, the entire point of
+      // this replacement (finding hubs the hand list doesn't cover).
+      await eventLog.importPeerEvent(
+        nav({ seq: nextSeq(), visitId: 'custom-root', canonicalUrl: 'https://hub.test/', commitTimestamp: T0 + 40_000 }),
+      );
+      await eventLog.importPeerEvent(
+        timeline({ seq: nextSeq(), canonicalUrl: 'https://hub.test/', title: 'Custom hub', observedAtMs: T0 + 40_100 }),
+      );
+      await eventLog.importPeerEvent(
+        timeline({ seq: nextSeq(), canonicalUrl: 'https://hub.test/', title: 'Custom hub (2)', observedAtMs: T0 + 40_200 }),
+      );
+      for (let index = 1; index <= 8; index += 1) {
+        await eventLog.importPeerEvent(
+          nav({
+            seq: nextSeq(),
+            visitId: `custom-item-${String(index)}`,
+            canonicalUrl: `https://hub.test/item-${String(index)}`,
+            openerVisitId: 'custom-root',
+            commitTimestamp: T0 + 41_000 + index,
+          }),
+        );
+      }
+
+      const health = await collectWorkGraphHealth({
+        vaultRoot,
+        eventLog,
+        now: () => new Date('2026-05-16T16:00:00.000Z'),
+      });
+
+      const row = health.candidates.find((c) => c.id === 'aggregator.learned-stats-shadow');
+      expect(row).toBeDefined();
+      expect(row).toEqual(
+        expect.objectContaining({
+          family: 'similarity',
+          lane: 'shadow',
+          servingImpact: 'observe-only',
+          // registryOnlyAggregatorCount > 0 (twitter.com) surfaces loudly —
+          // that direction risks resurrecting the 2026-07-10 false-friend
+          // if this shadow ever became the decider.
+          status: 'warning',
+          reason: 'learned-under-reaches-registry',
+        }),
+      );
+      expect(row?.metrics['totalClassified']).toBe(19);
+      expect(row?.metrics['agreementCount']).toBe(9);
+      expect(row?.metrics['disagreementCount']).toBe(10);
+      expect(row?.metrics['registryOnlyAggregatorCount']).toBe(1);
+      expect(row?.metrics['learnedOnlyAggregatorCount']).toBe(9);
+      expect(row?.metrics['feedVsItemDisagreementCount']).toBe(0);
+      expect(row?.metrics['agreementRate']).toBeCloseTo(9 / 19, 10);
+    });
+
+    it('reports status off with SIDETRACK_LEARNED_AGGREGATOR=0', async () => {
+      const prior = process.env['SIDETRACK_LEARNED_AGGREGATOR'];
+      process.env['SIDETRACK_LEARNED_AGGREGATOR'] = '0';
+      try {
+        const health = await collectWorkGraphHealth({
+          vaultRoot,
+          now: () => new Date('2026-05-16T16:00:00.000Z'),
+        });
+        const row = health.candidates.find((c) => c.id === 'aggregator.learned-stats-shadow');
+        expect(row).toEqual(expect.objectContaining({ status: 'off', reason: 'disabled' }));
+        expect(row?.metrics['totalClassified']).toBeNull();
+      } finally {
+        if (prior === undefined) delete process.env['SIDETRACK_LEARNED_AGGREGATOR'];
+        else process.env['SIDETRACK_LEARNED_AGGREGATOR'] = prior;
+      }
+    });
   });
 
   it('marks topic.incremental-shadow overflow=true as a warning row', async () => {
