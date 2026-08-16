@@ -1227,6 +1227,230 @@ PR: fix(store): index migration must not loop under the child watchdog
 instruction; the shipped fix targets `connections/snapshot.ts`, not an
 eventStore.ts migration, per the root-cause finding above.
 
+**2026-08-16 — SQL statement + phase budgets, CI query-plan lint
+(feat/sql-budget-plan-lint).** GUARDRAIL, not an F1–F7 item — filed here
+per the "binding plan tracks reality" rule, direct follow-up to the
+reconcile-child watchdog-loop incident above. That incident's ONLY
+signal was a 30-minute no-progress SIGKILL loop with zero attribution
+(which statement? which table? which plan?) — most of a day was spent
+finding the one `deleteOrphanEdges` call and the two triggers
+(`trg_edges_index_au`/`_ad`) actually responsible. This change is the
+standing guardrail so the SAME bug class (a missing index turning an
+O(n) operation into O(n·table_size)) surfaces in seconds-to-minutes with
+attribution, in production AND in CI, never again only via a 30-minute
+kill loop. Three independent layers, each detection/attribution only —
+none of them interrupt or kill a query (bun:sqlite has no
+`sqlite3_progress_handler` binding, and killing mid-write is its own
+risk class per the M7 hang-safety notes in
+`connectionsReconcileChildClient.ts`):
+
+1. **Statement budget (runtime).** `src/runtime/sqlBudget.ts` —
+   `budgetedStatement(db, site, sql)` drop-in-replaces `db.query(sql)`,
+   timing every `.run()`/`.all()`/`.get()` with a plain
+   `performance.now()` diff (no async, no allocation on the fast path;
+   measured overhead ~40-70ns/call, target <2µs/call, verified in
+   `sqlBudget.test.ts`). Over `SIDETRACK_SQL_BUDGET_MS` (default `1000`)
+   → one throttled `[sql.slow] ms=… site=… sql=<first 120 chars>` line
+   + a per-site counter (never silently dropped — the counter still
+   increments when the log line is throttled, so a statement stuck in a
+   tight loop, the incident's own shape, cannot flood the log but also
+   cannot hide). Over `SIDETRACK_SQL_BUDGET_HARD_MS` (default `60000`)
+   → additionally runs `EXPLAIN QUERY PLAN` for the statement on the
+   same handle, AFTER it completes, best-effort. Wired into
+   `connections/snapshot.ts` first (the incident site) at its ~13
+   hottest call sites — `replaceScopeRows`' delete-path statements
+   (including the exact `deleteOrphanEdges` from #378), the resolver
+   cache read/write, the resolver subgraph traversal reads, and the
+   projection-accumulator upserts. Other bun:sqlite-backed stores can
+   adopt incrementally — nothing in the module is connections-specific.
+
+2. **Phase budget (child).** `src/runtime/phaseBudget.ts` —
+   `checkPhaseBudgetExceeded(phaseDurations)` logs
+   `[phase.budget-exceeded] phase=… dt=… budgetMs=…` for any phase over
+   `SIDETRACK_PHASE_BUDGET_MS` (default `120000`). WIRING NOTE:
+   `connectionsMaterializer.ts` was off-limits for this change (operator
+   directive) and its `mark()` closure (the actual per-phase
+   `[connections-phase]` emitter, `buildAndWrite`, ~line 3652) formats
+   and logs inline with no shared utility to hook — so this is wired
+   into `collectMaterializerDiagnostics` in `materializerDiagnostics.ts`
+   instead, which `connectionsMaterializer.ts` already calls exactly
+   once per drain with the SAME raw `phaseDurations` array `mark()`
+   built. Trade-off, stated precisely: the alarm fires once the whole
+   drain finishes, not the instant the slow phase's own `mark()` would
+   have — acceptable because a phase wedged inside one synchronous
+   bun:sqlite call (the incident shape) can't make `mark()` fire either
+   until that call returns; the statement budget above is the layer
+   that actually alarms DURING such a phase, seconds in, from the first
+   slow statement. The existing no-progress watchdog remains the hard
+   backstop; this and the statement budget are audible-drain-failure
+   only — the log IS the alarm, never a throw, never a kill.
+
+3. **Plan lint (CI).** `src/connections/queryPlanLint.test.ts` — opens a
+   REAL `SqliteConnectionsStore(':memory:')` (the store's own
+   schema-init DDL, never hand-copied), seeds ~4,000 rows per big table
+   (`nodes`, `edges`, `edges_index` via the real triggers,
+   `connections_scope_nodes/edges`, `connections_resolver_cache`, both
+   projection-accumulator tables, `connections_applied_intervals`) so
+   SQLite's cost-based planner is honest at real-vault shape, runs
+   `ANALYZE`, then `EXPLAIN QUERY PLAN` over a 16-statement registry
+   (file:line pointers + a "how to register a new one" comment live
+   next to the array) and fails on any `SCAN <large-table>` not
+   explicitly allow-listed for that statement's own (unavoidable)
+   target. CRITICAL per the task's ask: trigger bodies are included —
+   `trg_edges_index_ai/au/ad` are extracted LIVE from `sqlite_master`
+   (never hand-copied, so they can't silently drift from production),
+   split into their individual statements, and `OLD.`/`NEW.` references
+   are substituted with a literal placeholder string
+   (`/\b(OLD|NEW)\.(\w+)/gi` → `'query-plan-lint-literal'`) so each
+   embedded statement can be EXPLAINed standalone outside a live trigger
+   firing — EXPLAIN QUERY PLAN never evaluates row content, so the
+   substituted value is irrelevant, only the resulting SQL shape
+   matters. A dedicated regression test proves the lint catches the
+   #378 bug class: it drops `idx_edges_index_src_dst` post-seed and
+   asserts `trg_edges_index_au`/`_ad` NOW report `SCAN edges_index`
+   (they don't with the index present). Ran against CURRENT main schema
+   (already carrying the #378 fix): all 16 registry entries clean, zero
+   additional unexpected scans found — `readIncidentEdgesForNodes`'s
+   `src IN (…) OR dst IN (…)` resolves via SQLite's `MULTI-INDEX OR`
+   (both `idx_edges_src`/`idx_edges_dst`), `deleteOrphanNodes`'s
+   `IN (SELECT … FROM temp_replace_nodes)` resolves via an index-driven
+   IN-operator rather than scanning `nodes` at all.
+
+Registering a new hot statement: add an entry to `HOT_STATEMENTS` in
+`queryPlanLint.test.ts` (SQL text + `sourceRef` file:line pointer +
+`allowScanTables` only for a statement's own unavoidable DELETE/UPDATE
+target) — see the comment block at the top of that file. Envs:
+`SIDETRACK_SQL_BUDGET_MS` (1000), `SIDETRACK_SQL_BUDGET_HARD_MS`
+(60000), `SIDETRACK_PHASE_BUDGET_MS` (120000) — all three re-read
+`process.env` on every call (no caching, matching
+`connectionsReconcileChildClient.ts`'s `noProgressTimeoutMs`
+convention), so tests can flip them per-case without a module reload
+and any process that mutates its own `process.env` at runtime (or is
+launched with the var already set) picks the value up immediately.
+
+PR: feat(runtime): SQL statement/phase budgets + CI query-plan lint
+(SCAN tripwire) (branch `feat/sql-budget-plan-lint`).
+
+**2026-08-16 — page-evidence embed lane rewired to F5 SQLite reads +
+audible embed failures (fix/embed-lane-f5-read).** LIVE INCIDENT: the
+test companion's embed lane logged `cycle embedded=0 failed=4 skipped=4
+... quarantined=132` every cycle for hours straight after the F5 restart
+(quarantine 12→180+ over the session), with no reason ever logged — a
+silent-failure violation of the audible-drain-failure rule regardless of
+cause.
+
+PRIME HYPOTHESIS (a legacy file-path bypass F5 left dark, mirroring the
+class of bug fixed in `recall-v2/store/backfill.ts`) was investigated and
+**NOT confirmed**: `page-content/store.ts`'s and `page-evidence/store.ts`'s
+own reads (`readPageContentExtractedPayloadForEvidence`,
+`readRawPageEvidence`, etc.) are correctly SQL-backed already, verified
+by direct reproduction against a COPY of the live test vault's
+`page-content.db`/`page-evidence.db` — `bun.com/docs/...` and other
+backlog head URLs DO have rows in both DBs with real extracted text. A
+repo-wide sweep (grepping for `by-url`/`raw/`/`chunks/` path
+constructions, direct `readdir`/`readFile` calls, and hand-rolled
+`_BAC/page-content|page-evidence` joins outside the two store modules)
+found **zero other legacy-layout readers** — F5's migration was complete;
+`page-content/store.ts`, `page-evidence/store.ts`,
+`page-evidence/bodyEvidenceQueue.ts` (a distinct, already-SQLite-adjacent
+job-queue dir, not a data bypass), and every downstream caller
+(`pageContentRoutes.ts`, `connectionsRoutes.ts`, `recall-v2/store/
+backfill.ts`, `ranker/eval/lexicalBaseline.ts`, etc.) all go through the
+exported SQLite-backed APIs.
+
+ACTUAL ROOT CAUSE (verified by direct reproduction — a probe script
+imported the real `store.ts` functions against a copy of the live DBs,
+with a stub embedder logging every invocation): `page-evidence/
+store.ts`'s `isCurrentEvidenceForEmbeddingCompletion` guard —
+```
+return record.updatedAt <= payload.extractedAt;
+```
+— compares the evidence record's `updatedAt` (bumped to the visit's
+`lastSeenAt` by `writeMetadataOnlyPageEvidence`, called from
+`ensurePageEvidenceForTimelineEntries` on EVERY timeline ensure/revisit,
+even when it only carries the existing `content` block forward
+unchanged) against `payload.extractedAt` (the FIXED original page-content
+extraction timestamp the embed lane's backlog reconstruction,
+`embedBacklogCanonicalUrl`, rebuilds every cycle). Any page revisited
+after its original capture — ordinary browsing, not a bug in itself —
+permanently pushes `updatedAt` past `extractedAt`, so this guard rejected
+the completion BEFORE the embedder was ever called, every time, even
+though the content (`contentHash`) was byte-identical. Live-vault
+evidence: 394/771 (51%) of the genuine `indexed_chunks`/`embeddingState:
+missing` backlog was blocked this way at time of investigation (SQL join
+of `page-evidence.updatedAt` against `page-content.updated_at` per URL,
+one copied-DB query); a probe with a correctly-dimensioned stub embedder
+proved the embedder was NEVER invoked for guard-blocked URLs and
+succeeded instantly for the rest — ruling out the embedder-poisoned-
+session alternative hypothesis too (no ORT fatal error in the boot log;
+`embed-lane-progress.json`'s `embeddedTotal`/`lastSuccessAtMs` show the
+lane DID succeed historically, then stopped). This guard predates F5 by
+three months (`e7bdba8b0`, 2026-05-24) — F5 didn't introduce the bug, but
+correctly reading via SQLite made the backlog large/durable enough
+(2,000+) for the pre-existing race to dominate every cycle.
+
+Fix (`page-evidence/store.ts`): `isCurrentEvidenceForEmbeddingCompletion`
+now treats `contentHash` equality as sufficient proof of "not stale" —
+content-hash match short-circuits to `true` regardless of `updatedAt`
+ordering; a hash MISMATCH still rejects exactly as before (the existing
+"stale embedding completion" test — a genuinely newer capture landing —
+still passes unmodified).
+
+Audible failures: `embedBacklogCanonicalUrl` now classifies every
+non-`embedded` outcome into a reason (`no-page-content`, `stale-guard`,
+`embed-error`, `not-persisted`); `backgroundEmbeddingLane.ts`'s `runOnce`
+accumulates a per-cycle `failedByReason`/`skippedByReason` histogram
+(new fields on `BackgroundEmbeddingCycleResult`), logs the FIRST
+occurrence of each distinct reason once (throttled — not once per
+attempt), and the cycle summary line now reads e.g. `cycle embedded=3
+failed=1 skipped=4 ... failedByReason=embed-error:1 head=...` instead of
+a bare, unexplained count. `embedCanonicalUrl`'s return type stays
+backward compatible (`'embedded' | 'skipped' | 'failed'` OR
+`{outcome, reason}`) so the ~20 existing mock-based lane tests needed no
+changes.
+
+Boot-time requeue: `requeueQuarantinedEmbeddingBacklog` (new,
+`store.ts`) runs once at boot, before the lane starts, and clears
+attempt/quarantine bookkeeping ONLY for entries whose last recorded
+failure reason is bug-caused (`stale-guard`, `not-persisted` —
+`REQUEUE_ELIGIBLE_FAILURE_REASONS`); `no-page-content` and `embed-error`
+are excluded so a genuinely-unembeddable record is never resurrected.
+Wired into `runtime/companion.ts` right before `backgroundEmbeddingLane
+.start()`.
+
+Tests added: a read-path regression in
+`backgroundEmbeddingLaneStore.test.ts` that writes real page-content +
+page-evidence via the SQLite stores, simulates a revisit (bumps
+`updatedAt` past `extractedAt` via `writeMetadataOnlyPageEvidence`), and
+asserts the record now embeds (confirmed to FAIL without the fix,
+classified `stale-guard`, before restoring it); audible-failure unit
+tests in `backgroundEmbeddingLane.test.ts` (histogram construction,
+throttled first-occurrence logging, thrown-embed classification,
+backward-compat bare-string path); requeue tests (bug-caused reasons
+cleared, genuinely-bad/unrecorded reasons left alone, one-time — a
+second sweep requeues nothing further).
+
+Verification: full page-evidence suite 73/73, page-content 52/52,
+runtime 63/63, full package suite 3440+/3449 (two consecutive full runs;
+the 2-3 failures were `http/visitsRoutes.test.ts` and `collectors/
+framework/discovery.test.ts` — both unrelated to this change and green
+in isolation, a loaded-machine flake plus a known Bun native-crash-on-
+exit at process teardown after the summary already printed).
+`typecheck`/`eslint`/`build` clean (zero new diagnostics; one pre-
+existing `no-console` warning in `store.ts`'s unrelated port-log line
+and one pre-existing unused-var warning in `companion.ts`, neither
+touched by this PR).
+
+Deviation from task framing: the prime hypothesis (a legacy file-path
+read-miss) was investigated thoroughly and explicitly ruled out with
+db-row evidence rather than assumed — the actual bug is a stale timing
+guard, not an I/O bypass. Reason-category naming reflects that (
+`stale-guard`/`not-persisted` instead of `read-miss`) while preserving
+the requested audibility/histogram/requeue shape.
+
+PR: fix(evidence): rewire embed lane to F5 SQLite stores + audible embed
+failures (branch `fix/embed-lane-f5-read`).
+
 **2026-08-16 — storage-tier in-place scoped publish, landed
 (perf/in-place-scoped-publish).** Closes the design note above. Full
 investigation, the empirical WAL-isolation spikes, and every design

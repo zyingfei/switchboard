@@ -69,11 +69,27 @@ export interface BackgroundEmbeddingLaneDeps {
    *   - 'embedded' — a vector was written (backlog shrank by one),
    *   - 'skipped'  — no content payload available to embed (leave for a
    *                  later cycle; do not count as a failure),
-   *   - 'failed'   — the embed threw (record it so we back off).
+   *   - 'failed'   — the embed did not land a ready vector (record it so
+   *                  we back off).
+   * 'skipped'/'failed' MAY be returned as `{outcome, reason}` instead of
+   * the bare string — `reason` is a free-form category string (e.g.
+   * 'no-page-content', 'stale-guard', 'embed-error') that the lane
+   * accumulates into a per-cycle histogram and logs once per distinct
+   * reason (throttled — see AUDIBLE FAILURES below). Plain-string returns
+   * remain fully supported (reason is simply absent from the histogram);
+   * this keeps the interface backward compatible for callers that don't
+   * classify failures.
    * MUST be resilient: a throw is caught by the lane and treated as
    * 'failed' (worker-failure -> skip, never inline crash).
    */
-  readonly embedCanonicalUrl: (canonicalUrl: string) => Promise<'embedded' | 'skipped' | 'failed'>;
+  readonly embedCanonicalUrl: (
+    canonicalUrl: string,
+  ) => Promise<
+    | 'embedded'
+    | 'skipped'
+    | 'failed'
+    | { readonly outcome: 'skipped' | 'failed'; readonly reason: string }
+  >;
   /** True while a connections drain is running. The lane pauses (does
    *  no embed work) whenever this returns true. */
   readonly isDrainActive: () => boolean;
@@ -163,6 +179,12 @@ export interface BackgroundEmbeddingProgress {
    *  the first success. Surfaces "is this lane actually doing anything?"
    *  so a silently-inert lane is visible instead of a 90-min mystery. */
   readonly lastSuccessAtMs?: number | null;
+  /** canonicalUrl -> reason of its most recent 'failed' outcome. Cleared
+   *  on success. AUDIBLE FAILURES (2026-08-16): this is what lets a boot-
+   *  time sweep tell a bug-caused quarantine (safe to requeue) apart from
+   *  a genuinely-unembeddable record (must stay quarantined) — see
+   *  page-evidence/store.ts's `requeueQuarantinedEmbeddingBacklog`. */
+  readonly lastFailureReasonByCanonicalUrl?: Record<string, string>;
 }
 
 const emptyProgress = (): BackgroundEmbeddingProgress => ({
@@ -172,6 +194,7 @@ const emptyProgress = (): BackgroundEmbeddingProgress => ({
   embeddedTotal: 0,
   lastRunAtMs: null,
   lastSuccessAtMs: null,
+  lastFailureReasonByCanonicalUrl: {},
 });
 
 /** A record is backlog IFF it carries content but has no ready vector.
@@ -200,6 +223,16 @@ export interface BackgroundEmbeddingCycleResult {
    *  not yet warm. Distinct from pausedForDrain so operators can tell a
    *  warmup wait from a drain yield. */
   readonly pausedForWarmup: boolean;
+  /** Per-cycle count of 'failed' outcomes by reason category (e.g.
+   *  `{ 'stale-guard': 3, 'embed-error': 1 }`). AUDIBLE FAILURES
+   *  (2026-08-16): the cycle used to report only a bare `failed=N` count
+   *  with no indication why — this is the structured form of the
+   *  `failedByReason=...` field on the cycle log line. Empty when no
+   *  reason-classified failures occurred (including when the embedder
+   *  dep doesn't classify at all). */
+  readonly failedByReason: Readonly<Record<string, number>>;
+  /** Same as `failedByReason` for 'skipped' outcomes. */
+  readonly skippedByReason: Readonly<Record<string, number>>;
 }
 
 /** Operator-facing lane health. Surfaced on /v1/status so a silently
@@ -295,6 +328,33 @@ export const createBackgroundEmbeddingLane = (
   // cooldown still gives it periodic fresh shots.
   const skipStrikes = new Map<string, number>();
   const SKIP_STRIKE_LIMIT = 8;
+  // AUDIBLE FAILURES: log the FIRST occurrence of each distinct reason
+  // category immediately (one line, with the URL) so an operator sees WHY
+  // the moment it starts happening, then throttle — every cycle's summary
+  // line already carries the per-reason COUNT (failedByReason=...), so a
+  // per-attempt line for every subsequent occurrence would just be noise.
+  // Process-lifetime set (like skipStrikes): a reason logged once in this
+  // process stays logged.
+  const seenFailureReasons = new Set<string>();
+
+  const normalizeAttemptResult = (
+    raw: Awaited<ReturnType<BackgroundEmbeddingLaneDeps['embedCanonicalUrl']>>,
+  ): { readonly outcome: 'embedded' | 'skipped' | 'failed'; readonly reason: string | undefined } =>
+    typeof raw === 'string'
+      ? { outcome: raw, reason: undefined }
+      : { outcome: raw.outcome, reason: raw.reason };
+
+  const bumpReasonCount = (histogram: Map<string, number>, reason: string): void => {
+    histogram.set(reason, (histogram.get(reason) ?? 0) + 1);
+  };
+
+  const histogramToRecord = (histogram: Map<string, number>): Record<string, number> =>
+    Object.fromEntries(histogram.entries());
+
+  const formatHistogram = (histogram: Map<string, number>): string =>
+    [...histogram.entries()]
+      .map(([reason, count]) => `${reason}:${String(count)}`)
+      .join(',');
 
   const loadProgressOnce = async (): Promise<void> => {
     if (progressLoaded) return;
@@ -341,6 +401,8 @@ export const createBackgroundEmbeddingLane = (
       quarantined: 0,
       pausedForDrain: false,
       pausedForWarmup: false,
+      failedByReason: {},
+      skippedByReason: {},
     };
     // Pause hard while a drain runs — the drain thread must never
     // contend with embedding CPU (existential CPU regime).
@@ -369,6 +431,7 @@ export const createBackgroundEmbeddingLane = (
     const nowMs = now();
     const attempts = { ...progress.attemptsByCanonicalUrl };
     const quarantinedAt = { ...(progress.quarantinedAtMsByCanonicalUrl ?? {}) };
+    const lastFailureReason = { ...(progress.lastFailureReasonByCanonicalUrl ?? {}) };
     let quarantined = 0;
     const backlog = candidates.filter((candidate) => {
       if (!isBackgroundEmbeddingBacklog(candidate)) return false;
@@ -404,6 +467,23 @@ export const createBackgroundEmbeddingLane = (
     let embedded = 0;
     let skipped = 0;
     let failed = 0;
+    const failedByReason = new Map<string, number>();
+    const skippedByReason = new Map<string, number>();
+    // AUDIBLE FAILURES: log the reason a record is offered a fresh attempt
+    // (skip-strike graduation) using its most recently seen reason too, so
+    // the eventual quarantine has a reason attached even though skips
+    // themselves never call the 'failed' branch below.
+    const recordReason = (canonicalUrl: string, reason: string | undefined): void => {
+      if (reason === undefined) {
+        delete lastFailureReason[canonicalUrl];
+        return;
+      }
+      lastFailureReason[canonicalUrl] = reason;
+      if (!seenFailureReasons.has(reason)) {
+        seenFailureReasons.add(reason);
+        log(`[page-evidence.embed-lane] first occurrence of reason=${reason} url=${canonicalUrl}`);
+      }
+    };
     for (const candidate of backlog) {
       // VISIT-counted cap: successes + failures + reconstruction skips all
       // consume the cap. A features-only record requires a real page-content
@@ -424,6 +504,8 @@ export const createBackgroundEmbeddingLane = (
           quarantined,
           pausedForDrain: true,
           pausedForWarmup: false,
+          failedByReason: histogramToRecord(failedByReason),
+          skippedByReason: histogramToRecord(skippedByReason),
         };
         progress = {
           schemaVersion: 1,
@@ -432,16 +514,20 @@ export const createBackgroundEmbeddingLane = (
           embeddedTotal: progress.embeddedTotal + embedded,
           lastRunAtMs: nowMs,
           lastSuccessAtMs: embedded > 0 ? nowMs : (progress.lastSuccessAtMs ?? null),
+          lastFailureReasonByCanonicalUrl: lastFailureReason,
         };
         embeddedThisProcess += embedded;
         await persistProgress();
         return recordHealth(partial, embedded > 0 ? 'embedded' : 'paused-drain');
       }
       let outcome: 'embedded' | 'skipped' | 'failed';
+      let reason: string | undefined;
       try {
-        outcome = await deps.embedCanonicalUrl(candidate.canonicalUrl);
+        const raw = await deps.embedCanonicalUrl(candidate.canonicalUrl);
+        ({ outcome, reason } = normalizeAttemptResult(raw));
       } catch (error) {
         outcome = 'failed';
+        reason = 'threw';
         log(
           `[page-evidence.embed-lane] embed threw for ${candidate.canonicalUrl}: ${
             error instanceof Error ? error.message : String(error)
@@ -452,6 +538,7 @@ export const createBackgroundEmbeddingLane = (
         embedded += 1;
         delete attempts[candidate.canonicalUrl];
         delete quarantinedAt[candidate.canonicalUrl];
+        delete lastFailureReason[candidate.canonicalUrl];
         skipStrikes.delete(candidate.canonicalUrl);
         try {
           deps.onEmbedded?.(candidate.canonicalUrl);
@@ -460,6 +547,8 @@ export const createBackgroundEmbeddingLane = (
         }
       } else if (outcome === 'failed') {
         failed += 1;
+        bumpReasonCount(failedByReason, reason ?? 'unknown');
+        recordReason(candidate.canonicalUrl, reason ?? 'unknown');
         const nextAttempts = (attempts[candidate.canonicalUrl] ?? 0) + 1;
         attempts[candidate.canonicalUrl] = nextAttempts;
         if (nextAttempts >= maxAttempts && quarantinedAt[candidate.canonicalUrl] === undefined) {
@@ -473,9 +562,11 @@ export const createBackgroundEmbeddingLane = (
         // and is handed to the attempt/quarantine machinery so it stops
         // occupying a batch slot forever. The cooldown still re-offers it.
         skipped += 1;
+        bumpReasonCount(skippedByReason, reason ?? 'unknown');
         const strikes = (skipStrikes.get(candidate.canonicalUrl) ?? 0) + 1;
         if (strikes >= SKIP_STRIKE_LIMIT) {
           skipStrikes.delete(candidate.canonicalUrl);
+          recordReason(candidate.canonicalUrl, reason ?? 'unknown');
           const nextAttempts = (attempts[candidate.canonicalUrl] ?? 0) + 1;
           attempts[candidate.canonicalUrl] = nextAttempts;
           if (nextAttempts >= maxAttempts && quarantinedAt[candidate.canonicalUrl] === undefined) {
@@ -495,6 +586,7 @@ export const createBackgroundEmbeddingLane = (
       embeddedTotal: progress.embeddedTotal + embedded,
       lastRunAtMs: nowMs,
       lastSuccessAtMs: embedded > 0 ? nowMs : (progress.lastSuccessAtMs ?? null),
+      lastFailureReasonByCanonicalUrl: lastFailureReason,
     };
     await persistProgress();
     // Success-without-progress: embeds this cycle but the backlog did not
@@ -512,12 +604,20 @@ export const createBackgroundEmbeddingLane = (
         .slice(0, 3)
         .map((candidate) => candidate.canonicalUrl)
         .join(' | ');
+      // AUDIBLE FAILURES: failedByReason/skippedByReason turn a bare
+      // `failed=4 skipped=4` (the 2026-08-16 incident's silent cycle line —
+      // zero indication why) into a reason-attributed histogram, e.g.
+      // `failedByReason=stale-guard:3,embed-error:1`.
       log(
         `[page-evidence.embed-lane] cycle embedded=${String(embedded)} failed=${String(
           failed,
         )} skipped=${String(skipped)} backlog=${String(backlog.length)} quarantined=${String(
           quarantined,
-        )}${noProgressCycles > 0 ? ` noProgress=${String(noProgressCycles)}` : ''} head=${sample}`,
+        )}${noProgressCycles > 0 ? ` noProgress=${String(noProgressCycles)}` : ''}${
+          failedByReason.size > 0 ? ` failedByReason=${formatHistogram(failedByReason)}` : ''
+        }${
+          skippedByReason.size > 0 ? ` skippedByReason=${formatHistogram(skippedByReason)}` : ''
+        } head=${sample}`,
       );
     }
     const cycleTag: BackgroundEmbeddingLaneHealth['lastCycle'] =
@@ -538,6 +638,8 @@ export const createBackgroundEmbeddingLane = (
         quarantined,
         pausedForDrain: false,
         pausedForWarmup: false,
+        failedByReason: histogramToRecord(failedByReason),
+        skippedByReason: histogramToRecord(skippedByReason),
       },
       cycleTag,
     );

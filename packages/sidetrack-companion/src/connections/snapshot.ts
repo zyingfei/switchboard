@@ -44,6 +44,7 @@ import { FEATURE_SCHEMA_VERSION, type CandidatePairFeatures } from '../ranker/fe
 import { extractFeatures } from '../ranker/features.js';
 import type { Candidate, CandidateSource } from '../ranker/types.js';
 import { yieldToEventLoop } from '../runtime/eventLoopYield.js';
+import { budgetedStatement } from '../runtime/sqlBudget.js';
 import { projectSnippetLineage } from '../snippets/projection.js';
 import type { AcceptedEvent, RegisterProjection } from '../sync/causal.js';
 import type { MaterializerProgress } from '../sync/contract/materializerProgress.js';
@@ -5736,9 +5737,13 @@ export class SqliteConnectionsStore implements ConnectionsStore {
     for (let index = 0; index < batches.length; index += 1) {
       const batch = batches[index]!;
       if (batch.length === 0) continue;
-      const rows = db
-        .query(`SELECT data FROM nodes WHERE id IN (${placeholdersFor(batch.length)})`)
-        .all(...batch);
+      // SQL budget (2026-08-16 incident, layer 1) — resolver subgraph read,
+      // called on every BFS hop of every resolve/traversal.
+      const rows = budgetedStatement(
+        db,
+        'connections.readNodesByIds.select',
+        `SELECT data FROM nodes WHERE id IN (${placeholdersFor(batch.length)})`,
+      ).all(...batch);
       for (const row of rows) {
         const node = JSON.parse(textField(row, 'data')) as ConnectionNode;
         out.set(node.id, node);
@@ -5764,9 +5769,13 @@ export class SqliteConnectionsStore implements ConnectionsStore {
       const batch = batches[index]!;
       if (batch.length === 0) continue;
       const placeholders = placeholdersFor(batch.length);
-      const rows = db
-        .query(`SELECT data FROM edges WHERE src IN (${placeholders}) OR dst IN (${placeholders})`)
-        .all(...batch, ...batch);
+      // SQL budget (2026-08-16 incident, layer 1) — resolver subgraph read,
+      // the UNBOUNDED incident-edge fetch on every BFS hop.
+      const rows = budgetedStatement(
+        db,
+        'connections.readIncidentEdgesForNodes.select',
+        `SELECT data FROM edges WHERE src IN (${placeholders}) OR dst IN (${placeholders})`,
+      ).all(...batch, ...batch);
       for (const row of rows) {
         for (const edge of JSON.parse(textField(row, 'data')) as ConnectionEdge[]) {
           out.set(edge.id, edge);
@@ -5794,15 +5803,18 @@ export class SqliteConnectionsStore implements ConnectionsStore {
     for (const batch of chunked(uniqueNodeIds, SQLITE_IN_CLAUSE_CHUNK_SIZE)) {
       if (batch.length === 0) continue;
       const placeholders = placeholdersFor(batch.length);
-      const rows = db
-        .query(
-          `SELECT node, COUNT(*) AS cnt FROM (
+      // SQL budget (2026-08-16 incident, layer 1) — hub-degree precheck,
+      // gates every BFS hop's choice between the unbounded and capped
+      // incident-edge reads.
+      const rows = budgetedStatement(
+        db,
+        'connections.readIncidentEdgeDegrees.select',
+        `SELECT node, COUNT(*) AS cnt FROM (
              SELECT src AS node FROM edges WHERE src IN (${placeholders})
              UNION ALL
              SELECT dst AS node FROM edges WHERE dst IN (${placeholders})
            ) GROUP BY node`,
-        )
-        .all(...batch, ...batch);
+      ).all(...batch, ...batch);
       for (const row of rows) {
         if (!isRecord(row)) continue;
         const node = row['node'];
@@ -6214,7 +6226,11 @@ export class SqliteConnectionsStore implements ConnectionsStore {
     // resolve — the caller already has the computed result and will serve it.
     try {
       const db = await this.#resolverCacheDatabase();
-      db.query(
+      // SQL budget (2026-08-16 incident, layer 1) — resolver-cache write,
+      // on the served-resolve hot path (D3).
+      budgetedStatement(
+        db,
+        'connections.cacheResolverResult.upsert',
         `INSERT INTO connections_resolver_cache
           (visit_id, snapshot_revision, result_json, computed_at)
          VALUES (?, ?, ?, ?)
@@ -6250,13 +6266,16 @@ export class SqliteConnectionsStore implements ConnectionsStore {
     // (null) so the caller computes the result inline rather than 500ing.
     try {
       const db = await this.#resolverCacheDatabase();
-      const row = db
-        .query(
-          `SELECT result_json
+      // SQL budget (2026-08-16 incident, layer 1) — resolver-cache read, on
+      // the served-resolve hot path (D3): every uncached resolve reaches
+      // here first.
+      const row = budgetedStatement(
+        db,
+        'connections.getCachedResolverResult.select',
+        `SELECT result_json
            FROM connections_resolver_cache
            WHERE visit_id = ? AND snapshot_revision = ?`,
-        )
-        .get(visitId, snapshotRevision);
+      ).get(visitId, snapshotRevision);
       this.#scheduleResolverCachePrune(snapshotRevision);
       if (row === null || row === undefined) return null;
       return JSON.parse(textField(row, 'result_json')) as unknown;
@@ -7250,7 +7269,17 @@ export class SqliteConnectionsStore implements ConnectionsStore {
         `INSERT OR IGNORE INTO temp_replace_new_edges (edge_src, edge_dst)
          VALUES (?, ?)`,
       );
-      const deleteScopeNodes = db.query(
+      // SQL budget (2026-08-16 incident, layer 1) — these four statements
+      // are replaceScopeRows' delete path, the exact neighborhood of the
+      // #378 deleteOrphanEdges hang (trg_edges_index_au/ad fire per row
+      // touched here). Wrapped so a future regression (e.g. a dropped
+      // index, or a new trigger with the same missing-index shape) alarms
+      // within SIDETRACK_SQL_BUDGET_MS instead of silently reintroducing a
+      // 30-minute hang. See queryPlanLint.test.ts for the registry entries
+      // covering these same statements + the triggers they fire.
+      const deleteScopeNodes = budgetedStatement(
+        db,
+        'connections.replaceScopeRows.deleteScopeNodes',
         `DELETE FROM connections_scope_nodes
          WHERE EXISTS (
            SELECT 1
@@ -7259,7 +7288,9 @@ export class SqliteConnectionsStore implements ConnectionsStore {
              AND s.scope_id = connections_scope_nodes.scope_id
          )`,
       );
-      const deleteScopeEdges = db.query(
+      const deleteScopeEdges = budgetedStatement(
+        db,
+        'connections.replaceScopeRows.deleteScopeEdges',
         `DELETE FROM connections_scope_edges
          WHERE EXISTS (
            SELECT 1
@@ -7268,7 +7299,9 @@ export class SqliteConnectionsStore implements ConnectionsStore {
              AND s.scope_id = connections_scope_edges.scope_id
          )`,
       );
-      const deleteOrphanNodes = db.query(
+      const deleteOrphanNodes = budgetedStatement(
+        db,
+        'connections.replaceScopeRows.deleteOrphanNodes',
         `DELETE FROM nodes
          WHERE id IN (SELECT node_id FROM temp_replace_nodes)
            AND NOT EXISTS (
@@ -7277,7 +7310,12 @@ export class SqliteConnectionsStore implements ConnectionsStore {
              WHERE c.node_id = nodes.id
            )`,
       );
-      const deleteOrphanEdges = db.query(
+      // THE incident statement (see this module's / sqlBudget.ts's header):
+      // fires trg_edges_index_ad once per row deleted from `edges`, which
+      // scans `edges_index` in full without idx_edges_index_src_dst.
+      const deleteOrphanEdges = budgetedStatement(
+        db,
+        'connections.replaceScopeRows.deleteOrphanEdges',
         `DELETE FROM edges
          WHERE EXISTS (
            SELECT 1
@@ -7942,7 +7980,14 @@ export class SqliteConnectionsStore implements ConnectionsStore {
     db: SqliteDatabase,
     write: ConnectionsProjectionAccumulatorWrite,
   ): void {
-    const upsertMetadata = db.query(
+    // SQL budget (2026-08-16 incident, layer 1) — these upserts run once per
+    // dirty key on EVERY drain (a scoped delta can touch thousands), so this
+    // is one of the highest call-volume statement groups in the store. See
+    // sqlBudget.ts's header for why the wrapper is designed to be near-free
+    // on the fast path.
+    const upsertMetadata = budgetedStatement(
+      db,
+      'connections.persistProjectionAccumulatorWrite.upsertMetadata',
       'INSERT INTO metadata (key, data) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET data = excluded.data',
     );
     const progress: ConnectionsProjectionAccumulatorProgress = {
@@ -7953,7 +7998,9 @@ export class SqliteConnectionsStore implements ConnectionsStore {
     };
     upsertMetadata.run(projectionAccumulatorMetadataKey(write.materializerName), JSON.stringify(progress));
 
-    const upsertUrlRow = db.query(
+    const upsertUrlRow = budgetedStatement(
+      db,
+      'connections.persistProjectionAccumulatorWrite.upsertUrlRow',
       `INSERT INTO connections_projection_url_accumulator (canonical_url, record_json, cursor_json)
        VALUES (?, ?, ?)
        ON CONFLICT(canonical_url) DO UPDATE SET
@@ -7972,7 +8019,9 @@ export class SqliteConnectionsStore implements ConnectionsStore {
       upsertUrlRow.run(key, JSON.stringify(record), cursor === undefined ? null : JSON.stringify(cursor));
     };
 
-    const upsertTabRow = db.query(
+    const upsertTabRow = budgetedStatement(
+      db,
+      'connections.persistProjectionAccumulatorWrite.upsertTabRow',
       `INSERT INTO connections_projection_tabsession_accumulator (tab_session_id, record_json)
        VALUES (?, ?)
        ON CONFLICT(tab_session_id) DO UPDATE SET record_json = excluded.record_json`,
@@ -8364,7 +8413,14 @@ export class SqliteConnectionsStore implements ConnectionsStore {
     // O(1) path: edges_index maps edge_id -> (src, dst), so we read only that
     // one bucket via the (src, dst) primary key instead of scanning every
     // edge bucket. The index is auto-maintained by triggers (see #database).
-    const idxRow = db.query('SELECT src, dst FROM edges_index WHERE edge_id = ?').get(edgeId);
+    // SQL budget (2026-08-16 incident, layer 1) — same edges_index table as
+    // the incident; a regression here would show up as this lookup itself
+    // going slow, not just the delete-side trigger cascade.
+    const idxRow = budgetedStatement(
+      db,
+      'connections.readEdgeInner.edgesIndexLookup',
+      'SELECT src, dst FROM edges_index WHERE edge_id = ?',
+    ).get(edgeId);
     if (idxRow !== null && idxRow !== undefined) {
       const bucketRow = db
         .query('SELECT data FROM edges WHERE src = ? AND dst = ?')

@@ -15,6 +15,7 @@ import { join } from 'node:path';
 import { appendHealthHistory } from './healthHistory.js';
 
 import { ENGAGEMENT_SESSION_AGGREGATED } from '../engagement/events.js';
+import { checkPhaseBudgetExceeded } from '../runtime/phaseBudget.js';
 import { TAB_SESSION_ATTRIBUTION_INFERRED } from '../tabsession/events.js';
 import {
   USER_ORGANIZED_ITEM,
@@ -905,6 +906,14 @@ export const collectMaterializerDiagnostics = (
 ): MaterializerDiagnostics => {
   const eventCounters = collectEventCounters(input.events);
   const latency = collectLatencyCounters(input.phaseDurations);
+  // Runtime guardrail (2026-08-16 incident, layer 2/3) — see
+  // runtime/phaseBudget.ts's header for why this lives here rather than in
+  // connectionsMaterializer.ts's `mark()`. `input.phaseDurations` is the
+  // SAME raw per-phase array `mark()` built for this drain; a phase whose
+  // dt exceeded SIDETRACK_PHASE_BUDGET_MS logs `[phase.budget-exceeded]`
+  // here, once, right after the drain's phases are all in. Never throws,
+  // never affects the returned diagnostics.
+  checkPhaseBudgetExceeded(input.phaseDurations);
   return {
     schemaVersion: MATERIALIZER_DIAGNOSTICS_SCHEMA_VERSION,
     producedAt: input.producedAt,
