@@ -57,7 +57,7 @@ import {
   countRenderedSimilarityFamilyEdges,
 } from '../../connections/renderedSimilarityFloor.js';
 import type {
-  ConnectionsProjectionAccumulatorState,
+  ConnectionsProjectionAccumulatorWrite,
   ConnectionsStore,
 } from '../../connections/snapshot.js';
 import {
@@ -365,8 +365,7 @@ import {
   deserializeTabSessionProjectionAccumulator,
   foldEventIntoTabSessionProjectionAccumulator,
   seedTabSessionProjectionAccumulatorAsync,
-  serializeTabSessionProjectionAccumulator,
-  serializeTabSessionProjection,
+  tabSessionProjectionAccumulatorKeysForEvent,
   tabSessionProjectionFromAccumulator,
   type TabSessionProjectionAccumulator,
 } from '../../tabsession/projection.js';
@@ -376,8 +375,7 @@ import {
   deserializeUrlProjectionAccumulator,
   foldEventIntoUrlProjectionAccumulator,
   seedUrlProjectionAccumulatorAsync,
-  serializeUrlProjectionAccumulator,
-  serializeUrlProjection,
+  urlProjectionAccumulatorKeyForEvent,
   urlProjectionFromAccumulator,
   type UrlProjectionAccumulator,
 } from '../../urls/projection.js';
@@ -1548,29 +1546,80 @@ export const createConnectionsMaterializer = (
   let tabSessionAccumulator: TabSessionProjectionAccumulator =
     createEmptyTabSessionProjectionAccumulator();
   let projectionAccumulatorsInitialized = false;
-  const serializeProjectionAccumulatorState = (
+  // F4 (blob diet) — dirty-key tracking. foldEventTrackingProjectionAccumulators
+  // (below) is the ONLY place that should fold an event into
+  // urlAccumulator/tabSessionAccumulator outside a cold reseed: it mirrors the
+  // fold itself with urlProjectionAccumulatorKeyForEvent /
+  // tabSessionProjectionAccumulatorKeysForEvent so every touched key is
+  // recorded here. consumeProjectionAccumulatorWrite (below) drains these
+  // sets into the write the store persists, so a scoped drain upserts
+  // O(touched keys) rows instead of re-serializing the whole accumulator
+  // (was: two full-state JSON blobs, tens of MB, rewritten every drain
+  // regardless of delta size — the "catch-up blob pacing" this replaced used
+  // to skip 4 of every 5 chunk writes specifically to survive that cost;
+  // delta-sized writes make the skip unnecessary, so every chunk persists
+  // now and a resume never needs to re-fold a skipped window).
+  let dirtyProjectionCanonicalUrls = new Set<string>();
+  let dirtyProjectionTabSessionIds = new Set<string>();
+  let dirtyProjectionOpenTabIdHashes = new Set<string>();
+  // True until the accumulators are (re)seeded from a cold/full pass, or a
+  // persisted-row reuse load lands — the very first write after either must
+  // replace the stored rows wholesale, since a dirty-set from before it
+  // cannot describe what the seed/load just built.
+  let projectionAccumulatorFullRewritePending = true;
+  const foldEventTrackingProjectionAccumulators = (event: AcceptedEvent): void => {
+    foldEventIntoUrlProjectionAccumulator(urlAccumulator, event);
+    foldEventIntoTabSessionProjectionAccumulator(tabSessionAccumulator, event);
+    const urlKey = urlProjectionAccumulatorKeyForEvent(event);
+    if (urlKey !== undefined) dirtyProjectionCanonicalUrls.add(urlKey);
+    const tabKeys = tabSessionProjectionAccumulatorKeysForEvent(event);
+    if (tabKeys !== undefined) {
+      dirtyProjectionTabSessionIds.add(tabKeys.sessionId);
+      if (tabKeys.tabIdHash !== undefined) dirtyProjectionOpenTabIdHashes.add(tabKeys.tabIdHash);
+    }
+  };
+  // Build the write for the persist about to happen. Returns `commit`,
+  // which the caller MUST invoke only after the store call succeeds: it
+  // removes exactly the keys this write included from the live dirty sets.
+  // A write that never commits (throws, or the caller skips persisting)
+  // leaves its keys in place — plus anything a concurrent onAccepted fold
+  // added meanwhile — so the NEXT attempt naturally retries them from the
+  // still-correct in-memory accumulator. No key can go unpersisted forever:
+  // it is only forgotten once a write that included it actually commits.
+  const consumeProjectionAccumulatorWrite = (
     progress: MaterializerProgress,
-  ): ConnectionsProjectionAccumulatorState => ({
-    materializerName: MATERIALIZER_NAME,
-    materializerVersion: MATERIALIZER_VERSION,
-    appliedDotIntervals: progress.appliedDotIntervals,
-    appliedFrontier: progress.appliedFrontier,
-    urlAccumulator: serializeUrlProjectionAccumulator(urlAccumulator),
-    tabSessionAccumulator: serializeTabSessionProjectionAccumulator(tabSessionAccumulator),
-  });
-  // Catch-up blob pacing: serializing + upserting the accumulator blob on
-  // EVERY chunk write is part of the drain's disk duty cycle (the blob is
-  // tens of MB; real captures measured 14-33s queued behind an unpaced
-  // drain). During chunk rounds only every 5th chunk persists it — a
-  // resume then re-folds at most 4 chunks' windows (~14ms per 5000
-  // events), which the blob-reuse fast path absorbs. Non-chunk drains are
-  // unchanged (always persist).
-  const chunkProjectionAccumulatorStateFor = (
-    progress: MaterializerProgress,
-  ): { projectionAccumulatorState?: ConnectionsProjectionAccumulatorState } =>
-    !requireScopedTimelineDeltaForDrain || catchUpChunkCounter % 5 === 0
-      ? { projectionAccumulatorState: serializeProjectionAccumulatorState(progress) }
-      : {};
+  ): { readonly write: ConnectionsProjectionAccumulatorWrite; readonly commit: () => void } => {
+    const base = {
+      materializerName: MATERIALIZER_NAME,
+      materializerVersion: MATERIALIZER_VERSION,
+      appliedDotIntervals: progress.appliedDotIntervals,
+      appliedFrontier: progress.appliedFrontier,
+      urlAccumulator,
+      tabSessionAccumulator,
+    };
+    if (projectionAccumulatorFullRewritePending) {
+      return {
+        write: { ...base, dirty: { mode: 'full' } },
+        commit: () => {
+          projectionAccumulatorFullRewritePending = false;
+          dirtyProjectionCanonicalUrls.clear();
+          dirtyProjectionTabSessionIds.clear();
+          dirtyProjectionOpenTabIdHashes.clear();
+        },
+      };
+    }
+    const canonicalUrls = new Set(dirtyProjectionCanonicalUrls);
+    const tabSessionIds = new Set(dirtyProjectionTabSessionIds);
+    const openTabIdHashes = new Set(dirtyProjectionOpenTabIdHashes);
+    return {
+      write: { ...base, dirty: { mode: 'delta', canonicalUrls, tabSessionIds, openTabIdHashes } },
+      commit: () => {
+        for (const key of canonicalUrls) dirtyProjectionCanonicalUrls.delete(key);
+        for (const key of tabSessionIds) dirtyProjectionTabSessionIds.delete(key);
+        for (const key of openTabIdHashes) dirtyProjectionOpenTabIdHashes.delete(key);
+      },
+    };
+  };
   const tryLoadProjectionAccumulatorState = async (
     progress: MaterializerProgress | null,
   ): Promise<boolean> => {
@@ -1616,6 +1665,12 @@ export const createConnectionsMaterializer = (
     urlAccumulator = deserializeUrlProjectionAccumulator(state.urlAccumulator);
     tabSessionAccumulator = deserializeTabSessionProjectionAccumulator(state.tabSessionAccumulator);
     projectionAccumulatorsInitialized = true;
+    // F4 (blob diet) — the reused rows are BY CONSTRUCTION already in sync
+    // with the store (the frontier/intervals equality check above just
+    // proved it), so the next write only needs whatever gets folded from
+    // here forward — no reason to pay a full rewrite just because this
+    // process never wrote before.
+    projectionAccumulatorFullRewritePending = false;
     return true;
   };
   const incrementalGraphView = createIncrementalConnectionsGraphView();
@@ -1639,9 +1694,6 @@ export const createConnectionsMaterializer = (
   // reconciles memberships honestly.
   let catchUpDeferredThreadReconcile = false;
   let forceFullRebuildForThreadReconcile = false;
-  // Chunk counter for catch-up blob pacing (see
-  // chunkProjectionAccumulatorStateFor). Reset per chunked catch-up.
-  let catchUpChunkCounter = 0;
   // F8 W3 — the hot-rebuild suppressor (#364) that used to live here
   // (lastFullBaseRebuildAtMs / searchVisitRowsDeferred /
   // searchRebuildCoalesceMs, a once-per-cooldown healing full rebuild) is
@@ -3365,12 +3417,15 @@ export const createConnectionsMaterializer = (
       // overwritten with our stale snapshot.
       progress: input.existingProgress,
       progressMode: 'snapshot-revision-only',
-      metadata: {
-        ...(scopedSnapshot.urlProjection === undefined
-          ? {}
-          : { urlProjection: scopedSnapshot.urlProjection }),
-        tabSessionProjection: scopedSnapshot.tabSessionProjection,
-      },
+      // F4 (blob diet) — no metadata.urlProjection/tabSessionProjection and
+      // no projectionAccumulatorWrite here: this UI-latency overlay reuses
+      // the CURRENT (unmodified) tabSessionProjection/urlProjection to build
+      // scopedSnapshot's rows — it folds no new event into either
+      // accumulator, so it has nothing new to persist into the
+      // projection-accumulator row tables. The row tables (and hence
+      // `current`'s derived projection) are left exactly as the last real
+      // drain/overlay wrote them, which is what this call already reused as
+      // its own input.
     });
     input.mark(
       `foregroundNavigationDelta scopes=${String(rowLocalScopes.length)} nodes=${String(scopedSnapshot.nodes.length)} edges=${String(scopedSnapshot.edges.length)} entries=${String(scopedTimelineDays.reduce((sum, day) => sum + day.entries.length, 0))} nav=${String(scopedNavigationEvents.length)}`,
@@ -3908,12 +3963,14 @@ export const createConnectionsMaterializer = (
       renderedSimilarityFamilyEdgeCountWritten =
         countRenderedSimilarityFamilyEdges(snapshotToWrite);
       const progress = progressForDrainSnapshot(snapshotToWrite);
+      const projectionWrite = consumeProjectionAccumulatorWrite(progress);
       await deps.store.writeSnapshotAndProgress(
         snapshotToWrite,
         progress,
         dirtyScopesForWrite,
-        serializeProjectionAccumulatorState(progress),
+        projectionWrite.write,
       );
+      projectionWrite.commit();
       lastFrontier = progress.appliedFrontier;
     };
     await writeForegroundNavigationDelta({
@@ -3946,12 +4003,19 @@ export const createConnectionsMaterializer = (
         tabSessionAccumulator = await seedTabSessionProjectionAccumulatorAsync(merged);
       }
       projectionAccumulatorsInitialized = true;
+      // F4 (blob diet) — a fresh/cold reseed just rebuilt both accumulators
+      // from scratch; no per-drain dirty-set (there wasn't one folding
+      // during the seed) can describe that, so the next persisted write
+      // must replace every row wholesale.
+      projectionAccumulatorFullRewritePending = true;
+      dirtyProjectionCanonicalUrls.clear();
+      dirtyProjectionTabSessionIds.clear();
+      dirtyProjectionOpenTabIdHashes.clear();
       mark('projectionAccumulators.seed');
     }
     if (loadedProjectionAccumulatorState || forcedPendingEventWindow !== null) {
       for (const event of [...pendingEventsForDrain].sort(compareAcceptedEventOrder)) {
-        foldEventIntoUrlProjectionAccumulator(urlAccumulator, event);
-        foldEventIntoTabSessionProjectionAccumulator(tabSessionAccumulator, event);
+        foldEventTrackingProjectionAccumulators(event);
       }
       mark(`projectionAccumulators.resumeFold events=${String(pendingEventsForDrain.length)}`);
     }
@@ -7450,19 +7514,18 @@ export const createConnectionsMaterializer = (
           );
           await yieldToEventLoop();
           const progress = progressForDrainSnapshot(scopedSnapshot);
+          const projectionWrite = consumeProjectionAccumulatorWrite(progress);
           await replaceScopeRowsForScopedDelta({
             scopes: rowLocalScopes,
             nodes: scoped.nodes,
             edges: scoped.edges,
             progress,
-            ...chunkProjectionAccumulatorStateFor(progress),
-            metadata: {
-              ...(scopedSnapshot.urlProjection === undefined
-                ? {}
-                : { urlProjection: scopedSnapshot.urlProjection }),
-              tabSessionProjection: scopedSnapshot.tabSessionProjection,
-            },
+            // F4 (blob diet) — no metadata.urlProjection/tabSessionProjection:
+            // projectionAccumulatorWrite already persists the equivalent
+            // content into the projection-accumulator row tables.
+            projectionAccumulatorWrite: projectionWrite.write,
           });
+          projectionWrite.commit();
           lastFrontier = progress.appliedFrontier;
           baseSnapshot = (await deps.store.readCurrent()) ?? scopedSnapshot;
           incrementalGraphView.seed(baseSnapshot);
@@ -7484,17 +7547,20 @@ export const createConnectionsMaterializer = (
         !scopesOwnGraphRows(previousSnapshotForScopedDelta, dirtyScopes)
       ) {
         const progress = progressForDrainSnapshot(previousSnapshotForScopedDelta);
+        const projectionWrite = consumeProjectionAccumulatorWrite(progress);
         await replaceScopeRowsForScopedDelta({
           scopes: dirtyScopes,
           nodes: [],
           edges: [],
           progress,
-          ...chunkProjectionAccumulatorStateFor(progress),
-          metadata: {
-            urlProjection: serializeUrlProjection(urlProjection),
-            tabSessionProjection: serializeTabSessionProjection(tabSessionProjection),
-          },
+          // F4 (blob diet) — no metadata.urlProjection/tabSessionProjection:
+          // projectionAccumulatorWrite already persists the equivalent
+          // content into the projection-accumulator row tables; the store
+          // derives `current`'s served projection from those rows on read
+          // (see #selfHealProjections in snapshot.ts).
+          projectionAccumulatorWrite: projectionWrite.write,
         });
+        projectionWrite.commit();
         lastFrontier = progress.appliedFrontier;
         baseSnapshot = (await deps.store.readCurrent()) ?? previousSnapshotForScopedDelta;
         incrementalGraphView.seed(baseSnapshot);
@@ -7528,17 +7594,20 @@ export const createConnectionsMaterializer = (
           dirtyScopes.map((scope) => recomputeScope(scope, previousSnapshotForScopedDelta)),
         );
         const progress = progressForDrainSnapshot(previousSnapshotForScopedDelta);
+        const projectionWrite = consumeProjectionAccumulatorWrite(progress);
         await replaceScopeRowsForScopedDelta({
           scopes: dirtyScopes,
           nodes: scoped.nodes,
           edges: scoped.edges,
           progress,
-          ...chunkProjectionAccumulatorStateFor(progress),
-          metadata: {
-            urlProjection: serializeUrlProjection(urlProjection),
-            tabSessionProjection: serializeTabSessionProjection(tabSessionProjection),
-          },
+          // F4 (blob diet) — no metadata.urlProjection/tabSessionProjection:
+          // projectionAccumulatorWrite already persists the equivalent
+          // content into the projection-accumulator row tables; the store
+          // derives `current`'s served projection from those rows on read
+          // (see #selfHealProjections in snapshot.ts).
+          projectionAccumulatorWrite: projectionWrite.write,
         });
+        projectionWrite.commit();
         lastFrontier = progress.appliedFrontier;
         baseSnapshot = (await deps.store.readCurrent()) ?? previousSnapshotForScopedDelta;
         incrementalGraphView.seed(baseSnapshot);
@@ -7562,17 +7631,20 @@ export const createConnectionsMaterializer = (
         // write (no node/edge rows change; #writeProgressRows persists the
         // chunk's dots + frontier) and serve the prior snapshot unchanged.
         const progress = progressForDrainSnapshot(previousSnapshotForScopedDelta);
+        const projectionWrite = consumeProjectionAccumulatorWrite(progress);
         await replaceScopeRowsForScopedDelta({
           scopes: [],
           nodes: [],
           edges: [],
           progress,
-          ...chunkProjectionAccumulatorStateFor(progress),
-          metadata: {
-            urlProjection: serializeUrlProjection(urlProjection),
-            tabSessionProjection: serializeTabSessionProjection(tabSessionProjection),
-          },
+          // F4 (blob diet) — no metadata.urlProjection/tabSessionProjection:
+          // projectionAccumulatorWrite already persists the equivalent
+          // content into the projection-accumulator row tables; the store
+          // derives `current`'s served projection from those rows on read
+          // (see #selfHealProjections in snapshot.ts).
+          projectionAccumulatorWrite: projectionWrite.write,
         });
+        projectionWrite.commit();
         lastFrontier = progress.appliedFrontier;
         baseSnapshot = (await deps.store.readCurrent()) ?? previousSnapshotForScopedDelta;
         incrementalGraphView.seed(baseSnapshot);
@@ -7622,17 +7694,20 @@ export const createConnectionsMaterializer = (
         // rebuilds from the complete event log; the graph is merely stale for
         // the remainder of the catch-up.
         const progress = progressForDrainSnapshot(previousSnapshotForScopedDelta);
+        const projectionWrite = consumeProjectionAccumulatorWrite(progress);
         await replaceScopeRowsForScopedDelta({
           scopes: [],
           nodes: [],
           edges: [],
           progress,
-          ...chunkProjectionAccumulatorStateFor(progress),
-          metadata: {
-            urlProjection: serializeUrlProjection(urlProjection),
-            tabSessionProjection: serializeTabSessionProjection(tabSessionProjection),
-          },
+          // F4 (blob diet) — no metadata.urlProjection/tabSessionProjection:
+          // projectionAccumulatorWrite already persists the equivalent
+          // content into the projection-accumulator row tables; the store
+          // derives `current`'s served projection from those rows on read
+          // (see #selfHealProjections in snapshot.ts).
+          projectionAccumulatorWrite: projectionWrite.write,
         });
+        projectionWrite.commit();
         lastFrontier = progress.appliedFrontier;
         baseSnapshot = (await deps.store.readCurrent()) ?? previousSnapshotForScopedDelta;
         incrementalGraphView.seed(baseSnapshot);
@@ -7690,17 +7765,20 @@ export const createConnectionsMaterializer = (
         replaceScopeRowsForScopedDelta !== undefined
       ) {
         const progress = progressForDrainSnapshot(previousSnapshotForScopedDelta);
+        const projectionWrite = consumeProjectionAccumulatorWrite(progress);
         await replaceScopeRowsForScopedDelta({
           scopes: [],
           nodes: [],
           edges: [],
           progress,
-          ...chunkProjectionAccumulatorStateFor(progress),
-          metadata: {
-            urlProjection: serializeUrlProjection(urlProjection),
-            tabSessionProjection: serializeTabSessionProjection(tabSessionProjection),
-          },
+          // F4 (blob diet) — no metadata.urlProjection/tabSessionProjection:
+          // projectionAccumulatorWrite already persists the equivalent
+          // content into the projection-accumulator row tables; the store
+          // derives `current`'s served projection from those rows on read
+          // (see #selfHealProjections in snapshot.ts).
+          projectionAccumulatorWrite: projectionWrite.write,
         });
+        projectionWrite.commit();
         lastFrontier = progress.appliedFrontier;
         baseSnapshot = (await deps.store.readCurrent()) ?? previousSnapshotForScopedDelta;
         incrementalGraphView.seed(baseSnapshot);
@@ -7853,19 +7931,18 @@ export const createConnectionsMaterializer = (
           dirtyScopes.map((scope) => recomputeScope(scope, baseSnapshot)),
         );
         const progress = progressForDrainSnapshot(baseSnapshot);
+        const projectionWrite = consumeProjectionAccumulatorWrite(progress);
         await deps.store.replaceScopeRows!({
           scopes: dirtyScopes,
           nodes: scoped.nodes,
           edges: scoped.edges,
           progress,
-          ...chunkProjectionAccumulatorStateFor(progress),
-          metadata: {
-            ...(baseSnapshot.urlProjection === undefined
-              ? {}
-              : { urlProjection: baseSnapshot.urlProjection }),
-            tabSessionProjection: baseSnapshot.tabSessionProjection,
-          },
+          // F4 (blob diet) — no metadata.urlProjection/tabSessionProjection:
+          // projectionAccumulatorWrite already persists the equivalent
+          // content into the projection-accumulator row tables.
+          projectionAccumulatorWrite: projectionWrite.write,
         });
+        projectionWrite.commit();
         lastFrontier = progress.appliedFrontier;
         wroteScopeIncremental = true;
         mark(
@@ -8982,8 +9059,7 @@ export const createConnectionsMaterializer = (
       // applyProjectionEventOverlay isn't deduped against
       // appliedDotIntervals.
       if (PROJECTION_OVERLAY_HANDLES.has(event.type) && projectionAccumulatorsInitialized) {
-        foldEventIntoUrlProjectionAccumulator(urlAccumulator, event);
-        foldEventIntoTabSessionProjectionAccumulator(tabSessionAccumulator, event);
+        foldEventTrackingProjectionAccumulators(event);
       }
       if (handlesContentLaneOnly) {
         scheduleContentOnlyProgressAdvance(event);
@@ -9008,8 +9084,7 @@ export const createConnectionsMaterializer = (
     // first buildAndWrite seeds the accumulators from the log; we
     // detect that via the initialized flag.
     if (projectionAccumulatorsInitialized) {
-      foldEventIntoUrlProjectionAccumulator(urlAccumulator, event);
-      foldEventIntoTabSessionProjectionAccumulator(tabSessionAccumulator, event);
+      foldEventTrackingProjectionAccumulators(event);
     }
     scheduleProjectionOverlay(event);
     scheduleForegroundNavigationOverlay(event);
@@ -9023,6 +9098,14 @@ export const createConnectionsMaterializer = (
     projectionAccumulatorsInitialized = false;
     urlAccumulator = createEmptyUrlProjectionAccumulator();
     tabSessionAccumulator = createEmptyTabSessionProjectionAccumulator();
+    // F4 (blob diet) — a reset discards any dirty-set the accumulators had
+    // been tracking (moot: they're empty again anyway) and forces the next
+    // persisted write to replace every row wholesale once the accumulators
+    // are reseeded.
+    projectionAccumulatorFullRewritePending = true;
+    dirtyProjectionCanonicalUrls.clear();
+    dirtyProjectionTabSessionIds.clear();
+    dirtyProjectionOpenTabIdHashes.clear();
     incrementalGraphView.reset();
     lastEngagementClassRevision = undefined;
     lastRankerProducerRevision = undefined;
@@ -9095,7 +9178,6 @@ export const createConnectionsMaterializer = (
       } finally {
         catchUpPendingEventWindow = null;
         requireScopedTimelineDeltaForDrain = false;
-        catchUpChunkCounter += 1;
         requestBunMemoryRelease();
       }
       lastSuccessAt = new Date().toISOString();

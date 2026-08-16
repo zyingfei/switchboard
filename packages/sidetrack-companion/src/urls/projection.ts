@@ -469,6 +469,35 @@ export const foldEventIntoUrlProjectionAccumulator = (
   foldUrlIgnoredIntoAccumulator(acc, event);
 };
 
+// F4 (blob diet) — pure key derivation MIRRORING the fold guards above
+// (event-type + payload-shape + itemKind/action checks), used only to build
+// a per-drain "dirty canonical URL" set so the store can persist an
+// O(delta) row write instead of re-serializing the whole accumulator. Keep
+// in lockstep with the four fold*IntoAccumulator functions above: any event
+// that mutates `acc.records`/`acc.observationCursors` must have a matching
+// branch here, or that row update would go unpersisted.
+export const urlProjectionAccumulatorKeyForEvent = (event: AcceptedEvent): string | undefined => {
+  if (event.type === BROWSER_TIMELINE_OBSERVED) {
+    if (!isBrowserTimelineObservedPayload(event.payload)) return undefined;
+    const canonical = event.payload.canonicalUrl ?? event.payload.url;
+    return typeof canonical === 'string' && canonical.length > 0 ? canonical : undefined;
+  }
+  if (event.type === USER_ORGANIZED_ITEM) {
+    if (!isUserOrganizedItemPayload(event.payload)) return undefined;
+    const payload = event.payload;
+    return payload.itemKind === 'canonical-url' && payload.action === 'move'
+      ? payload.itemId
+      : undefined;
+  }
+  if (event.type === URL_ATTRIBUTION_INFERRED) {
+    return isUrlAttributionInferredPayload(event.payload) ? event.payload.canonicalUrl : undefined;
+  }
+  if (event.type === URL_IGNORED) {
+    return isUrlIgnoredPayload(event.payload) ? event.payload.canonicalUrl : undefined;
+  }
+  return undefined;
+};
+
 export const seedUrlProjectionAccumulator = (
   events: readonly AcceptedEvent[],
 ): UrlProjectionAccumulator => {

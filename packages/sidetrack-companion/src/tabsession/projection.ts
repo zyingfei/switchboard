@@ -282,6 +282,43 @@ export const foldEventIntoTabSessionProjectionAccumulator = (
   foldInferredSessionAttributionIntoAccumulator(acc, event);
 };
 
+// F4 (blob diet) — pure key derivation MIRRORING the fold guards above, used
+// only to build a per-drain "dirty" key set so the store can persist an
+// O(delta) row write instead of re-serializing the whole accumulator.
+// `tabIdHash` is included whenever an observed event carries one — the fold
+// may SET or DELETE that tabIdHash's `openSessionsByTabId` entry depending
+// on `transition`/`closedAt`; the caller doesn't need to know which, it just
+// re-reads whatever `acc.openSessionsByTabId.get(tabIdHash)` currently holds
+// at persist time (present → upsert, absent → delete). Keep in lockstep with
+// the three fold*IntoAccumulator functions above: any event that mutates
+// `acc.records`/`acc.openSessionsByTabId` must have a matching branch here.
+export const tabSessionProjectionAccumulatorKeysForEvent = (
+  event: AcceptedEvent,
+): { readonly sessionId: string; readonly tabIdHash?: string } | undefined => {
+  if (event.type === BROWSER_TIMELINE_OBSERVED) {
+    if (!isBrowserTimelineObservedPayload(event.payload)) return undefined;
+    const payload = event.payload;
+    if (payload.tabSessionId === undefined || payload.tabSessionId.length === 0) return undefined;
+    return {
+      sessionId: payload.tabSessionId,
+      ...(payload.tabIdHash === undefined ? {} : { tabIdHash: payload.tabIdHash }),
+    };
+  }
+  if (event.type === USER_ORGANIZED_ITEM) {
+    if (!isUserOrganizedItemPayload(event.payload)) return undefined;
+    const payload = event.payload;
+    return payload.itemKind === 'tab-session' && payload.action === 'move'
+      ? { sessionId: payload.itemId }
+      : undefined;
+  }
+  if (event.type === TAB_SESSION_ATTRIBUTION_INFERRED) {
+    return isTabSessionAttributionInferredPayload(event.payload)
+      ? { sessionId: event.payload.tabSessionId }
+      : undefined;
+  }
+  return undefined;
+};
+
 /**
  * Stage 5.2 W2c — full-pass seed. Sorts events by event-order and
  * folds them all. Equivalent to projectTabSessions(events) → state.

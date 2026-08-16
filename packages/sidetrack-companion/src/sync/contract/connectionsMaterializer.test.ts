@@ -1525,6 +1525,17 @@ describe('connectionsMaterializer (Class B, consumer-only)', () => {
         );
         for (const node of input.nodes) nodes.set(node.id, node);
         for (const edge of input.edges) edges.set(edge.id, edge);
+        // F4 (blob diet) — replaceScopeRows no longer carries
+        // urlProjection/tabSessionProjection in a `metadata` param; this
+        // fake mimics the real store by deriving them from
+        // projectionAccumulatorWrite's live accumulators instead (the real
+        // store persists the same content into the projection-accumulator
+        // row tables and self-heals `current`'s served projection from
+        // those rows on read — see snapshot.ts's #selfHealProjections /
+        // #deriveProjectionsFromRows). Undefined (the foreground-nav
+        // overlay path) leaves the projection unchanged, matching the
+        // real store's "nothing new to persist" behavior there.
+        const write = input.projectionAccumulatorWrite;
         currentSnapshot = {
           scope: {},
           ...(currentSnapshot ?? {}),
@@ -1533,12 +1544,21 @@ describe('connectionsMaterializer (Class B, consumer-only)', () => {
           nodeCount: nodes.size,
           edgeCount: edges.size,
           updatedAt: currentSnapshot?.updatedAt ?? '1970-01-01T00:00:00.000Z',
-          ...(input.metadata?.urlProjection === undefined
+          ...(write === undefined
             ? {}
-            : { urlProjection: input.metadata.urlProjection }),
-          ...(input.metadata?.tabSessionProjection === undefined
-            ? {}
-            : { tabSessionProjection: input.metadata.tabSessionProjection }),
+            : {
+                urlProjection: {
+                  schemaVersion: 1,
+                  byCanonicalUrl: Object.fromEntries(write.urlAccumulator.records),
+                },
+                tabSessionProjection: {
+                  schemaVersion: 1,
+                  bySessionId: Object.fromEntries(write.tabSessionAccumulator.records),
+                  openSessionsByTabId: Object.fromEntries(
+                    write.tabSessionAccumulator.openSessionsByTabId,
+                  ),
+                },
+              }),
         };
         currentProgress = input.progress;
       },
@@ -1796,6 +1816,17 @@ describe('connectionsMaterializer (Class B, consumer-only)', () => {
         );
         for (const node of input.nodes) nodes.set(node.id, node);
         for (const edge of input.edges) edges.set(edge.id, edge);
+        // F4 (blob diet) — replaceScopeRows no longer carries
+        // urlProjection/tabSessionProjection in a `metadata` param; this
+        // fake mimics the real store by deriving them from
+        // projectionAccumulatorWrite's live accumulators instead (the real
+        // store persists the same content into the projection-accumulator
+        // row tables and self-heals `current`'s served projection from
+        // those rows on read — see snapshot.ts's #selfHealProjections /
+        // #deriveProjectionsFromRows). Undefined (the foreground-nav
+        // overlay path) leaves the projection unchanged, matching the
+        // real store's "nothing new to persist" behavior there.
+        const write = input.projectionAccumulatorWrite;
         currentSnapshot = {
           scope: {},
           ...(currentSnapshot ?? {}),
@@ -1804,12 +1835,21 @@ describe('connectionsMaterializer (Class B, consumer-only)', () => {
           nodeCount: nodes.size,
           edgeCount: edges.size,
           updatedAt: currentSnapshot?.updatedAt ?? '1970-01-01T00:00:00.000Z',
-          ...(input.metadata?.urlProjection === undefined
+          ...(write === undefined
             ? {}
-            : { urlProjection: input.metadata.urlProjection }),
-          ...(input.metadata?.tabSessionProjection === undefined
-            ? {}
-            : { tabSessionProjection: input.metadata.tabSessionProjection }),
+            : {
+                urlProjection: {
+                  schemaVersion: 1,
+                  byCanonicalUrl: Object.fromEntries(write.urlAccumulator.records),
+                },
+                tabSessionProjection: {
+                  schemaVersion: 1,
+                  bySessionId: Object.fromEntries(write.tabSessionAccumulator.records),
+                  openSessionsByTabId: Object.fromEntries(
+                    write.tabSessionAccumulator.openSessionsByTabId,
+                  ),
+                },
+              }),
         };
         currentProgress = input.progress;
       },
