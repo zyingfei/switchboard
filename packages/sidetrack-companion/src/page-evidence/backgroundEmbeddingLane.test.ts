@@ -498,3 +498,98 @@ describe('createBackgroundEmbeddingLane.health', () => {
     expect(h.inert).toBe(false);
   });
 });
+
+// ─────────────────────────────────────────────────────────────────────
+// AUDIBLE FAILURES (2026-08-16 incident). The live embed lane logged
+// `cycle embedded=0 failed=4 skipped=4 ...` every cycle for hours with NO
+// indication why — a silent-failure violation of the repo's audible-
+// drain-failure rule. `embedCanonicalUrl` may now return
+// `{outcome, reason}` instead of a bare string; the lane must turn that
+// into a per-cycle reason histogram (`failedByReason`/`skippedByReason`)
+// and log the FIRST occurrence of each distinct reason once (throttled —
+// not once per attempt).
+// ─────────────────────────────────────────────────────────────────────
+describe('createBackgroundEmbeddingLane audible failures', () => {
+  it('builds a failedByReason / skippedByReason histogram from classified outcomes', async () => {
+    const outcomesByUrl: Record<
+      string,
+      'embedded' | { readonly outcome: 'skipped' | 'failed'; readonly reason: string }
+    > = {
+      'https://a.test': { outcome: 'failed', reason: 'stale-guard' },
+      'https://b.test': { outcome: 'failed', reason: 'stale-guard' },
+      'https://c.test': { outcome: 'failed', reason: 'embed-error' },
+      'https://d.test': { outcome: 'skipped', reason: 'no-page-content' },
+      'https://e.test': 'embedded',
+    };
+    const lane = createBackgroundEmbeddingLane(
+      deps({
+        listCandidates: async () =>
+          Object.keys(outcomesByUrl).map((canonicalUrl) => candidate({ canonicalUrl })),
+        embedCanonicalUrl: async (url) => outcomesByUrl[url]!,
+      }),
+    );
+    const result = await lane.runOnce();
+    expect(result.embedded).toBe(1);
+    expect(result.failed).toBe(3);
+    expect(result.skipped).toBe(1);
+    expect(result.failedByReason).toEqual({ 'stale-guard': 2, 'embed-error': 1 });
+    expect(result.skippedByReason).toEqual({ 'no-page-content': 1 });
+  });
+
+  it('still works when embedCanonicalUrl returns bare strings (backward compatible, no reasons)', async () => {
+    const lane = createBackgroundEmbeddingLane(
+      deps({
+        listCandidates: async () => [
+          candidate({ canonicalUrl: 'https://a.test' }),
+          candidate({ canonicalUrl: 'https://b.test' }),
+        ],
+        embedCanonicalUrl: async (url) => (url === 'https://a.test' ? 'failed' : 'skipped'),
+      }),
+    );
+    const result = await lane.runOnce();
+    expect(result.failed).toBe(1);
+    expect(result.skipped).toBe(1);
+    expect(result.failedByReason).toEqual({ unknown: 1 });
+    expect(result.skippedByReason).toEqual({ unknown: 1 });
+  });
+
+  it('logs the first occurrence of a reason once, not once per attempt (throttled)', async () => {
+    const lines: string[] = [];
+    const lane = createBackgroundEmbeddingLane(
+      deps({
+        log: (message) => lines.push(message),
+        listCandidates: async () => [
+          candidate({ canonicalUrl: 'https://a.test' }),
+          candidate({ canonicalUrl: 'https://b.test' }),
+          candidate({ canonicalUrl: 'https://c.test' }),
+        ],
+        embedCanonicalUrl: async () => ({ outcome: 'failed', reason: 'stale-guard' }),
+      }),
+    );
+    await lane.runOnce();
+    const firstOccurrenceLines = lines.filter((line) => line.includes('first occurrence'));
+    expect(firstOccurrenceLines).toHaveLength(1);
+    expect(firstOccurrenceLines[0]).toContain('reason=stale-guard');
+    // The cycle summary line still carries the full per-cycle COUNT.
+    const cycleLine = lines.find((line) => line.includes('cycle embedded='));
+    expect(cycleLine).toContain('failedByReason=stale-guard:3');
+
+    // A SECOND cycle with the SAME reason logs no additional first-
+    // occurrence line (still throttled) but the histogram still counts.
+    await lane.runOnce();
+    expect(lines.filter((line) => line.includes('first occurrence'))).toHaveLength(1);
+  });
+
+  it('classifies a thrown embed as reason=threw', async () => {
+    const lane = createBackgroundEmbeddingLane(
+      deps({
+        listCandidates: async () => [candidate({ canonicalUrl: 'https://a.test' })],
+        embedCanonicalUrl: async () => {
+          throw new Error('boom');
+        },
+      }),
+    );
+    const result = await lane.runOnce();
+    expect(result.failedByReason).toEqual({ threw: 1 });
+  });
+});

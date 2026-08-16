@@ -183,7 +183,7 @@ describe('background-embedding lane throughput (warmup-race regression)', () => 
     const embedOneReal = await embedBacklogCanonicalUrl(root);
     const embedCanonicalUrl = async (
       canonicalUrl: string,
-    ): Promise<'embedded' | 'skipped' | 'failed'> => {
+    ): Promise<Awaited<ReturnType<typeof embedOneReal>>> => {
       const outcome = await embedOneReal(canonicalUrl);
       if (outcome === 'embedded') {
         embeds += 1;

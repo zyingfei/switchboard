@@ -65,6 +65,7 @@ import {
   createIncrementalBackgroundEmbeddingCandidateSource,
   readBackgroundEmbeddingProgress,
   writeBackgroundEmbeddingProgress,
+  requeueQuarantinedEmbeddingBacklog,
 } from '../page-evidence/store.js';
 import { ensurePageContentStoreReady } from '../page-content/store.js';
 import {
@@ -1237,6 +1238,34 @@ export const startCompanion = async (
     // Same rationale as stopBodyEvidenceLane above.
     let stopBackgroundEmbeddingLane: (() => void) | undefined;
     if (backgroundEmbeddingLaneEnabled) {
+      // ONE-TIME, BOUNDED, CATEGORY-SCOPED requeue for backlog entries
+      // quarantined by a BUG (the 2026-08-16 stale-guard incident: the
+      // completion guard rejected a record whose content was unchanged,
+      // purely because its evidence `updatedAt` had been bumped by an
+      // unrelated later revisit — see page-evidence/store.ts's
+      // `isCurrentEvidenceForEmbeddingCompletion` and
+      // `requeueQuarantinedEmbeddingBacklog`). Runs once, before the lane
+      // starts, so those records get one more shot without operator
+      // intervention. Reason categories that can reflect a genuinely-
+      // unembeddable record ('no-page-content', 'embed-error') are
+      // deliberately excluded — never resurrect a real dead end.
+      const requeueResult = await requeueQuarantinedEmbeddingBacklog(options.vaultPath).catch(
+        (error: unknown) => {
+          process.stdout.write(
+            `[page-evidence.embed-lane] boot requeue sweep failed: ${
+              error instanceof Error ? error.message : String(error)
+            }\n`,
+          );
+          return { requeued: [] };
+        },
+      );
+      if (requeueResult.requeued.length > 0) {
+        process.stdout.write(
+          `[page-evidence.embed-lane] boot requeue: cleared quarantine for ${String(
+            requeueResult.requeued.length,
+          )} bug-caused record(s)\n`,
+        );
+      }
       // Load the privacy tombstone set once at startup. A page whose
       // domain is tombstoned is never embedded (privacy gate). The set is
       // a snapshot; a tombstone added mid-session takes effect on the next
