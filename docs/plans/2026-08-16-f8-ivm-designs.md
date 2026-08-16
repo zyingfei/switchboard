@@ -202,3 +202,18 @@ Un-healable repair class: scopes whose bail predates W1/W2 store
 activation recycle in the queue (self-diagnosing via depth/oldest
 gauges) until fresh events or one consented rebuild — shrinks to zero
 once flags are on from boot.
+
+## Disk-wear audit closure (2026-08-16, live-verified)
+
+Idle: 80KB/10min, zero non-log writes. Active: the last O(state)
+per-drain class (edge_order 18.15MB + current 5.77MB + accumulator
+5.65MB + node_order 1.9MB rewritten every scoped drain) eliminated in
+PR #365: order blobs deleted-and-derived, accumulator + projections
+decomposed into dirty-key row tables, per-event overlay row-scoped.
+Live post-drain measurement: edge_order/node_order ABSENT, current
+0.26KB, accumulator 8.09KB tag + rows. Per-drain metadata 25.7MB → ~8KB.
+Remaining writes are O(change) by construction: event appends, store
+ingest, scope rows, per-capture record + 157KB chunks-manifest (F5),
+rare bounded snapshots. Verdict: day-to-day rewrite amplification is
+closed; F5 and the snapshot binary format are size/aesthetic residuals,
+not wear classes.
