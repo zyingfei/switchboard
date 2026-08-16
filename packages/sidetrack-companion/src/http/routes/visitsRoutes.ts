@@ -17,6 +17,7 @@ import { ENTITY_TITLE_ENRICHED, effectiveUrlTitle, enrichmentLookupFromMerged, l
 import { USER_FLOW_REJECTED, USER_ORGANIZED_ITEM, isUserFlowRejectedPayload, isUserOrganizedItemPayload } from '../../feedback/events.js';
 import { generateCandidates } from '../../ranker/candidates.js';
 import type { AcceptedEvent } from '../../sync/causal.js';
+import { getSharedEventStoreServeStale } from '../../sync/eventStore.js';
 import { isLaneOpportunityId, recordLaneOutcome } from '../../tabsession/lanePrequential.js';
 import type { UrlResolutionResult } from '../../tabsession/resolver.js';
 import { BROWSER_TIMELINE_OBSERVED, isBrowserTimelineObservedPayload } from '../../timeline/events.js';
@@ -127,6 +128,124 @@ export const resolverTimelineEventsForCanonicalUrls = (
     const visitKey = resolverCanonicalUrlKey(event.payload.canonicalUrl ?? event.payload.url);
     return normalizedTargets.has(visitKey);
   });
+};
+
+// Indexed replacements for resolverSignalEventsForCanonicalUrls /
+// resolverTimelineEventsForCanonicalUrls (perf/event-candidate-resolve).
+//
+// The two functions above take the batch's already-materialized `merged`
+// array (hundreds of thousands of events on a real vault — see
+// server.ts's per-candidate loop) and run a full JS `.filter` over it PER
+// CANDIDATE URL. That is fine for the batched, once-per-request `misses`
+// call, but the event-candidate path calls it again per expand-target
+// inside the loop — the exact O(merged)-per-candidate cost this pair
+// exists to avoid.
+//
+// When the typed event store (SIDETRACK_EVENT_STORE=1) is available these
+// go straight at events_resolver_url_idx / events_type_idx instead of
+// scanning `merged` — O(matching rows) for the target URL(s), independent
+// of how large `merged` is. Falls back to the JS-filter path (byte-
+// identical output — see visitsRoutes.eventCandidateResolve.test.ts's
+// equivalence test) when the store is unavailable, mirroring
+// readEventsFromStoreOrLog's own store-vs-log gate.
+export const resolverSignalEventsForCanonicalUrlsIndexed = async (
+  vaultRoot: string | undefined,
+  merged: readonly AcceptedEvent[],
+  canonicalUrls: readonly string[],
+): Promise<readonly AcceptedEvent[]> => {
+  const store = vaultRoot === undefined ? null : await getSharedEventStoreServeStale(vaultRoot);
+  if (store === null) return resolverSignalEventsForCanonicalUrls(merged, canonicalUrls);
+  // USER_FLOW_REJECTED carries no URL (see eventStore.ts's
+  // resolverUrlForEvent) and is matched UNCONDITIONALLY by the reference
+  // filter, so it stays a small type-scoped read, never resolver_url-keyed.
+  const rejected: AcceptedEvent[] = [];
+  await store.forEachChunkOfTypes(
+    [USER_FLOW_REJECTED],
+    (chunk) => {
+      for (const candidate of chunk) {
+        if (isUserFlowRejectedPayload(candidate.payload)) rejected.push(candidate);
+      }
+    },
+    2000,
+  );
+  // USER_ORGANIZED_ITEM rows are resolver_url-indexed only when they
+  // validated AND itemKind === 'canonical-url' at ingest/backfill time —
+  // the WHERE resolver_url IN (...) already encodes both checks, so no
+  // extra JS re-validation is needed on the way out.
+  const organized =
+    canonicalUrls.length === 0 ? [] : store.readByResolverUrls(canonicalUrls, [USER_ORGANIZED_ITEM]);
+  return [...rejected, ...organized];
+};
+
+export const resolverTimelineEventsForCanonicalUrlsIndexed = async (
+  vaultRoot: string | undefined,
+  merged: readonly AcceptedEvent[],
+  canonicalUrls: ReadonlySet<string>,
+): Promise<readonly AcceptedEvent[]> => {
+  const store = vaultRoot === undefined ? null : await getSharedEventStoreServeStale(vaultRoot);
+  if (store === null) return resolverTimelineEventsForCanonicalUrls(merged, canonicalUrls);
+  if (canonicalUrls.size === 0) return [];
+  const normalizedTargets = [...new Set([...canonicalUrls].map(resolverCanonicalUrlKey))];
+  return store.readByResolverUrls(normalizedTargets, [BROWSER_TIMELINE_OBSERVED]);
+};
+
+// ---- resolver-cache key folding for event-candidate results (F3/F4) ----
+//
+// The plain resolver cache key (resolverCacheRevision above) is safe for
+// the SIX-lane result because that result is a pure function of
+// (snapshotRevision, arm, state) — nothing else feeds it. An event-
+// candidate resolve additionally depends on WHICH urls the caller flagged
+// as event candidates in this batch (they drive expandedCandidateUrlsFor
+// Target -> resolverEvents, see server.ts): the same target URL resolved
+// with a different event-candidate set is a genuinely different input and
+// must be a genuinely different cache entry — folding a stable hash of the
+// caller's (sorted, deduped) eventCandidateUrls into the revision string
+// gives that for free, using the SAME (visit_id, revision) cache table and
+// the SAME deferred-write path as every other resolver-cache entry.
+//
+// Deliberately keyed on the CALLER-SUPPLIED eventCandidateUrls, not the
+// server-computed similarity expansion (resolverExpandedCandidateUrlsFor
+// CanonicalUrls) — the expansion needs `merged` to compute, and computing
+// it just to decide a cache key would defeat the point (an all-hit batch
+// must pay zero merged/subgraph reads, see server.ts). Trusting
+// snapshotRevision to bust the entry when the underlying graph/timeline
+// signal actually changes is the SAME trust boundary the plain resolver
+// cache already relies on (it has no event/timeline fold at all).
+const FNV_OFFSET_BASIS_32 = 0x811c9dc5;
+const FNV_PRIME_32 = 0x01000193;
+
+/** Deterministic, non-cryptographic string hash (FNV-1a, 32-bit) rendered
+ *  as 8 lowercase hex chars. Used ONLY as a cache-key discriminator — never
+ *  a security or dedup-uniqueness boundary — so an astronomically-unlikely
+ *  collision costs a wrong cache HIT, not a security issue; the folded key
+ *  still carries the full snapshotRevision, so a collision would need to
+ *  also match a live revision to matter, and is self-healing on the next
+ *  real graph move. */
+export const stableHash = (input: string): string => {
+  let hash = FNV_OFFSET_BASIS_32;
+  for (let index = 0; index < input.length; index += 1) {
+    hash ^= input.charCodeAt(index);
+    hash = Math.imul(hash, FNV_PRIME_32);
+  }
+  return (hash >>> 0).toString(16).padStart(8, '0');
+};
+
+/** Folds a (sorted, deduped) event-candidate URL set into a resolver-cache
+ *  revision string. Order-invariant and duplicate-invariant by
+ *  construction (both inputs are normalized before hashing); a different
+ *  SET of URLs — added, removed, or swapped — always produces a different
+ *  key. */
+export const eventCandidateCacheRevision = (
+  batchCacheRevision: string,
+  eventCandidateUrls: readonly string[],
+): string => {
+  const sortedUnique = [...new Set(eventCandidateUrls)].sort();
+  // NUL-joined: URLs can legally contain spaces (unescaped query values)
+  // but never a NUL byte, so a plain space-join could collide two
+  // different sets (['a b', 'c'] vs ['a', 'b c']) onto the same hash
+  // input. Matches the NUL-separator convention resolverCacheDefer.ts's
+  // pendingKey already uses.
+  return `${batchCacheRevision}|ec:${stableHash(sortedUnique.join('\u0000'))}`;
 };
 
 export const resolverExpandedCandidateUrlsForCanonicalUrls = (

@@ -25,6 +25,45 @@ import {
   incrementDuplicateCaptures,
   incrementStoreSkippedOutOfOrder,
 } from './eventLaneHealth.js';
+import { USER_ORGANIZED_ITEM, isUserOrganizedItemPayload } from '../feedback/events.js';
+import { BROWSER_TIMELINE_OBSERVED, isBrowserTimelineObservedPayload } from '../timeline/events.js';
+
+// Duplicated, one-line-on-purpose: `http/routes/visitsRoutes.ts` has its own
+// `resolverCanonicalUrlKey` and `connections/snapshot.ts` its own
+// `normalizeResolverUrl` — same normalization (strip #fragment, strip
+// trailing slashes), three independent copies. A store module (this file)
+// must not import from a route module (wrong dependency direction), and a
+// shared import would still cost a cross-package hop for one regex; the
+// existing snapshot.ts precedent already treats this as fine to duplicate.
+const resolverUrlKey = (raw: string): string => raw.replace(/#.*$/u, '').replace(/\/+$/u, '');
+
+// The `resolver_url` index value for one event, computed at ingest AND
+// backfill time (must stay in exact lockstep with
+// resolverSignalEventsForCanonicalUrls / resolverTimelineEventsForCanonicalUrls
+// in http/routes/visitsRoutes.ts — those are the JS-filter equivalents this
+// column exists to replace). Two independent key spaces share the one
+// column because the two event types never collide on `type` in a caller's
+// WHERE clause:
+//   - BROWSER_TIMELINE_OBSERVED: resolverUrlKey(canonicalUrl ?? url) —
+//     NORMALIZED, matching resolverTimelineEventsForCanonicalUrls' symmetric
+//     normalization of both sides.
+//   - USER_ORGANIZED_ITEM with itemKind === 'canonical-url': the RAW
+//     itemId, unnormalized — matching resolverSignalEventsForCanonicalUrls'
+//     exact-string Set.has(itemId) (no normalization there today; changing
+//     that would be a behavior change, not an index-backing one).
+//   - Everything else (including USER_FLOW_REJECTED, which carries no URL
+//     at all and must stay on the unconditional type-scoped read): ''.
+const resolverUrlForEvent = (type: string, payload: unknown): string => {
+  if (type === BROWSER_TIMELINE_OBSERVED) {
+    if (!isBrowserTimelineObservedPayload(payload)) return '';
+    return resolverUrlKey(payload.canonicalUrl ?? payload.url);
+  }
+  if (type === USER_ORGANIZED_ITEM) {
+    if (!isUserOrganizedItemPayload(payload)) return '';
+    return payload.itemKind === 'canonical-url' ? payload.itemId : '';
+  }
+  return '';
+};
 
 export interface EventStore {
   /** Idempotent by (replicaId, seq). Watermark advances for every valid event. */
@@ -44,6 +83,28 @@ export interface EventStore {
    *  per-aggregate projection GET (measured: 9.1s cold on 866k events,
    *  fired in bursts on every extension service-worker reconnect). */
   readonly readByAggregate: (aggregateId: string) => readonly AcceptedEvent[];
+  /** Events whose maintained `resolver_url` index value is in `resolverUrls`,
+   *  restricted to `types` — O(matching rows) via events_resolver_url_idx,
+   *  replacing the request-path pattern of reading a type-scoped chunk (via
+   *  forEachChunkOfTypes) and then JS-filtering it down to one or a handful
+   *  of canonical URLs (resolverSignalEventsForCanonicalUrls /
+   *  resolverTimelineEventsForCanonicalUrls in http/routes/visitsRoutes.ts).
+   *  `resolver_url` is populated at ingest time by `resolverUrlForEvent`
+   *  below — see its doc comment for the exact per-type key semantics
+   *  (some types, e.g. USER_FLOW_REJECTED, carry no URL and are never
+   *  matched here; callers must still read those via forEachChunkOfTypes). */
+  readonly readByResolverUrls: (
+    resolverUrls: readonly string[],
+    types: readonly string[],
+  ) => readonly AcceptedEvent[];
+  /** Most-recent `limit` events of ONE type, via events_accepted_at_ms_idx
+   *  (DESC) — a BOUNDED alternative to forEachChunkOfTypes for callers that
+   *  need breadth (a graph/discovery input, not a specific URL's own
+   *  events) but not the entire type-scoped history. Order is most-recent-
+   *  first, NOT the (replica_id, seq) order forEachChunkOfTypes returns —
+   *  callers that need causal order must sort the result themselves; the
+   *  one caller today (resolver candidate generation) does not. */
+  readonly readMostRecentByType: (type: string, limit: number) => readonly AcceptedEvent[];
   readonly maxAcceptedAtMs: () => number;
   /** MAX(accepted_at_ms) for a single event type (events_type_idx filter),
    *  0 when the type has never been seen. A single aggregate query — used
@@ -176,12 +237,14 @@ const SCHEMA = `
     target TEXT NOT NULL,
     hlc TEXT NOT NULL,
     aggregate_id TEXT NOT NULL,
+    resolver_url TEXT NOT NULL DEFAULT '',
     PRIMARY KEY (replica_id, seq)
   );
   CREATE INDEX IF NOT EXISTS events_accepted_at_ms_idx ON events(accepted_at_ms);
   CREATE INDEX IF NOT EXISTS events_replica_seq_idx ON events(replica_id, seq);
   CREATE INDEX IF NOT EXISTS events_aggregate_idx ON events(aggregate_id, replica_id, seq);
   CREATE INDEX IF NOT EXISTS events_type_idx ON events(type, replica_id, seq);
+  CREATE INDEX IF NOT EXISTS events_type_accepted_at_idx ON events(type, accepted_at_ms);
   CREATE TABLE IF NOT EXISTS ingest_watermark (
     replica_id TEXT PRIMARY KEY,
     max_seq INTEGER NOT NULL
@@ -285,11 +348,79 @@ export const createEventStore = async (vaultRoot: string): Promise<EventStore> =
   const db = new Database(dbPath, { create: true, readwrite: true });
   db.exec(SCHEMA);
 
+  // Migration for stores created before `resolver_url` existed: the raw
+  // SCHEMA's `CREATE TABLE IF NOT EXISTS` is a no-op against an already-
+  // present `events` table, so a pre-existing store's column is missing
+  // until this ALTER runs once. Cheap PRAGMA read on every open afterward
+  // (column already present ⇒ no-op); the one-time ALTER + backfill only
+  // fires the FIRST open after this code ships. See resolverUrlForEvent for
+  // the backfilled value's exact semantics.
+  const eventsColumns = db.query("PRAGMA table_info('events')").all();
+  const resolverUrlColumnMissing = !eventsColumns.some(
+    (column) => stringField(column, 'name') === 'resolver_url',
+  );
+  if (resolverUrlColumnMissing) {
+    db.exec("ALTER TABLE events ADD COLUMN resolver_url TEXT NOT NULL DEFAULT ''");
+  }
+  const updateResolverUrl = db.query(
+    'UPDATE events SET resolver_url = ? WHERE replica_id = ? AND seq = ?',
+  );
+  const backfillResolverUrlColumn = async (): Promise<void> => {
+    const BACKFILL_CHUNK = 2000;
+    const backfillTypes = [BROWSER_TIMELINE_OBSERVED, USER_ORGANIZED_ITEM];
+    const typePlaceholders = backfillTypes.map(() => '?').join(', ');
+    let lastReplicaId = '';
+    let lastSeq = 0;
+    while (true) {
+      const rows = db
+        .query(
+          `SELECT replica_id, seq, type, payload FROM events
+             WHERE type IN (${typePlaceholders})
+               AND (replica_id > ? OR (replica_id = ? AND seq > ?))
+             ORDER BY replica_id, seq
+             LIMIT ?`,
+        )
+        .all(...backfillTypes, lastReplicaId, lastReplicaId, lastSeq, BACKFILL_CHUNK);
+      if (rows.length === 0) return;
+      db.exec('BEGIN');
+      try {
+        for (const row of rows) {
+          const replicaId = stringField(row, 'replica_id');
+          const seq = numberField(row, 'seq');
+          let payload: unknown = null;
+          try {
+            payload = parseJson(stringField(row, 'payload'));
+          } catch {
+            payload = null;
+          }
+          const resolverUrl = resolverUrlForEvent(stringField(row, 'type'), payload);
+          if (resolverUrl.length > 0) updateResolverUrl.run(resolverUrl, replicaId, seq);
+          lastReplicaId = replicaId;
+          lastSeq = seq;
+        }
+        db.exec('COMMIT');
+      } catch (error) {
+        db.exec('ROLLBACK');
+        throw error;
+      }
+      if (rows.length < BACKFILL_CHUNK) return;
+      // Yield between chunks — this can walk a few hundred thousand rows on
+      // first upgrade; never hold the loop for the whole pass uninterrupted.
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    }
+  };
+  if (resolverUrlColumnMissing) {
+    await backfillResolverUrlColumn();
+  }
+  db.exec(
+    'CREATE INDEX IF NOT EXISTS events_resolver_url_idx ON events(resolver_url, type, replica_id, seq)',
+  );
+
   const insertEvent = db.query(
     `INSERT OR IGNORE INTO events
        (replica_id, seq, client_event_id, type, payload, accepted_at_ms,
-        deps, target, hlc, aggregate_id)
-     VALUES (?,?,?,?,?,?,?,?,?,?)`,
+        deps, target, hlc, aggregate_id, resolver_url)
+     VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
   );
   const bumpWatermark = db.query(
     `INSERT INTO ingest_watermark (replica_id, max_seq) VALUES (?, ?)
@@ -409,6 +540,7 @@ export const createEventStore = async (vaultRoot: string): Promise<EventStore> =
       optionalJsonText(event.target),
       optionalJsonText(event.hlc),
       event.aggregateId,
+      resolverUrlForEvent(event.type, event.payload),
     );
     // changes === 0 ⇒ the INSERT OR IGNORE hit the (replica_id, seq)
     // primary key: a row already exists for this dot. Classify the
@@ -688,6 +820,40 @@ export const createEventStore = async (vaultRoot: string): Promise<EventStore> =
         .all(aggregateId),
     );
 
+  const readByResolverUrls = (
+    resolverUrls: readonly string[],
+    types: readonly string[],
+  ): readonly AcceptedEvent[] => {
+    if (resolverUrls.length === 0 || types.length === 0) return [];
+    const urlPlaceholders = resolverUrls.map(() => '?').join(', ');
+    const typePlaceholders = types.map(() => '?').join(', ');
+    return rowsToEvents(
+      db
+        .query(
+          `SELECT ${SELECT_COLUMNS}
+           FROM events
+           WHERE resolver_url IN (${urlPlaceholders}) AND type IN (${typePlaceholders})
+           ORDER BY replica_id, seq`,
+        )
+        .all(...resolverUrls, ...types),
+    );
+  };
+
+  const readMostRecentByType = (type: string, limit: number): readonly AcceptedEvent[] => {
+    if (limit <= 0) return [];
+    return rowsToEvents(
+      db
+        .query(
+          `SELECT ${SELECT_COLUMNS}
+           FROM events
+           WHERE type = ?
+           ORDER BY accepted_at_ms DESC
+           LIMIT ?`,
+        )
+        .all(type, Math.floor(limit)),
+    );
+  };
+
   const maxAcceptedAtMs = (): number => {
     const row = db
       .query(
@@ -867,6 +1033,8 @@ export const createEventStore = async (vaultRoot: string): Promise<EventStore> =
     rebuildFromJsonl,
     readSince,
     readByAggregate,
+    readByResolverUrls,
+    readMostRecentByType,
     maxAcceptedAtMs,
     maxAcceptedAtMsForType,
     maxCompactedAcceptedAtMsForType,
