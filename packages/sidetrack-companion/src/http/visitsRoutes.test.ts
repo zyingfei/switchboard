@@ -16,6 +16,7 @@ import {
 import { URL_ATTRIBUTION_INFERRED } from '../urls/events.js';
 import { createVaultWriter } from '../vault/writer.js';
 import { createIdempotencyStore } from './idempotency.js';
+import { eventCandidateCacheRevision, resolverCacheRevision } from './routes/visitsRoutes.js';
 import { createCompanionHttpServer, startHttpServer } from './server.js';
 
 describe('per-URL HTTP routes', () => {
@@ -862,6 +863,11 @@ describe('per-URL HTTP routes — resolver cache and batch resolve', () => {
       };
     };
     expect(body.data.results[targetUrl]?.fusedCandidates[0]?.workstreamId).toBe('ws_security');
+    // The PLAIN revision is never used for an event-candidate target — a
+    // collision there would let an event-candidate-expanded resolve shadow
+    // (or be shadowed by) the six-lane plain result. It is cached, but only
+    // under the FOLDED revision (perf/event-candidate-resolve) — see the
+    // next test for the folded key's cache-hit behavior.
     expect(connectionsStore.getCachedResolverResult).not.toHaveBeenCalledWith(
       targetUrl,
       'rev-event-candidates',
@@ -871,6 +877,115 @@ describe('per-URL HTTP routes — resolver cache and batch resolve', () => {
       'rev-event-candidates',
       expect.anything(),
     );
+    const foldedRevision = eventCandidateCacheRevision(
+      await resolverCacheRevision('rev-event-candidates', vaultRoot),
+      [targetUrl],
+    );
+    expect(connectionsStore.cacheResolverResult).toHaveBeenCalledWith(
+      targetUrl,
+      foldedRevision,
+      expect.objectContaining({
+        fusedCandidates: expect.arrayContaining([
+          expect.objectContaining({ workstreamId: 'ws_security' }),
+        ]),
+      }),
+    );
+  });
+
+  it('POST /v1/visits/batch-resolve serves a repeated event-candidate set from cache', async () => {
+    const targetUrl = 'https://docs.kernel.org/security/self-protection.html';
+    const anchorUrl = 'https://docs.kernel.org/security/lsm.html';
+    await connectionsStore.putCurrent(
+      snapshotForEventCandidateUrl(targetUrl, anchorUrl, 'rev-event-candidates-repeat'),
+    );
+    await appendObservation({ seq: 1, url: targetUrl, title: 'Kernel Self-Protection' });
+    await appendObservation({ seq: 2, url: anchorUrl, title: 'Linux Security Module framework' });
+
+    const requestBody = JSON.stringify({
+      canonicalUrls: [targetUrl],
+      eventCandidateUrls: [targetUrl],
+    });
+    const first = await fetch(`${serverUrl}/v1/visits/batch-resolve`, {
+      method: 'POST',
+      headers: reqHeaders(),
+      body: requestBody,
+    });
+    expect(first.status).toBe(200);
+
+    const readResolverSubgraphForUrls = vi.spyOn(connectionsStore, 'readResolverSubgraphForUrls');
+    readResolverSubgraphForUrls.mockClear();
+
+    const second = await fetch(`${serverUrl}/v1/visits/batch-resolve`, {
+      method: 'POST',
+      headers: reqHeaders(),
+      body: requestBody,
+    });
+    expect(second.status).toBe(200);
+    const secondBody = (await second.json()) as {
+      data: {
+        results: Record<
+          string,
+          { readonly fusedCandidates: readonly { readonly workstreamId: string }[] }
+        >;
+      };
+    };
+    // Second identical request hits the folded-key cache — same served
+    // answer, and no fresh subgraph read for the miss path (item 4: an
+    // all-cache-hit batch pays no subgraph read for attribution).
+    expect(secondBody.data.results[targetUrl]?.fusedCandidates[0]?.workstreamId).toBe(
+      'ws_security',
+    );
+    const foldedRevision = eventCandidateCacheRevision(
+      await resolverCacheRevision('rev-event-candidates-repeat', vaultRoot),
+      [targetUrl],
+    );
+    expect(connectionsStore.getCachedResolverResult).toHaveBeenCalledWith(
+      targetUrl,
+      foldedRevision,
+    );
+  });
+
+  it('POST /v1/visits/batch-resolve misses the event-candidate cache when the candidate set changes', async () => {
+    const targetUrl = 'https://docs.kernel.org/security/self-protection.html';
+    const anchorUrl = 'https://docs.kernel.org/security/lsm.html';
+    await connectionsStore.putCurrent(
+      snapshotForEventCandidateUrl(targetUrl, anchorUrl, 'rev-event-candidates-set-change'),
+    );
+    await appendObservation({ seq: 1, url: targetUrl, title: 'Kernel Self-Protection' });
+    await appendObservation({ seq: 2, url: anchorUrl, title: 'Linux Security Module framework' });
+
+    await fetch(`${serverUrl}/v1/visits/batch-resolve`, {
+      method: 'POST',
+      headers: reqHeaders(),
+      body: JSON.stringify({ canonicalUrls: [targetUrl], eventCandidateUrls: [targetUrl] }),
+    });
+
+    const cacheWrite = vi.spyOn(connectionsStore, 'cacheResolverResult');
+    cacheWrite.mockClear();
+
+    // Same target URL, but this batch ALSO flags anchorUrl as an event
+    // candidate. eventCandidateTargetSet (the intersection with
+    // canonicalUrls that actually drives the fold — see server.ts) is
+    // therefore genuinely different from the first request's {targetUrl},
+    // so this MUST miss the first request's folded cache entry and
+    // recompute (caching under its OWN, differently-folded key). Note:
+    // eventCandidateUrls entries NOT also present in canonicalUrls are
+    // dropped by that intersection, so anchorUrl must be requested too —
+    // an eventCandidateUrls-only change would be a no-op on the fold.
+    const response = await fetch(`${serverUrl}/v1/visits/batch-resolve`, {
+      method: 'POST',
+      headers: reqHeaders(),
+      body: JSON.stringify({
+        canonicalUrls: [targetUrl, anchorUrl],
+        eventCandidateUrls: [targetUrl, anchorUrl],
+      }),
+    });
+    expect(response.status).toBe(200);
+    const changedFoldedRevision = eventCandidateCacheRevision(
+      await resolverCacheRevision('rev-event-candidates-set-change', vaultRoot),
+      [targetUrl, anchorUrl],
+    );
+    expect(cacheWrite).toHaveBeenCalledWith(targetUrl, changedFoldedRevision, expect.anything());
   });
 
   it('POST /v1/visits/batch-resolve accepts titleHints and appends the content lane', async () => {

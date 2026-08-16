@@ -12,7 +12,7 @@ import { createRequestId } from '../domain/ids.js';
 import { ENTITY_CONTENT_ENRICHED, gistLookupFromMerged, lookupGist, type GistLookup } from '../enrichment/contentEnrichment.js';
 import { ENTITY_ENRICHMENT_RETRACTED } from '../enrichment/events.js';
 import { ENTITY_TITLE_ENRICHED, enrichmentLookupFromMerged, lookupSynthesizedTitle, type EnrichmentLookup } from '../enrichment/titleEnrichment.js';
-import { USER_FLOW_REJECTED, USER_ORGANIZED_ITEM } from '../feedback/events.js';
+import { USER_FLOW_REJECTED, USER_ORGANIZED_ITEM, isUserOrganizedItemPayload } from '../feedback/events.js';
 import { listPageEvidenceRecords } from '../page-evidence/store.js';
 import { createEmbeddingCache, embedTextHash } from '../recall/embeddingCache.js';
 import { RECALL_MODEL } from '../recall/modelManifest.js';
@@ -37,12 +37,12 @@ import { createProblem, type ValidationIssue } from './problem.js';
 import { queueResolverCacheWrite, resolverCacheDeferEnabled, scheduleResolverCacheFlush } from './resolverCacheDefer.js';
 import { scheduleReverseShadowFlush } from '../attribution-v1/reverseShadowDefer.js';
 
-import { HttpRouteError, RESOLVER_SIGNAL_EVENT_TYPES, acquireResolveSlot, callerIdentities, callerIdentityFor, connectionsGraphSig, domainTombstoneSetFor, eventReadCoverageSig, objectRecord, readBody, readEventsFromStoreOrLog, releaseResolveSlot, requireVaultRoot, resolveSwrCache } from './routeSupport.js';
+import { HttpRouteError, RESOLVER_SIGNAL_EVENT_TYPES, acquireResolveSlot, callerIdentities, callerIdentityFor, connectionsGraphSig, domainTombstoneSetFor, eventReadCoverageSig, eventStoreForContext, objectRecord, readBody, readEventsFromStoreOrLog, releaseResolveSlot, requireVaultRoot, resolveSwrCache } from './routeSupport.js';
 import type { CallerIdentity, CompanionHttpConfig, HttpMethod, RouteDefinition } from './routeSupport.js';
 import { urlWorkstreamLookupFromProjection } from './routes/entitiesRoutes.js';
 import { isPrivacyEventType } from './routes/privacyRoutes.js';
 import { loadEmbedderModule } from './routes/recallRoutes.js';
-import { RESOLVER_EXPAND_EVENT_TYPES, armedResolveSig, resolverCacheRevision, resolverExpandedCandidateUrlsForCanonicalUrls, resolverSignalEventsForCanonicalUrls, resolverTimelineEventsForCanonicalUrls } from './routes/visitsRoutes.js';
+import { RESOLVER_EXPAND_EVENT_TYPES, armedResolveSig, eventCandidateCacheRevision, resolverCacheRevision, resolverExpandedCandidateUrlsForCanonicalUrls, resolverSignalEventsForCanonicalUrls, resolverSignalEventsForCanonicalUrlsIndexed, resolverTimelineEventsForCanonicalUrlsIndexed } from './routes/visitsRoutes.js';
 
 import { systemRoutesA, systemRoutesB, systemRoutesC } from './routes/systemRoutes.js';
 import { privacyRoutes } from './routes/privacyRoutes.js';
@@ -701,6 +701,62 @@ const recordLanePredictionsBestEffort = (
 const privacyEventsFrom = (events: readonly import('../sync/causal.js').AcceptedEvent[]) =>
   events.filter((event) => isPrivacyEventType(event.type));
 
+// Bound for the BROWSER_TIMELINE_OBSERVED window fed to candidate generation
+// (perf/event-candidate-resolve) — mirrors the resolver hub-subgraph budgets
+// (SIDETRACK_RESOLVER_SUBGRAPH_NODE_BUDGET etc., connections/snapshot.ts):
+// generateCandidates needs BREADTH (same-domain / opener-chain / navigation-
+// chain discovery across many URLs, not just the target's own events), so it
+// cannot be made a by-URL indexed read the way the target's own signal/
+// timeline events were — but it does not need the vault's ENTIRE
+// BROWSER_TIMELINE_OBSERVED history either. Most-recent-N is a reasonable,
+// honestly-bounded proxy (browsing-candidate relevance is recency-biased in
+// practice) and caps the worst case instead of leaving it open-ended. `0` is
+// the kill switch — falls back to the prior unbounded type-scoped read.
+const RESOLVER_CANDIDATE_TIMELINE_WINDOW_ENV = 'SIDETRACK_RESOLVER_CANDIDATE_TIMELINE_WINDOW';
+const DEFAULT_RESOLVER_CANDIDATE_TIMELINE_WINDOW = 20_000;
+const resolverCandidateTimelineWindow = (): number => {
+  const raw = process.env[RESOLVER_CANDIDATE_TIMELINE_WINDOW_ENV];
+  if (raw === undefined || raw.length === 0) return DEFAULT_RESOLVER_CANDIDATE_TIMELINE_WINDOW;
+  const parsed = Number(raw);
+  return Number.isFinite(parsed) && parsed >= 0
+    ? Math.floor(parsed)
+    : DEFAULT_RESOLVER_CANDIDATE_TIMELINE_WINDOW;
+};
+
+// The timeline events fed to resolverExpandedCandidateUrlsForCanonicalUrls.
+// Indexed + bounded when the typed store is available (readMostRecentByType,
+// events_type_accepted_at_idx — O(window) instead of O(all
+// BROWSER_TIMELINE_OBSERVED-ever)); the store-unavailable path falls back to
+// filtering the `merged` array, which is ONLY safe because `merged` still
+// carries the wide RESOLVER_EXPAND_EVENT_TYPES list whenever the store is
+// null (see the merged read above) — that branch selection and this one must
+// stay in lockstep. `0` (kill switch) with the store available still reads
+// indexed, just type-scoped + unbounded (forEachChunkOfTypes), NOT a
+// merged-filter — `merged` no longer carries BROWSER_TIMELINE_OBSERVED at
+// all once the store is up, so filtering it here would silently return
+// nothing.
+const timelineEventsForCandidateGeneration = async (
+  typedEventStore: Awaited<ReturnType<typeof eventStoreForContext>>,
+  merged: readonly AcceptedEvent[],
+): Promise<readonly AcceptedEvent[]> => {
+  if (typedEventStore === null) {
+    return merged.filter((event) => event.type === BROWSER_TIMELINE_OBSERVED);
+  }
+  const window = resolverCandidateTimelineWindow();
+  if (window <= 0) {
+    const events: AcceptedEvent[] = [];
+    await typedEventStore.forEachChunkOfTypes(
+      [BROWSER_TIMELINE_OBSERVED],
+      (chunk) => {
+        events.push(...chunk);
+      },
+      2000,
+    );
+    return events;
+  }
+  return typedEventStore.readMostRecentByType(BROWSER_TIMELINE_OBSERVED, window);
+};
+
 // SWR serve-key for a batch-resolve item. Namespaced `|batch` (distinct from
 // the GET route's `|?dryRun=…` query) because the batch path reads a
 // different subgraph shape; the `visres:` prefix keeps invalidateResolveCaches
@@ -792,6 +848,48 @@ const primeBatchSwrEntry = (
   result: UrlResolutionResult,
 ): void => {
   resolveSwrCache.prime(batchResolveSwrKey(canonicalUrl), graphSig, [200, result]);
+};
+
+// ---- content-lane join-snapshot memo (perf/event-candidate-resolve) ----
+//
+// On an all-cache-hit batch (misses.length === 0 ⇒ missedSnapshot === null)
+// the content-lane join below used to call sqliteStore.readResolverSubgraph
+// ForUrls(uniqueUrls) UNCONDITIONALLY — the exact "subgraph read on an
+// all-hit batch" item 4 forbids, and the single biggest cost measured on a
+// warm re-poll (350ms-10s+ under load; the resolver hub-subgraph traversal
+// budgets from perf/resolver-subgraph-budget cap it, but capped still means
+// "walk up to 1200 nodes / 4000 edges", not "free"). The panel re-polls the
+// SAME small visible-tab URL set every few seconds, so this is memoizable:
+// `readResolverSubgraphForUrls`'s answer for a given URL set is a pure
+// function of `snapshotRevision` — the SAME trust boundary the resolver
+// cache itself already relies on (its entries are keyed on nothing but
+// snapshotRevision + arm/state) — so reusing a memoized snapshot across
+// requests is exactly as fresh as re-reading, never stale. Revision-gated,
+// not TTL-gated: a stale revision is simply never a hit.
+const JOIN_SNAPSHOT_MEMO_CAP = 32;
+const joinSnapshotMemo = new Map<
+  string,
+  { readonly revision: string; readonly snapshot: ConnectionsSnapshot }
+>();
+const joinSnapshotMemoKey = (urls: readonly string[]): string =>
+  [...new Set(urls)].sort().join('\u0000');
+const memoizedJoinSnapshot = async (
+  sqliteStore: SqliteConnectionsStore,
+  snapshotRevision: string,
+  urls: readonly string[],
+): Promise<ConnectionsSnapshot | null> => {
+  const key = joinSnapshotMemoKey(urls);
+  const cached = joinSnapshotMemo.get(key);
+  if (cached !== undefined && cached.revision === snapshotRevision) return cached.snapshot;
+  const snapshot = await sqliteStore.readResolverSubgraphForUrls(urls);
+  if (snapshot !== null) {
+    if (joinSnapshotMemo.size >= JOIN_SNAPSHOT_MEMO_CAP && !joinSnapshotMemo.has(key)) {
+      const oldestKey = joinSnapshotMemo.keys().next().value;
+      if (oldestKey !== undefined) joinSnapshotMemo.delete(oldestKey);
+    }
+    joinSnapshotMemo.set(key, { revision: snapshotRevision, snapshot });
+  }
+  return snapshot;
 };
 
 // ---- the single decoration seam (stage S3) -----------------------------
@@ -1076,10 +1174,40 @@ export const routes: readonly RouteDefinition[] = [
           snapshotRevision === undefined
             ? undefined
             : await resolverCacheRevision(snapshotRevision, requireVaultRoot(context));
+        // Event-candidate cache-key fold (perf/event-candidate-resolve). Same
+        // (visit_id, revision) table as the plain resolver cache, but the
+        // revision additionally folds a stable hash of THIS batch's
+        // eventCandidateUrls — see eventCandidateCacheRevision's doc comment
+        // for why that's a correct, cheap-to-compute discriminator. Computed
+        // once per batch (request-constant), reused for every event-candidate
+        // target below. undefined when there is nothing to fold (no
+        // event-candidate targets, or the batch has no cache revision at all
+        // — connections snapshot not sqlite-backed).
+        const batchEventCandidateCacheRevision =
+          batchCacheRevision === undefined || eventCandidateTargetSet.size === 0
+            ? undefined
+            : eventCandidateCacheRevision(batchCacheRevision, [...eventCandidateTargetSet]);
         // F1 privacy gate: the served tombstone set, loaded once for the batch.
         const batchTombstones = await domainTombstoneSetFor(context);
         for (const canonicalUrl of uniqueUrls) {
           if (eventCandidateTargetSet.has(canonicalUrl)) {
+            // Same candidate SET (this batch's eventCandidateUrls) as a prior
+            // resolve of this URL ⇒ same folded key ⇒ legitimate cache hit,
+            // skipping merged/subgraph reads entirely for this URL (item 4).
+            // A changed set ⇒ different key ⇒ miss, exactly like a brand-new
+            // URL — no SWR-stale fallback here (event-candidate resolves are
+            // deliberately never served merely-stale; see primeBatchSwrEntry's
+            // exclusion below).
+            if (batchEventCandidateCacheRevision !== undefined) {
+              const cached = await sqliteStore.getCachedResolverResult(
+                canonicalUrl,
+                batchEventCandidateCacheRevision,
+              );
+              if (cached !== null) {
+                results[canonicalUrl] = cached as UrlResolutionResult;
+                continue;
+              }
+            }
             misses.push(canonicalUrl);
             continue;
           }
@@ -1111,6 +1239,28 @@ export const routes: readonly RouteDefinition[] = [
           }
           misses.push(canonicalUrl);
         }
+        // Index-backed (perf/event-candidate-resolve, coordinator-flagged
+        // profiling finding): checked ONCE so the read below can decide its
+        // OWN type list, not just how each URL's events get filtered
+        // afterward. Live `sample` profiling during a real browsing burst
+        // showed 10-12s single ticks dominated by sqlite3_step/VdbeExec/
+        // BtreeFinishMoveto — the WINDOW READ itself (materializing +
+        // JSON-decoding every matching row, most of them
+        // BROWSER_TIMELINE_OBSERVED) was the multi-second cost, not the JS
+        // filter that used to run after it. When the typed store is
+        // available, per-URL signal/timeline events now come from
+        // resolverSignalEventsForCanonicalUrlsIndexed /
+        // resolverTimelineEventsForCanonicalUrlsIndexed (by-URL indexed,
+        // above) and the candidate-generation timeline input comes from
+        // timelineEventsForCandidateGeneration (bounded, below) — NEITHER
+        // needs BROWSER_TIMELINE_OBSERVED or USER_FLOW_REJECTED in `merged`
+        // anymore, so the window read can drop straight to the same cheap
+        // enrichment-only type list the all-cache-hit branch already used.
+        // Store unavailable is the ONE case that still needs the wide read:
+        // the *Indexed helpers fall back to JS-filtering `merged` itself
+        // then, so `merged` must carry the full type list for that fallback
+        // to stay correct.
+        const typedEventStore = await eventStoreForContext(context);
         // When every URL was a resolver-cache hit there is no attribution work
         // to do — but the CONTENT lane still runs (it is decoupled from that
         // cache by design and recomputes at query time), and it needs the gist.
@@ -1124,7 +1274,7 @@ export const routes: readonly RouteDefinition[] = [
         // history of per-request full scans costing tens of seconds), and it is
         // strictly cheaper than the miss path's resolver-expand read.
         const merged =
-          misses.length === 0
+          misses.length === 0 || typedEventStore !== null
             ? await readEventsFromStoreOrLog(
                 context,
                 context.eventLog,
@@ -1185,12 +1335,20 @@ export const routes: readonly RouteDefinition[] = [
         // Folds from `merged`, which now always carries the enrichment types —
         // see the read above for why the all-cache-hit branch cannot be [].
         gistLookup = gistLookupFromMerged(requireVaultRoot(context), batchEnrichSig, merged);
+        // Gated on MISSED event-candidate targets, not just eventCandidate
+        // TargetSet.size — a target whose folded cache entry already hit
+        // (see the classification loop above) never reaches `misses`, and
+        // must not pay for a timeline read it has no use for (item 4: an
+        // all-hit batch pays zero merged/subgraph reads).
+        const missedEventCandidateTargets = misses.filter((canonicalUrl) =>
+          eventCandidateTargetSet.has(canonicalUrl),
+        );
         const expandedCandidateUrlsByTarget =
-          eventCandidateTargetSet.size === 0
+          missedEventCandidateTargets.length === 0
             ? new Map<string, readonly string[]>()
             : resolverExpandedCandidateUrlsForCanonicalUrls(
-                merged,
-                misses.filter((canonicalUrl) => eventCandidateTargetSet.has(canonicalUrl)),
+                await timelineEventsForCandidateGeneration(typedEventStore, merged),
+                missedEventCandidateTargets,
               );
         const expandedCandidateUrls = [
           ...new Set(
@@ -1224,7 +1382,21 @@ export const routes: readonly RouteDefinition[] = [
             'Connections snapshot is not ready.',
           );
         }
-        const missedEvents = resolverSignalEventsForCanonicalUrls(merged, misses);
+        // Index-backed (perf/event-candidate-resolve): O(matching rows) via
+        // events_resolver_url_idx / events_type_idx when the typed store is
+        // available, falling back to the JS filter over `merged` otherwise —
+        // see resolverSignalEventsForCanonicalUrlsIndexed's doc comment.
+        // Gated on misses.length: an all-cache-hit batch must not pay the
+        // (small but real, unlike the old free JS-filter-of-nothing) typed
+        // USER_FLOW_REJECTED read this now does (item 4).
+        const missedEvents =
+          misses.length === 0
+            ? []
+            : await resolverSignalEventsForCanonicalUrlsIndexed(
+                requireVaultRoot(context),
+                merged,
+                misses,
+              );
         for (const canonicalUrl of misses) {
           // BREATHE BETWEEN URLS. Everything below — the resolver, the lane
           // joins, the resolver-cache write — is SYNCHRONOUS sqlite on the
@@ -1254,23 +1426,41 @@ export const routes: readonly RouteDefinition[] = [
           }
           const expandEventCandidates = eventCandidateTargetSet.has(canonicalUrl);
           const expandedForTarget = expandedCandidateUrlsByTarget.get(canonicalUrl) ?? [];
+          // Index-backed (perf/event-candidate-resolve): these used to be two
+          // O(merged) JS filters PER event-candidate URL — on a real vault
+          // `merged` is hundreds of thousands of events, so with N
+          // event-candidate URLs in one batch that was N full scans back to
+          // back. The SIGNAL half is a filter over `missedEvents` (already
+          // fetched once for the whole batch, above — it already contains
+          // every USER_FLOW_REJECTED event AND every USER_ORGANIZED_ITEM
+          // event for every miss URL including this one, so no second sqlite
+          // read is needed). The TIMELINE half genuinely needs its own read
+          // (missedEvents never carries BROWSER_TIMELINE_OBSERVED) — O(matching
+          // rows) via events_resolver_url_idx when the typed store is
+          // available (falls back to the identical JS filter over `merged`
+          // otherwise — see resolverTimelineEventsForCanonicalUrlsIndexed's
+          // doc comment).
           const resolverEvents = expandEventCandidates
             ? [
-                ...resolverSignalEventsForCanonicalUrls(merged, [canonicalUrl]),
-                ...resolverTimelineEventsForCanonicalUrls(
+                ...missedEvents.filter(
+                  (event) =>
+                    event.type === USER_FLOW_REJECTED ||
+                    (event.type === USER_ORGANIZED_ITEM &&
+                      isUserOrganizedItemPayload(event.payload) &&
+                      event.payload.itemId === canonicalUrl),
+                ),
+                ...(await resolverTimelineEventsForCanonicalUrlsIndexed(
+                  requireVaultRoot(context),
                   merged,
                   new Set([canonicalUrl, ...expandedForTarget]),
-                ),
+                )),
               ]
             : missedEvents;
           const synthesizedForMiss = synthesizedTitleFor(canonicalUrl);
-          // PHASE BREAK: events-prep -> resolve. In the event-candidate case the
-          // lines above are two O(merged) filters over the whole read window
-          // (signal + timeline events for the target and every expanded
-          // candidate) — pure JS, but on a real vault `merged` is hundreds of
-          // thousands of events, so the prep alone is a tick worth of work
-          // BEFORE the resolver's sqlite reads start. Splitting them keeps
-          // "slowest single URL" from meaning "prep AND resolve back to back".
+          // PHASE BREAK: events-prep -> resolve. Keeps "slowest single URL"
+          // from meaning "prep AND resolve back to back" even now that prep
+          // is index-backed (a yield still caps how long one URL's sqlite
+          // reads can hold the loop before the resolver's own reads start).
           await yieldToEventLoop();
           const result = await resolveUrlAttributionArmed({
             vaultRoot: requireVaultRoot(context),
@@ -1283,7 +1473,17 @@ export const routes: readonly RouteDefinition[] = [
             ...(expandEventCandidates ? {} : { useEventCandidateSimilarity: false }),
           });
           results[canonicalUrl] = result;
-          if (batchCacheRevision !== undefined && !expandEventCandidates) {
+          // Event-candidate results now cache too (perf/event-candidate-
+          // resolve) — under the FOLDED revision (batchEventCandidateCache
+          // Revision), never the plain batchCacheRevision, so a changed
+          // candidate set can never collide with or shadow a differently-
+          // computed entry. SWR priming stays excluded for these (see the
+          // comment at primeBatchSwrEntry below) — only the persisted sqlite
+          // cache backs event-candidate re-resolves.
+          const cacheRevisionForWrite = expandEventCandidates
+            ? batchEventCandidateCacheRevision
+            : batchCacheRevision;
+          if (cacheRevisionForWrite !== undefined) {
             // Cache the SIX-lane result only. The content lane (lane 7) is
             // query-time + titleHint-dependent, so it is appended to the served
             // copy AFTER the cache read/write (see the final pass below) and is
@@ -1317,17 +1517,22 @@ export const routes: readonly RouteDefinition[] = [
                     : null;
                 },
                 canonicalUrl,
-                batchCacheRevision,
+                cacheRevisionForWrite,
                 result,
               );
             } else {
-              await sqliteStore.cacheResolverResult(canonicalUrl, batchCacheRevision, result);
+              await sqliteStore.cacheResolverResult(canonicalUrl, cacheRevisionForWrite, result);
             }
             // Seed the SWR cache so a later drain can serve this item stale +
             // refresh in the background rather than recomputing it inline in
             // the next convoy. eventCandidate items are intentionally excluded
-            // (they must always resolve fresh).
-            primeBatchSwrEntry(canonicalUrl, batchGraphSig, result);
+            // — they resolve fresh from the SWR's perspective (a graph-sig
+            // move never serves them merely-stale); the folded resolver-cache
+            // entry written just above is what makes a REPEAT request with
+            // the SAME candidate set fast, not the SWR layer.
+            if (!expandEventCandidates) {
+              primeBatchSwrEntry(canonicalUrl, batchGraphSig, result);
+            }
           }
         }
         // Content lane (lane 7) — appended query-time to EVERY served result
@@ -1349,10 +1554,17 @@ export const routes: readonly RouteDefinition[] = [
             merged,
             batchEnrichSig,
           );
+          // Memoized (perf/event-candidate-resolve, item 4): on an all-hit
+          // batch missedSnapshot is null, so this used to be an UNCONDITIONAL
+          // fresh subgraph read on every warm poll — see memoizedJoinSnapshot's
+          // doc comment for why reusing a revision-gated memo here is exactly
+          // as fresh as re-reading.
           const joinSnapshot =
             missedSnapshot ??
             (Object.keys(results).length > 0
-              ? await sqliteStore.readResolverSubgraphForUrls(uniqueUrls)
+              ? snapshotRevision === undefined
+                ? await sqliteStore.readResolverSubgraphForUrls(uniqueUrls)
+                : await memoizedJoinSnapshot(sqliteStore, snapshotRevision, uniqueUrls)
               : null);
           // Single finalize seam (stage S3): every served result — cache hit,
           // SWR stale, fresh compute alike — flows through the SAME function

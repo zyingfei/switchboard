@@ -124,3 +124,94 @@ off the serve path (`attribution-v1/reverseShadowDefer.ts`, mirrors
 `http/resolverCacheDefer.ts`). Truncation is deterministic and reported
 via `ConnectionsSnapshot.truncated` + a throttled
 `[resolver.subgraph.truncated]` log line for soak observability.
+
+**2026-08-16, round 2 — index-backed event-candidate resolve
+(perf/event-candidate-resolve).** Not an F1–F7 item; filed here per the
+"binding plan tracks reality" rule — same measured symptom family
+(multi-second `POST /v1/visits/batch-resolve`), a chokepoint specific to
+the panel's per-navigation "focused tab" resolve. Baseline measured on
+build bc862f1d: single fresh URL 3.1s, same URL warm (resolver-cache hit)
+1.5s, same URL passed via `eventCandidateUrls` 6.4s AND **never cached** —
+every focused-tab poll paid the full cost, forever, because the route
+unconditionally forced event-candidate URLs into the miss path and skipped
+both the cache read and the cache write for them (server.ts guard was
+`if (batchCacheRevision !== undefined && !expandEventCandidates)`).
+
+Measurement (item 1): a probe instrumented on a copied vault (never the
+live companion) plus a coordinator-supplied macOS `sample` profile from a
+real browsing burst agreed on the actual dominant cost: NOT the two
+per-candidate `.filter()` calls the original hypothesis named (cheap even
+on ~19K in-scope events, <25ms), but the WINDOW READ itself —
+`readEventsFromStoreOrLog`'s type-scoped SELECT materializing and
+JSON-decoding every `BROWSER_TIMELINE_OBSERVED`/`USER_FLOW_REJECTED`-family
+row before any per-URL work started (sqlite3_step/VdbeExec/
+BtreeFinishMoveto dominated the sample; the local probe showed this single
+read alone costing seconds, occasionally 10s+ under machine contention).
+The warm/cache-hit path additionally paid a full connections-subgraph read
+(`readResolverSubgraphForUrls`) on EVERY poll for the content lane's
+workstream join, even when every URL was a resolver-cache hit and no
+attribution work ran at all.
+
+Fix (four independent pieces, same PR):
+- **Maintained index**: `sync/eventStore.ts` gained a `resolver_url`
+  column + `events_resolver_url_idx` (migrated in-place with a one-time
+  ALTER+backfill on first open of a pre-existing store) and a
+  `events_type_accepted_at_idx`, plus `readByResolverUrls` /
+  `readMostRecentByType` store methods. Per-URL signal/timeline events for
+  the resolve now come from these indexed reads
+  (`resolverSignalEventsForCanonicalUrlsIndexed` /
+  `resolverTimelineEventsForCanonicalUrlsIndexed` in
+  `http/routes/visitsRoutes.ts`) instead of filtering the window read —
+  and the window read itself now DROPS the `BROWSER_TIMELINE_OBSERVED` /
+  `USER_FLOW_REJECTED` types entirely whenever the typed store is
+  available, since nothing downstream needs them from it anymore. The one
+  read that still needs breadth (candidate-generation's same-domain/
+  opener-chain/navigation-chain discovery, `resolverExpandedCandidateUrls
+  ForCanonicalUrls`) is now a BOUNDED most-recent-N read
+  (`SIDETRACK_RESOLVER_CANDIDATE_TIMELINE_WINDOW`, default 20,000, `0` =
+  kill switch back to unbounded), mirroring the hub-subgraph budget
+  pattern above, instead of the full type-scoped history.
+- **Candidate-keyed cache**: `eventCandidateCacheRevision` folds a stable
+  hash (FNV-1a) of the batch's sorted, deduped `eventCandidateUrls` into
+  the resolver-cache revision string. Event-candidate targets now get a
+  real cache read (folded key) before falling to the miss path, and a real
+  cache write (folded key, never the plain key) after computing — same
+  `(visit_id, revision)` table, same deferred-write path
+  (`resolverCacheDefer.ts`) as every other entry. A changed candidate set
+  is a different key, i.e. a correct miss, not a stale hit. SWR priming
+  stays excluded for these entries (an event-candidate resolve is still
+  never served merely-stale) — only the persisted sqlite cache backs a
+  repeat.
+- **All-hit fast path**: the initial per-URL loop now checks the folded
+  cache BEFORE pushing an event-candidate URL into `misses`, so a repeat
+  poll with an unchanged candidate set never reaches the window
+  read/candidate-generation/subgraph code at all.
+- **Join-snapshot memo**: the content lane's subgraph read
+  (`readResolverSubgraphForUrls` for the workstream join) is now memoized
+  per `(snapshotRevision, sorted URL set)` — revision-gated, not
+  TTL-gated, so a cache hit is exactly as fresh as a re-read (same trust
+  boundary the resolver cache itself already relies on). This was paying a
+  fresh subgraph read on EVERY all-cache-hit batch before this fix.
+
+Acceptance (serve-path): focused-URL re-resolve warm <300ms; fresh
+event-candidate <1.5s; resolver-cache rows grow during browsing
+(event-candidate results included, verified via
+`visitsRoutes.test.ts`'s cache-read/cache-write assertions with the folded
+key). Absolute wall-clock numbers from the local copied-vault measurement
+were NOT clean enough to cite as a before/after table — the shared dev
+machine had a live companion + its own reconcile child + (at times) a
+concurrent full test-suite run contending for CPU, producing 10x swings
+between identical requests. The structural claims (index used, cache
+folded and hit, window read narrowed, subgraph read memoized) are verified
+by call-count assertions in the touched test suites instead of wall-clock
+deltas; see PR #<TBD> for exact numbers and caveats.
+
+Tests added:
+`src/http/routes/visitsRoutes.test.ts` (new) — `stableHash` /
+`eventCandidateCacheRevision` unit tests (deterministic, sorted-set- and
+duplicate-invariant, distinct sets → distinct keys); events-prep
+equivalence test (indexed path vs. the O(merged) JS-filter reference on a
+synthetic fixture covering exact-vs-normalized URL matching, order-
+insensitive compare); store-unavailable fallback parity.
+`src/http/visitsRoutes.test.ts` — updated/added HTTP-level event-candidate
+cache tests (folded-key write, repeat-hits-cache, changed-set-misses).
