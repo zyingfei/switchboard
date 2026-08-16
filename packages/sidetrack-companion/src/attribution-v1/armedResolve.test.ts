@@ -9,6 +9,7 @@ import { ATTRIBUTION_ARM_ENV } from './serve.js';
 import { ATTRIBUTION_V1_SHADOW_ENV } from './shadow.js';
 import { armShadowSnapshot, resetArmShadowForTest } from './armShadow.js';
 import { resetShadowStateMemoForTest } from './emit.js';
+import { __resetReverseShadowDeferQueue, flushReverseShadows } from './reverseShadowDefer.js';
 import { writeAttributionV1Artifact } from './artifact.js';
 import type { ConnectionsSnapshot } from '../connections/types.js';
 import type { EventLog } from '../sync/eventLog.js';
@@ -93,6 +94,7 @@ describe('resolveUrlAttributionArmed', () => {
     vaultRoot = await mkdtemp(join(tmpdir(), 'armed-resolve-'));
     resetArmShadowForTest();
     resetShadowStateMemoForTest();
+    __resetReverseShadowDeferQueue();
     // Materialize a fresh v1 state artifact the vote arm can read.
     await writeAttributionV1Artifact({ vaultRoot, eventLog: stubEventLog(stateEvents) });
   });
@@ -103,6 +105,7 @@ describe('resolveUrlAttributionArmed', () => {
     if (prevShadow === undefined) delete process.env[ATTRIBUTION_V1_SHADOW_ENV];
     else process.env[ATTRIBUTION_V1_SHADOW_ENV] = prevShadow;
     resetShadowStateMemoForTest();
+    __resetReverseShadowDeferQueue();
     await rm(vaultRoot, { recursive: true, force: true });
   });
 
@@ -252,16 +255,26 @@ describe('resolveUrlAttributionArmed', () => {
     expect(result.decision.gate?.detail).toContain('lacks title vote');
   });
 
-  it('records the reverse arm-shadow (incumbent vs served vote3) when serving the vote arm', async () => {
+  it('records the reverse arm-shadow (incumbent vs served vote3) AFTER the resolve resolves, once flushed', async () => {
     process.env[ATTRIBUTION_ARM_ENV] = 'vote3';
     process.env[ATTRIBUTION_V1_SHADOW_ENV] = '1'; // shadow ON
     const probeUrl = 'https://blog.rust-lang.org/c';
-    await resolveUrlAttributionArmed({
+    const result = await resolveUrlAttributionArmed({
       vaultRoot,
       canonicalUrl: probeUrl,
       snapshot: snapshot(probeUrl, 'rust release notes'),
       events: [],
     });
+    // PERF (2026-08-16) — the served result is available IMMEDIATELY; the
+    // reverse shadow (the incumbent's full PPR re-run) is deferred and has
+    // NOT run yet at this point. The response never waits on it.
+    expect(result.decision).toBeDefined();
+    expect(armShadowSnapshot().requests).toBe(0);
+
+    // Draining the deferred queue (what the HTTP dispatch's `finally` does
+    // via scheduleReverseShadowFlush, AFTER the response is sent) is what
+    // actually runs the incumbent compute and records the sample.
+    await flushReverseShadows();
     const snap = armShadowSnapshot();
     expect(snap.requests).toBe(1);
     // The incumbent (empty snapshot edges ⇒ inbox/null) DISAGREES with the vote

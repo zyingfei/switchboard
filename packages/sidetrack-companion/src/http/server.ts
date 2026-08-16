@@ -35,6 +35,7 @@ import { VaultExportConfinementError, VaultUnavailableError } from './errors.js'
 import { isModelHostPath, serveModelFile } from './modelHostRoute.js';
 import { createProblem, type ValidationIssue } from './problem.js';
 import { queueResolverCacheWrite, resolverCacheDeferEnabled, scheduleResolverCacheFlush } from './resolverCacheDefer.js';
+import { scheduleReverseShadowFlush } from '../attribution-v1/reverseShadowDefer.js';
 
 import { HttpRouteError, RESOLVER_SIGNAL_EVENT_TYPES, acquireResolveSlot, callerIdentities, callerIdentityFor, connectionsGraphSig, domainTombstoneSetFor, eventReadCoverageSig, objectRecord, readBody, readEventsFromStoreOrLog, releaseResolveSlot, requireVaultRoot, resolveSwrCache } from './routeSupport.js';
 import type { CallerIdentity, CompanionHttpConfig, HttpMethod, RouteDefinition } from './routeSupport.js';
@@ -1196,6 +1197,19 @@ export const routes: readonly RouteDefinition[] = [
             [...expandedCandidateUrlsByTarget.values()].flatMap((candidateUrls) => candidateUrls),
           ),
         ];
+        // PERF (2026-08-16) — VERIFIED single pin for the whole misses loop
+        // below: this is the ONLY sqlite-metadata-deriving read
+        // (readResolverSubgraphForUrls -> #readMetadata -> the write_seq
+        // self-heal at snapshot.ts's #selfHealProjections) on this code path
+        // for the entire request. `missedSnapshot` is one object reference,
+        // reused verbatim by every URL in the misses loop below (the `const
+        // snapshot = missedSnapshot;` inside it) AND by finalizeBatchResolveResults's
+        // `joinSnapshot` fallback — nothing in either per-URL loop calls
+        // readSnapshotMetadata/readCurrent/any other subgraph read, so
+        // write_seq cannot advance (and re-trigger self-heal) mid-request.
+        // The reverse-shadow deferral (reverseShadowDefer.ts) does not change
+        // this: its deferred job reuses this SAME captured snapshot object,
+        // it never re-reads metadata. No separate pin needed.
         const missedSnapshot =
           misses.length === 0
             ? null
@@ -1813,6 +1827,11 @@ export const handleRequest = async (
     // scheduling at all, when the queue is empty — which is every request that
     // is not a batch-resolve with fresh misses.
     scheduleResolverCacheFlush();
+    // Same reasoning, same AFTER-the-response trigger point, for the
+    // reverse-shadow queue (reverseShadowDefer.ts) — the incumbent-resolver
+    // re-run that used to happen inline per miss URL now runs here instead.
+    // No-op when the shadow flag is off or the batch had zero misses.
+    scheduleReverseShadowFlush();
   }
 };
 

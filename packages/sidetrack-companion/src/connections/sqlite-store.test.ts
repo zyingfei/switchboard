@@ -145,6 +145,9 @@ describe('SqliteConnectionsStore', () => {
     vi.restoreAllMocks();
     delete process.env['SIDETRACK_CONNECTIONS_STORE'];
     delete process.env['SIDETRACK_CONNECTIONS_INCREMENTAL_SCOPES'];
+    delete process.env['SIDETRACK_RESOLVER_SUBGRAPH_NODE_BUDGET'];
+    delete process.env['SIDETRACK_RESOLVER_SUBGRAPH_EDGE_BUDGET'];
+    delete process.env['SIDETRACK_RESOLVER_HUB_DEGREE_CAP'];
     if (vaultRoot !== null) {
       await rm(vaultRoot, { recursive: true, force: true });
       vaultRoot = null;
@@ -225,6 +228,111 @@ describe('SqliteConnectionsStore', () => {
       expect(fromUrl?.edgeCount).toBe(4);
       expect(fromTabSession).toEqual(fromUrl);
       expect(fromThread).toEqual(fromUrl);
+      store.close();
+    },
+  );
+
+  // PERF (resolver hub-subgraph budgets, 2026-08-16) — synthetic hub-graph
+  // fixture for the traversal budget tests below. `hub` fans out to 12
+  // leaves (a stand-in for a real vault's high-fan-out URL, e.g. an
+  // aggregator front page with thousands of inbound links); `normalA` /
+  // `normalB` are an ordinary two-hop chain that shares NO edges with the
+  // hub, so it is the control group a hub cap must never disturb. All ids
+  // are synthetic workstream nodes — the cap under test is purely a
+  // structural incident-edge COUNT, so nothing here (or in
+  // #readIncidentEdgeDegrees) inspects a URL, domain, or node kind.
+  const HUB_LEAF_COUNT = 12;
+  const buildHubGraphSnapshot = (): ConnectionsSnapshot => {
+    const seed = node('workstream:seed', 'workstream', 'Seed');
+    const hub = node('workstream:hub', 'workstream', 'Hub');
+    const normalA = node('workstream:normalA', 'workstream', 'Normal A');
+    const normalB = node('workstream:normalB', 'workstream', 'Normal B');
+    const leaves = Array.from({ length: HUB_LEAF_COUNT }, (_, i) =>
+      node(`workstream:leaf-${String(i + 1).padStart(2, '0')}`, 'workstream', `Leaf ${String(i)}`),
+    );
+    const edges: ConnectionEdge[] = [
+      edge('thread_in_workstream', seed.id, hub.id, '2026-06-01T00:00:00.000Z'),
+      edge('thread_in_workstream', seed.id, normalA.id, '2026-06-01T00:00:01.000Z'),
+      edge('thread_in_workstream', normalA.id, normalB.id, '2026-06-01T00:00:02.000Z'),
+      ...leaves.map((leaf, i) =>
+        edge(
+          'thread_in_workstream',
+          hub.id,
+          leaf.id,
+          `2026-06-01T00:01:${String(i).padStart(2, '0')}.000Z`,
+        ),
+      ),
+    ];
+    return {
+      scope: {},
+      nodes: [seed, hub, normalA, normalB, ...leaves],
+      edges,
+      updatedAt: '2026-06-01T00:01:11.000Z',
+      nodeCount: 4 + HUB_LEAF_COUNT,
+      edgeCount: edges.length,
+      snapshotRevision: 'rev-hub-graph',
+    };
+  };
+
+  sqliteIt(
+    'traversal node budget truncates deterministically and reports truncated:true',
+    async () => {
+      const store = new SqliteConnectionsStore('/unused', { databasePath: ':memory:' });
+      await store.putCurrent(buildHubGraphSnapshot());
+      process.env['SIDETRACK_RESOLVER_HUB_DEGREE_CAP'] = '0'; // isolate the node budget
+      process.env['SIDETRACK_RESOLVER_SUBGRAPH_EDGE_BUDGET'] = '0';
+      process.env['SIDETRACK_RESOLVER_SUBGRAPH_NODE_BUDGET'] = '4';
+
+      const first = await store.readSubgraphForNode('workstream:seed', 2);
+      const second = await store.readSubgraphForNode('workstream:seed', 2);
+
+      expect(first?.truncated).toBe(true);
+      expect(first?.nodes.length).toBeLessThanOrEqual(4);
+      expect(first?.nodes.length).toBeGreaterThan(0);
+      // Deterministic across repeated calls on unchanged data — same node
+      // AND edge id sets, not just the same count.
+      expect(second?.nodes.map((n) => n.id)).toEqual(first?.nodes.map((n) => n.id));
+      expect(second?.edges.map((e) => e.id)).toEqual(first?.edges.map((e) => e.id));
+      expect(second?.truncated).toBe(true);
+      store.close();
+    },
+  );
+
+  sqliteIt(
+    'hub-degree cap withholds the hub from expansion while non-hub 2-hop reachability is unchanged',
+    async () => {
+      const store = new SqliteConnectionsStore('/unused', { databasePath: ':memory:' });
+      await store.putCurrent(buildHubGraphSnapshot());
+      process.env['SIDETRACK_RESOLVER_SUBGRAPH_NODE_BUDGET'] = '0';
+      process.env['SIDETRACK_RESOLVER_SUBGRAPH_EDGE_BUDGET'] = '0';
+
+      process.env['SIDETRACK_RESOLVER_HUB_DEGREE_CAP'] = '5';
+      const capped = await store.readSubgraphForNode('workstream:seed', 2);
+
+      process.env['SIDETRACK_RESOLVER_HUB_DEGREE_CAP'] = '0'; // kill switch: unbudgeted
+      const uncapped = await store.readSubgraphForNode('workstream:seed', 2);
+
+      // The hub itself is always reached (seed -> hub is a direct edge) and
+      // is always PRESENT — the cap withholds EXPANSION through it, not the
+      // node itself.
+      expect(capped?.nodes.map((n) => n.id)).toContain('workstream:hub');
+      // Non-hub reachability (seed -> normalA -> normalB, no hub edge on the
+      // path) is IDENTICAL with and without the cap.
+      expect(capped?.nodes.map((n) => n.id)).toContain('workstream:normalB');
+      expect(uncapped?.nodes.map((n) => n.id)).toContain('workstream:normalB');
+      // Hub fan-out is capped to <= 5 leaves under the budget, vs all 12
+      // leaves when the cap is killed (0 = unlimited).
+      const cappedLeafCount = (capped?.nodes ?? []).filter((n) =>
+        n.id.startsWith('workstream:leaf-'),
+      ).length;
+      const uncappedLeafCount = (uncapped?.nodes ?? []).filter((n) =>
+        n.id.startsWith('workstream:leaf-'),
+      ).length;
+      expect(cappedLeafCount).toBeLessThanOrEqual(5);
+      expect(cappedLeafCount).toBeGreaterThan(0);
+      expect(uncappedLeafCount).toBe(HUB_LEAF_COUNT);
+      expect(capped?.truncated).toBe(true);
+      expect(uncapped?.truncated).toBeUndefined();
       store.close();
     },
   );
