@@ -179,3 +179,26 @@ histogram mark, tuned later from data; (3) primary-promotion rule
 Implementation phase A = new modules (incremental revision builder,
 promotion, revision GC, tests) with NO materializer edits; phase B =
 wiring after W1 lands.
+
+## W3 landing notes (2026-08-16)
+
+Landed full-spec: repair-queue sidecar (dedupe on scope), unconditional
+demotion superseding the suppressor (cooldown machinery deleted),
+drain-time healing (takeBatch unioned into dirtyScopes), tripwire on
+the full-rebuild fallback, consent-gated cold-boot/version-bump with
+size threshold + first-run exemption, `connections-rebuild` CLI,
+repairQueueDepth + needs-repair health.
+
+CORRECTION to this doc: the in-drain Layer-0 similarity recovery IS a
+full-log rebuild, not scoped repair. Deliberate residual: routine
+self-heal reasons (laneUnloadedReuse/bootstrapAdopted/renderedRecovery)
+and already-consented reasons stay ungated; the consent-rule sub-reasons
+(materializer-version-bump, store-corruption-recovery) are marked
+`similarityRecovery.fullLogRebuild.notConsentGated` pending a scoped
+Layer-0 redesign (future wave; candidates: rebuild similarity from the
+persisted HNSW + corpus stores instead of the log).
+
+Un-healable repair class: scopes whose bail predates W1/W2 store
+activation recycle in the queue (self-diagnosing via depth/oldest
+gauges) until fresh events or one consented rebuild — shrinks to zero
+once flags are on from boot.

@@ -79,7 +79,6 @@ const envKeys = [
   'SIDETRACK_CONNECTIONS_DRIFT_DISABLED',
   'SIDETRACK_TOPIC_PRODUCER',
   'SIDETRACK_SEARCH_INDEX_STORE',
-  'SIDETRACK_FULL_REBUILD_COOLDOWN_MS',
   'SIDETRACK_CONNECTIONS_PHASE_LOG',
   'SIDETRACK_RANKER_ON_SCOPED_DELTA',
 ] as const;
@@ -328,11 +327,6 @@ describe('F8 W2 — search-index stores kill the pending-search-visit bail', () 
     process.env['SIDETRACK_CONNECTIONS_DRIFT_DISABLED'] = '1';
     process.env['SIDETRACK_TOPIC_PRODUCER'] = 'union-find';
     process.env['SIDETRACK_CONNECTIONS_PHASE_LOG'] = '1';
-    // Same rationale as connectionsThreadRegisterMembership.test.ts: the
-    // interim hot-rebuild suppressor (#364) coalesces a second
-    // full-rebuild-eligible drain within its cooldown into a no-op,
-    // which would mask this drain's own gate decision.
-    process.env['SIDETRACK_FULL_REBUILD_COOLDOWN_MS'] = '0';
     delete process.env['SIDETRACK_RANKER_ON_SCOPED_DELTA'];
   });
 
@@ -501,17 +495,21 @@ describe('F8 W2 — search-index stores kill the pending-search-visit bail', () 
     expect(closestVisitEdges(incremental)).toEqual([]);
   });
 
-  it('control: with the store disabled, an identical search-visit window still bails to a base rebuild', async () => {
+  it('control: with the store disabled, an identical search-visit window now DEMOTES instead of bailing to a base rebuild (F8 W3)', async () => {
     // No SIDETRACK_SEARCH_INDEX_STORE=1 — proves the flag (not some
     // unrelated fast path) is what changes drain behavior above.
-    // Also override SIDETRACK_SKIP_RANKER_SNAPSHOT=1 from beforeEach:
-    // with it set, a non-scoped drain takes the Stage 5.2 W3b
-    // scope-incremental publish path (writes only `dirtyScopes`'
-    // rows), which is orthogonal to W2 — the base rebuild's in-memory
-    // baseSnapshot is correct either way, but this control's assertion
-    // reads the PERSISTED snapshot, which that narrower publish path
-    // would not update for a thread-owned edge whose thread scope
-    // wasn't independently dirty this drain.
+    //
+    // F8 W3 supersedes the interim hot-rebuild suppressor this test used
+    // to exercise (docs/plans/2026-08-16-f8-ivm-designs.md, "W3"): the
+    // `pending-search-visit` bail now ALWAYS demotes (progress-only write,
+    // serve the PRIOR snapshot unchanged, enqueue the dirty scope) rather
+    // than ever reaching a full/widened rebuild. With the search-index
+    // store disabled there is no durable cross-window join source, so a
+    // repair-drain attempt hits the SAME structural gate and re-demotes —
+    // a genuine "cannot heal via scoped recompute" case (see
+    // connectionsThreadRegisterMembership.test.ts's control test for the
+    // sibling case, and connectionsRepairDemotion.test.ts for the
+    // heals-when-it-can equivalence test with the store ON).
     delete process.env['SIDETRACK_SKIP_RANKER_SNAPSHOT'];
     const replica = await loadOrCreateReplica(vaultRoot);
     const eventLog = createEventLog(vaultRoot, replica);
@@ -527,6 +525,8 @@ describe('F8 W2 — search-index stores kill the pending-search-visit bail', () 
     });
     await importEvents(eventLog, [founding]);
     await materializer.catchUp(eventLog);
+    const priorSnapshot = await store.readCurrent();
+    if (priorSnapshot === null) throw new Error('expected a snapshot after the founding drain');
 
     const newSearchVisit = timelineObserved({
       replicaId: 'A',
@@ -537,17 +537,21 @@ describe('F8 W2 — search-index stores kill the pending-search-visit bail', () 
     await importEvents(eventLog, [newSearchVisit]);
     const phase = await capturePhaseLog(() => materializer.catchUp(eventLog));
 
-    expect(phase).toContain('buildConnectionsSnapshot base');
+    expect(phase).toContain('scopedTimelineDelta.demoted reason=pending-search-visit');
 
-    const incremental = await store.readCurrent();
-    if (incremental === null) throw new Error('expected rebuilt snapshot');
-    // The old (expensive) full-rebuild path still produces the correct
-    // edges — the flag changes HOW they're derived (scoped vs. base),
-    // not WHETHER they end up correct — so this is a phase-log-only
-    // control, matching connectionsThreadRegisterMembership.test.ts's
-    // control test structure.
-    expect(searchQueryMentionEdges(incremental)).toEqual(
-      searchQueryMentionEdges(fullSnapshotFor([founding, newSearchVisit])),
+    const served = await store.readCurrent();
+    if (served === null) throw new Error('expected the prior snapshot to still be served');
+    // Genuinely stale (byte-identical to the pre-search-visit snapshot —
+    // the search visit's own timeline node never lands), never silently
+    // wrong: no thread_text_mentions_search_query edge exists as if the
+    // join had (incorrectly, partially) run.
+    expect(searchQueryMentionEdges(served)).toEqual([]);
+    expect(served.nodes.map((node) => node.id).sort()).toEqual(
+      priorSnapshot.nodes.map((node) => node.id).sort(),
     );
+    // Sanity: a full rebuild of the same two events WOULD mint the edge —
+    // otherwise this test would not be distinguishing demoted-stale from
+    // correctly-empty.
+    expect(searchQueryMentionEdges(fullSnapshotFor([founding, newSearchVisit]))).toHaveLength(1);
   });
 });

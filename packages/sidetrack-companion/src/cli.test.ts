@@ -647,6 +647,85 @@ describe('runCli', () => {
       await rm(vaultRoot, { recursive: true, force: true });
     }
   });
+
+  // F8 IVM plan W3 — Recovery consent rule (docs/plans/2026-08-16-f8-ivm-
+  // designs.md). `connections-rebuild` is the sole consented full-replay
+  // entry point; these tests mirror the compact-engagement CLI tests'
+  // structure (missing --vault, process-lock refusal, happy path).
+  it('connections-rebuild refuses without --vault', async () => {
+    const streams = createStreams();
+    const exitCode = await runCli(['connections-rebuild'], streams);
+    expect(exitCode).toBe(2);
+    expect(streams.stderr.text()).toContain('--vault');
+  });
+
+  it('connections-rebuild refuses when the recall process-lock is held by a live foreign PID', async () => {
+    // Mirrors the compact-engagement lock-refusal test above: a full
+    // replay is a second writer against the vault, so it takes the same
+    // one-writer-per-vault recall process-lock before touching anything.
+    const parentPid = process.ppid;
+    if (!Number.isFinite(parentPid) || parentPid <= 0) return;
+    const vaultRoot = await mkdtemp(join(tmpdir(), 'connections-rebuild-locked-'));
+    try {
+      await mkdir(join(vaultRoot, '_BAC', 'recall'), { recursive: true });
+      await writeFile(join(vaultRoot, '_BAC', 'recall', '.lock'), `${String(parentPid)}\n`, 'utf8');
+      const streams = createStreams();
+      const exitCode = await runCli(['connections-rebuild', '--vault', vaultRoot], streams);
+      expect(exitCode).toBe(1);
+      expect(streams.stderr.text()).toContain('refuses');
+      expect(streams.stderr.text()).toContain(String(parentPid));
+    } finally {
+      await rm(vaultRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('connections-rebuild performs a full replay from the complete event source and publishes it', async () => {
+    const vaultRoot = await mkdtemp(join(tmpdir(), 'connections-rebuild-happy-'));
+    try {
+      const { createEventLog } = await import('./sync/eventLog.js');
+      const { loadOrCreateReplica } = await import('./sync/replicaId.js');
+      const { THREAD_UPSERTED } = await import('./threads/events.js');
+      const replica = await loadOrCreateReplica(vaultRoot);
+      const eventLog = createEventLog(vaultRoot, replica);
+      await eventLog.importPeerEvent({
+        clientEventId: 'A.1.thread',
+        dot: { replicaId: 'A', seq: 1 },
+        deps: {},
+        aggregateId: 'T1',
+        type: THREAD_UPSERTED,
+        payload: {
+          bac_id: 'T1',
+          provider: 'chatgpt',
+          threadUrl: 'https://thread.example.test/T1',
+          title: 'T1 title',
+          lastSeenAt: '2026-08-16T10:00:00.000Z',
+        },
+        acceptedAtMs: Date.parse('2026-08-16T10:00:00.000Z'),
+      });
+
+      const streams = createStreams();
+      const exitCode = await runCli(
+        ['connections-rebuild', '--vault', vaultRoot, '--json'],
+        streams,
+      );
+      expect(exitCode).toBe(0);
+      const output = JSON.parse(streams.stdout.text()) as {
+        readonly vaultPath: string;
+        readonly nodeCount: number;
+        readonly edgeCount: number;
+      };
+      expect(output.vaultPath).toBe(vaultRoot);
+      expect(output.nodeCount).toBeGreaterThan(0);
+
+      const { createConnectionsStore } = await import('./connections/snapshot.js');
+      const store = createConnectionsStore(vaultRoot);
+      const snapshot = await store.readCurrent();
+      expect(snapshot).not.toBeNull();
+      expect(snapshot?.nodes.some((node) => node.id.includes('T1'))).toBe(true);
+    } finally {
+      await rm(vaultRoot, { recursive: true, force: true });
+    }
+  });
 });
 
 describe('renderServiceNextSteps', () => {

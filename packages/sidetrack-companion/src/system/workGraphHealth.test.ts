@@ -34,6 +34,7 @@ import {
 } from '../recall-v2/rankerShadowDiff.js';
 import type { AcceptedEvent } from '../sync/causal.js';
 import { createEventLog } from '../sync/eventLog.js';
+import { createRepairQueueStore } from '../connections/repairQueueStore.js';
 import {
   collectWorkGraphHealth,
   withLiveShipGateV2Serving,
@@ -496,6 +497,142 @@ describe('work graph diagnostic candidates', () => {
         }),
       ]),
     );
+  });
+
+  // F8 IVM plan W3 — repair-queue gauge + needs-repair condition
+  // (docs/plans/2026-08-16-f8-ivm-designs.md, "W3"; "Health" §5).
+  describe('repair-queue health (F8 W3)', () => {
+    beforeEach(async () => {
+      await mkdir(join(vaultRoot, '_BAC', 'connections'), { recursive: true });
+    });
+
+    it('reports depth=0 / status=ok / no needs-repair on a fresh vault', async () => {
+      const health = await collectWorkGraphHealth({
+        vaultRoot,
+        now: () => new Date('2026-08-16T13:00:00.000Z'),
+      });
+
+      expect(health.repairQueue).toEqual({
+        depth: 0,
+        oldestEnqueuedAt: null,
+        oldestAgeMs: null,
+        status: 'ok',
+        needsRepair: null,
+      });
+      expect(health.candidates).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            id: 'reconcile.repair-queue',
+            family: 'reconcile',
+            lane: 'queue',
+            status: 'ok',
+            reason: null,
+          }),
+        ]),
+      );
+    });
+
+    it('warns when repair-queue depth exceeds the threshold', async () => {
+      const store = await createRepairQueueStore(vaultRoot);
+      try {
+        for (let i = 0; i < 101; i += 1) {
+          store.enqueue([{ kind: 'url', id: `https://example.test/${String(i)}` }], 'gate');
+        }
+      } finally {
+        store.close();
+      }
+
+      const health = await collectWorkGraphHealth({
+        vaultRoot,
+        now: () => new Date('2026-08-16T13:00:00.000Z'),
+      });
+
+      expect(health.repairQueue.depth).toBe(101);
+      expect(health.repairQueue.status).toBe('warning');
+      expect(health.candidates).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            id: 'reconcile.repair-queue',
+            status: 'warning',
+            reason: 'repair-queue-backlog',
+            metrics: expect.objectContaining({ depth: 101, depthWarnThreshold: 100 }),
+          }),
+        ]),
+      );
+    });
+
+    it('warns when the oldest repair-queue entry has been queued over an hour', async () => {
+      const store = await createRepairQueueStore(vaultRoot);
+      try {
+        store.enqueue([{ kind: 'thread', id: 'T1' }], 'thread-workstream-membership-changed');
+      } finally {
+        store.close();
+      }
+
+      // Entry was enqueued "now" (real wall clock); ask health to evaluate
+      // staleness 2 hours in the future rather than manipulating the
+      // stored timestamp directly.
+      const health = await collectWorkGraphHealth({
+        vaultRoot,
+        now: () => new Date(Date.now() + 2 * 60 * 60 * 1000),
+      });
+
+      expect(health.repairQueue.depth).toBe(1);
+      expect(health.repairQueue.status).toBe('warning');
+      expect(health.repairQueue.oldestAgeMs).not.toBeNull();
+      expect(health.repairQueue.oldestAgeMs ?? 0).toBeGreaterThan(60 * 60 * 1000);
+    });
+
+    it('does not warn below both thresholds', async () => {
+      const store = await createRepairQueueStore(vaultRoot);
+      try {
+        store.enqueue([{ kind: 'thread', id: 'T1' }], 'thread-workstream-membership-changed');
+      } finally {
+        store.close();
+      }
+
+      const health = await collectWorkGraphHealth({
+        vaultRoot,
+        now: () => new Date(Date.now() + 60_000),
+      });
+
+      expect(health.repairQueue.depth).toBe(1);
+      expect(health.repairQueue.status).toBe('ok');
+    });
+
+    it('surfaces the needs-repair condition with the exact CLI command (Recovery consent rule)', async () => {
+      const store = await createRepairQueueStore(vaultRoot);
+      try {
+        store.markNeedsRepair(
+          'cold-boot-non-empty-vault',
+          `sidetrack-companion connections-rebuild --vault ${vaultRoot}`,
+        );
+      } finally {
+        store.close();
+      }
+
+      const health = await collectWorkGraphHealth({
+        vaultRoot,
+        now: () => new Date('2026-08-16T13:00:00.000Z'),
+      });
+
+      expect(health.repairQueue.needsRepair).toEqual({
+        reason: 'cold-boot-non-empty-vault',
+        command: `sidetrack-companion connections-rebuild --vault ${vaultRoot}`,
+        detectedAt: expect.any(String),
+      });
+      expect(health.candidates).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            id: 'reconcile.repair-queue',
+            status: 'alarm',
+            reason: expect.stringContaining(
+              `run: sidetrack-companion connections-rebuild --vault ${vaultRoot}`,
+            ),
+          }),
+        ]),
+      );
+    });
   });
 
   it('surfaces canonicalization telemetry and over-collapsed page-content hygiene', async () => {

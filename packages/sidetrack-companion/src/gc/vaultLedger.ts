@@ -214,6 +214,10 @@ export const classifyVaultPath = (segments: readonly string[]): LedgerFamily => 
         // src/search-index/captureTextFtsStore.ts.
         leaf === 'search-query-index.db' ||
         leaf === 'capture-text-fts.db' ||
+        // W3 of the F8 IVM plan — the persisted repair queue (bail
+        // demotion target) + the durable needs-repair marker share this
+        // sidecar. See src/connections/repairQueueStore.ts.
+        leaf === 'repair-queue.db' ||
         leaf === 'snapshot.sqlite'
       ) {
         return 'connections-sidecar-dbs';

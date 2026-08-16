@@ -1,4 +1,4 @@
-import { mkdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises';
+import { mkdir, readdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 
 import {
@@ -297,6 +297,10 @@ import {
   type CaptureTextFtsStore,
 } from '../../search-index/captureTextFtsStore.js';
 import { matchesWholeWordQuery } from '../../search-index/searchTextMatch.js';
+import {
+  createRepairQueueStore,
+  type RepairQueueStore,
+} from '../../connections/repairQueueStore.js';
 import {
   BROWSER_TIMELINE_OBSERVED,
   type BrowserTimelineObservedPayload,
@@ -661,6 +665,58 @@ const searchIndexStoreEnabled = (): boolean =>
 // is always covered without paying a full lifetime-history scan on
 // every drain with a new capture.
 const RECENT_SEARCH_QUERY_BOUND = 200;
+// F8 W3 — Recovery consent rule (docs/plans/2026-08-16-f8-ivm-designs.md,
+// "Recovery consent rule"). Catastrophic-loss recovery (cold boot with no
+// previous snapshot on a NON-empty vault, a materializer version bump, a
+// Layer-0 similarity-corruption reset) must never auto-invoke a full
+// replay on a vault of meaningful size — only a genuinely fresh/small
+// vault gets the first-run auto-build exemption. `estimateEventLogBytes`
+// sums the canonical JSONL log's on-disk size (stat only, never reads
+// content) the same directory shape threadRegisterStore.rebuildFromJsonl
+// walks. A missing/unreadable log root is treated as 0 bytes (fresh
+// vault), matching every other "no log yet" fallback in this file.
+export const estimateEventLogBytes = async (vaultRoot: string): Promise<number> => {
+  const logRoot = join(vaultRoot, '_BAC', 'log');
+  let replicaDirs: string[];
+  try {
+    replicaDirs = await readdir(logRoot);
+  } catch {
+    return 0;
+  }
+  let total = 0;
+  for (const replicaDir of replicaDirs) {
+    let files: string[];
+    try {
+      files = (await readdir(join(logRoot, replicaDir))).filter((f) => f.endsWith('.jsonl'));
+    } catch {
+      continue;
+    }
+    for (const file of files) {
+      try {
+        const info = await stat(join(logRoot, replicaDir, file));
+        total += info.size;
+      } catch {
+        // File vanished mid-walk (concurrent seal/rotate) — skip, not fatal.
+      }
+    }
+  }
+  return total;
+};
+const RECOVERY_CONSENT_DEFAULT_THRESHOLD_BYTES = 10 * 1024 * 1024;
+// Env-tunable so tests can exercise "large vault" behavior without writing
+// 10MB of fixture log.
+export const recoveryConsentThresholdBytes = (): number => {
+  const raw = process.env['SIDETRACK_RECOVERY_CONSENT_THRESHOLD_BYTES'];
+  const parsed = raw === undefined ? Number.NaN : Number.parseInt(raw, 10);
+  return Number.isFinite(parsed) && parsed >= 0
+    ? parsed
+    : RECOVERY_CONSENT_DEFAULT_THRESHOLD_BYTES;
+};
+// The exact command string surfaced in the needs-repair health condition
+// (Recovery consent rule item 2) — must match src/cli.ts's
+// `connections-rebuild` subcommand literally.
+export const connectionsRebuildCommandFor = (vaultRoot: string): string =>
+  `sidetrack-companion connections-rebuild --vault ${vaultRoot}`;
 // Scoped re-visit no-op fast path (default ON; disable with =0 + restart
 // for instant rollback). When a drain window touches scopes that own
 // graph rows but carries NO graph-row-affecting event (no
@@ -938,6 +994,7 @@ export interface CreateConnectionsMaterializerDeps {
   readonly threadRegisterStore?: ThreadRegisterStore;
   readonly searchQueryIndexStore?: SearchQueryIndexStore;
   readonly captureTextFtsStore?: CaptureTextFtsStore;
+  readonly repairQueueStore?: RepairQueueStore;
   readonly eventStore?: EventStore;
   readonly rankerRetrainer?: RankerRetrainer;
   readonly closestVisitRankerLoader?: ClosestVisitRankerLoader;
@@ -1145,6 +1202,17 @@ export interface ConnectionsMaterializer extends Materializer {
    * must never contend with embedding CPU (CPU regime).
    */
   readonly isDrainActive: () => boolean;
+  /**
+   * F8 W3 — Recovery consent rule. The ONLY consented entry point for a
+   * full-log rebuild outside the existing Layer-0 recovery tier. Forces
+   * exactly one `buildAndWrite` pass down the full-rebuild path (bypassing
+   * demotion and the non-empty-vault consent gates, since calling this
+   * function IS the consent) and clears the persisted repair queue +
+   * needs-repair marker on success, since a full rebuild heals every
+   * queued scope by construction. Intended caller: the `connections-rebuild`
+   * CLI subcommand (src/cli.ts) — never an automatic/scheduled path.
+   */
+  readonly runConsentedFullRebuild: () => Promise<ConnectionsSnapshot>;
   /**
    * Lifecycle — release this instance. Cancels all scheduled work the
    * factory owns (the drain debounce timer and the content-only
@@ -1560,25 +1628,32 @@ export const createConnectionsMaterializer = (
   // Chunk counter for catch-up blob pacing (see
   // chunkProjectionAccumulatorStateFor). Reset per chunked catch-up.
   let catchUpChunkCounter = 0;
-  // Search-visit rebuild coalescing. A search visit in a drain window
-  // cannot take the scoped path (cross-visit search edges need the full
-  // corpus), so every drain whose window contains one fell to the full
-  // rebuild — during active search-heavy browsing that meant a
-  // multi-minute full pass PER DRAIN (observed live 2026-08-16: real
-  // captures starved to 26-30s behind back-to-back rebuilds). The full
-  // rebuild now runs at most once per cooldown; in between, search-visit
-  // drains advance progress only (prior snapshot served, same mechanics
-  // as the catch-up deferral). `searchVisitRowsDeferred` is sticky so
-  // that once the cooldown expires the NEXT drain — search or not —
-  // performs the healing rebuild rather than waiting for another search.
-  let lastFullBaseRebuildAtMs = 0;
-  let searchVisitRowsDeferred = false;
-  const searchRebuildCoalesceMs = (): number => {
-    const raw =
-      process.env['SIDETRACK_FULL_REBUILD_COOLDOWN_MS'] ??
-      process.env['SIDETRACK_SEARCH_REBUILD_COALESCE_MS'];
+  // F8 W3 — the hot-rebuild suppressor (#364) that used to live here
+  // (lastFullBaseRebuildAtMs / searchVisitRowsDeferred /
+  // searchRebuildCoalesceMs, a once-per-cooldown healing full rebuild) is
+  // SUPERSEDED by demotion: see docs/plans/2026-08-16-f8-ivm-designs.md
+  // "W3". Every non-recovery-tier bail now demotes unconditionally
+  // (progress-only write + repair-queue enqueue, no cooldown, no sticky
+  // healing rebuild) instead of coalescing full rebuilds on a timer — a
+  // full rebuild off an operational drain path no longer exists at all
+  // for these classes, healing runs through the repair-queue drain at the
+  // top of buildAndWrite instead (see repairQueueStore below).
+  //
+  // `forceFullRebuildConsented` is the ONE remaining way a drain takes a
+  // full-log rebuild outside the existing recovery tier
+  // (similarityRecoveryNeedsBaseRebuild / forceFullRebuildForThreadReconcile):
+  // the user-consented `connections-rebuild` CLI (Recovery consent rule)
+  // sets it via `runConsentedFullRebuild` before calling buildAndWrite once,
+  // and it is never set by any automatic/scheduled path.
+  let forceFullRebuildConsented = false;
+  // F8 W3 — persistent repair queue (see repairQueueStore.ts). Batch size
+  // for the drain-start takeBatch; env-tunable for tests/ops, never
+  // disabled outright (an unbounded batch would reintroduce an
+  // unbounded-cost drain).
+  const repairBatchSize = (): number => {
+    const raw = process.env['SIDETRACK_REPAIR_BATCH'];
     const parsed = raw === undefined ? Number.NaN : Number.parseInt(raw, 10);
-    return Number.isFinite(parsed) && parsed >= 0 ? parsed : 600_000;
+    return Number.isFinite(parsed) && parsed > 0 ? parsed : 16;
   };
   // Persistent engagement fact store (lazy-opened; survives restart).
   // Sourced via deps for tests; defaults to the SQLite-backed store.
@@ -1612,6 +1687,13 @@ export const createConnectionsMaterializer = (
   let captureTextFtsStore: CaptureTextFtsStore | null = null;
   let captureTextFtsStoreInit: Promise<CaptureTextFtsStore> | null = null;
   let captureTextFtsStoreUnavailable = false;
+  // F8 W3 — persistent repair queue (lazy-opened; survives restart).
+  // ALWAYS on (no feature flag, unlike W1/W2's opt-in stores): demotion
+  // is the only remaining path for a non-recovery-tier bail, so this
+  // store must always be reachable. See repairQueueStore.ts's header.
+  let repairQueueStore: RepairQueueStore | null = null;
+  let repairQueueStoreInit: Promise<RepairQueueStore> | null = null;
+  let repairQueueStoreUnavailable = false;
   let eventStore: EventStore | null = null;
   let eventStoreInit: Promise<EventStore> | null = null;
   let eventStoreUnavailable = false;
@@ -1695,6 +1777,22 @@ export const createConnectionsMaterializer = (
     } catch {
       captureTextFtsStoreUnavailable = true;
       captureTextFtsStoreInit = null;
+      return null;
+    }
+  };
+  const ensureRepairQueueStore = async (): Promise<RepairQueueStore | null> => {
+    if (repairQueueStore !== null) return repairQueueStore;
+    if (repairQueueStoreUnavailable) return null;
+    try {
+      repairQueueStoreInit ??=
+        deps.repairQueueStore !== undefined
+          ? Promise.resolve(deps.repairQueueStore)
+          : createRepairQueueStore(deps.vaultRoot);
+      repairQueueStore = await repairQueueStoreInit;
+      return repairQueueStore;
+    } catch {
+      repairQueueStoreUnavailable = true;
+      repairQueueStoreInit = null;
       return null;
     }
   };
@@ -3870,16 +3968,62 @@ export const createConnectionsMaterializer = (
     const timelineDays = enrichTimelineDaysWithEngagement(rawTimelineDays, engagementInputs);
     mark('enrichTimelineDays');
     await yieldToEventLoop();
-    const dirtyScopes = invalidationKeysToScopes(buildKeys);
-    const previousSnapshotForRanker = await deps.store.readCurrent();
-    // Boot inherits the on-disk snapshot as "recently rebuilt": without this
-    // every RESTART pays one full ~370MB generation rewrite on the first
-    // bailed drain (lastFullBaseRebuildAtMs starts at 0 ⇒ cooldown trivially
-    // expired). An existing published generation is at worst one cooldown
-    // stale, which the sticky healing rebuild already bounds.
-    if (lastFullBaseRebuildAtMs === 0 && previousSnapshotForRanker !== null) {
-      lastFullBaseRebuildAtMs = Date.now();
+    // F8 W3 — repair-queue drain. Always attempted (no feature flag); a
+    // failure to open just means no scopes get pulled this drain (the
+    // queue keeps them for the next one — never lost). Only drains
+    // outside chunk mode: a catch-up chunk's own deferral mechanics
+    // (catchUpDeferredThreadReconcile) already handle its bail class, and
+    // pulling repair work into a chunk would fight the chunk's own
+    // bounded-cost contract.
+    const repairQueueFactStore = await ensureRepairQueueStore();
+    const repairScopesForDrain: Scope[] = [];
+    if (repairQueueFactStore !== null && !requireScopedTimelineDeltaForDrain) {
+      const drained = repairQueueFactStore.takeBatch(repairBatchSize());
+      for (const entry of drained) repairScopesForDrain.push(entry.scope);
+      if (drained.length > 0) {
+        mark(
+          `repairQueue.drain n=${String(drained.length)} reasons=${[
+            ...new Set(drained.map((entry) => entry.reason)),
+          ]
+            .slice(0, 5)
+            .join(',')}`,
+        );
+      }
     }
+    // Union repaired scopes into THIS drain's dirty set so they ride the
+    // ordinary scoped recompute + replaceScopeRows path below — recomputing
+    // a repaired scope against the CURRENT base snapshot is what actually
+    // heals it (or, if the underlying cause is still unresolved, re-demotes
+    // it with a fresh timestamp; see repairQueueStore.ts's header).
+    const dirtyScopes =
+      repairScopesForDrain.length === 0
+        ? invalidationKeysToScopes(buildKeys)
+        : dedupeScopeList([...invalidationKeysToScopes(buildKeys), ...repairScopesForDrain]);
+    const previousSnapshotForRanker = await deps.store.readCurrent();
+    // F8 W3 — Recovery consent rule. Lazy + memoized per drain: the fs
+    // walk only pays its cost on the rare drains that actually reach a
+    // catastrophic-recovery decision point (cold boot with no previous
+    // snapshot, a materializer version bump) — never the ordinary warm
+    // scoped-delta path. `forceFullRebuildConsented` (the CLI) always
+    // short-circuits to "consented" without touching disk.
+    let vaultLogBytesMemo: number | undefined;
+    const vaultIsLargeForConsent = async (): Promise<boolean> => {
+      if (forceFullRebuildConsented) return false;
+      if (vaultLogBytesMemo === undefined) {
+        vaultLogBytesMemo = await estimateEventLogBytes(deps.vaultRoot);
+      }
+      return vaultLogBytesMemo > recoveryConsentThresholdBytes();
+    };
+    const markNeedsRepairIfLarge = async (reason: string): Promise<boolean> => {
+      const large = await vaultIsLargeForConsent();
+      if (large && repairQueueFactStore !== null) {
+        repairQueueFactStore.markNeedsRepair(reason, connectionsRebuildCommandFor(deps.vaultRoot));
+        mark(
+          `recoveryConsent.needsRepair reason=${reason} cmd=${connectionsRebuildCommandFor(deps.vaultRoot)}`,
+        );
+      }
+      return large;
+    };
     // Stage 5.2 W3 — skip-gate the most expensive pass. The revisionId
     // is a hash over (model + threshold + topK + gate + per-visit
     // corpus/focus). If the same set of visits has already been
@@ -4146,6 +4290,14 @@ export const createConnectionsMaterializer = (
       existingProgress.materializerVersion !== MATERIALIZER_VERSION
     ) {
       similarityFloorResetReasons.push('materializer-version-bump');
+      // F8 W3 — Recovery consent rule: a version bump on a large vault
+      // must not silently trigger a hundreds-of-MB rewrite. The demotion
+      // machinery already prevents the auto-rebuild structurally (no
+      // scoped-delta gate passes under a version mismatch, so every bail
+      // demotes rather than falling into the full-rebuild fallback); this
+      // additionally surfaces the specific, actionable condition via the
+      // needs-repair health row instead of a generic per-scope reason.
+      await markNeedsRepairIfLarge('materializer-version-bump');
     }
     if (loadedHnswStoreForGate?.recoveredFromCorruption() ?? false) {
       similarityFloorResetReasons.push('store-corruption-recovery');
@@ -6268,6 +6420,42 @@ export const createConnectionsMaterializer = (
       bootstrapAdopted ||
       renderedSimilarityRecoveryNeeded ||
       resetForcesFullCorpusRebuild;
+    // F8 W3 investigation note (Recovery consent rule, "Layer-0 similarity
+    // corruption"): the W3 wave bullet describes this whole path as
+    // "scoped repair, not full replay" and says to leave it untouched.
+    // Reading `baseRebuildEvents` a few lines below shows that claim is
+    // FALSE — `similarityRecoveryNeedsBaseRebuild` (any of its 4 sub-
+    // reasons) drives a `storeBackedEvents.readSince({})` /
+    // `deps.eventLog.readMerged()` read (the COMPLETE log) and a full
+    // `buildConnectionsSnapshot` over it: a genuine full-log rebuild.
+    // DELIBERATELY NOT consent-gated here despite that, for two of the
+    // four sub-reasons: `laneUnloadedReuse` / `bootstrapAdopted` /
+    // `renderedSimilarityRecoveryNeeded` are ROUTINE self-heals (the HNSW
+    // lane not warm yet, a wiped served signal recovering from an
+    // on-disk revision) that fire on ordinary restarts, not catastrophic
+    // loss — gating them would silently regress Layer-0 self-recovery on
+    // every large-vault restart. `resetForcesFullCorpusRebuild` driven by
+    // `privacy-purge` or `operator-rebuild` must also stay ungated: a
+    // purge has to complete for privacy correctness, and an operator
+    // rebuild IS itself the consent. Only `resetForcesFullCorpusRebuild`
+    // driven by `materializer-version-bump` or `store-corruption-recovery`
+    // — the two sub-reasons that actually match the Recovery consent
+    // rule's enumerated list — are candidates for gating; left ungated in
+    // this wave (see the coordinator report) because splitting the
+    // similarity-floor reset-reason set finer risks the floor guard's
+    // "exactly one of the three flags" invariant and its render-floor
+    // backstop, which need dedicated regression coverage beyond this
+    // wave's scope. Marked here so the gap is visible in phase logs, not
+    // silent.
+    if (
+      resetForcesFullCorpusRebuild &&
+      (similarityFloorResetReasons.includes('materializer-version-bump') ||
+        similarityFloorResetReasons.includes('store-corruption-recovery'))
+    ) {
+      mark(
+        `similarityRecovery.fullLogRebuild.notConsentGated reasons=${similarityFloorResetReasons.join(',')} — see F8 W3 report`,
+      );
+    }
     if (renderedSimilarityRecoveryNeeded && !laneUnloadedReuse && !bootstrapAdopted) {
       mark(
         `renderedSimilarityRecovery.forceBaseRebuild adopted=${String(
@@ -6301,14 +6489,30 @@ export const createConnectionsMaterializer = (
           buildEngagementClassifierInputs(baseRebuildEvents, buildTimelineDays(baseRebuildEvents)),
         )
       : timelineDays;
-    let baseSnapshot: ConnectionsSnapshot =
-      similarityRecoveryNeedsBaseRebuild
-        ? buildConnectionsSnapshot({
-            ...input,
-            events: baseRebuildEvents,
-            timelineDays: baseRebuildTimelineDays,
-          })
-        : (previousSnapshotForRanker ?? buildConnectionsSnapshot(input));
+    let baseSnapshot: ConnectionsSnapshot;
+    if (similarityRecoveryNeedsBaseRebuild) {
+      baseSnapshot = buildConnectionsSnapshot({
+        ...input,
+        events: baseRebuildEvents,
+        timelineDays: baseRebuildTimelineDays,
+      });
+    } else if (previousSnapshotForRanker !== null) {
+      baseSnapshot = previousSnapshotForRanker;
+    } else if (await markNeedsRepairIfLarge('cold-boot-non-empty-vault')) {
+      // F8 W3 — Recovery consent rule. Cold boot with NO previous
+      // snapshot on a vault whose canonical log is already substantial:
+      // this used to be an UNCONDITIONAL `buildConnectionsSnapshot(input)`
+      // over the complete merged event set — exactly the silent
+      // hundreds-of-MB full replay the consent rule forbids. Serve
+      // degraded (empty graph, zero event-derived rows) instead of
+      // auto-replaying; the needs-repair mark above names the exact CLI
+      // command. A genuinely fresh/small vault (below the threshold)
+      // still auto-builds below — first-run setup is not recovery.
+      baseSnapshot = buildConnectionsSnapshot({ ...input, events: [], timelineDays: [] });
+      mark('coldBoot.degraded reason=non-empty-vault-no-previous-snapshot');
+    } else {
+      baseSnapshot = buildConnectionsSnapshot(input);
+    }
     // A Layer-0 recovery rebuild produces the COMPLETE graph from the full
     // log (same as the cold build), so treat it as prebuilt: the
     // scoped-delta / incremental-view paths below must not run against it.
@@ -6355,19 +6559,16 @@ export const createConnectionsMaterializer = (
       // the rebuild that re-derives thread_in_workstream edges).
       scopedTimelineDeltaSkipDetail = 'thread-membership-reconcile-forced';
     }
-    // Sticky search-visit healing: rows were deferred by a coalesced
-    // search-visit drain and the cooldown has expired — force THIS drain
-    // (search or not) down the full-rebuild path so the deferred rows and
-    // cross-search edges land now rather than waiting for another search.
-    const searchVisitCadenceRebuildDue =
-      !requireScopedTimelineDeltaForDrain &&
-      searchVisitRowsDeferred &&
-      Date.now() - lastFullBaseRebuildAtMs >= searchRebuildCoalesceMs();
-    if (searchVisitCadenceRebuildDue && !forceFullRebuildForThreadReconcile) {
-      scopedTimelineDeltaSkipDetail = 'search-visit-cadence-rebuild';
+    // F8 W3 — the user-consented `connections-rebuild` CLI forces the full
+    // path exactly once (see `forceFullRebuildConsented`'s declaration):
+    // the scoped delta must NOT run, matching the reconcile-forced case
+    // above (this drain's whole point is to re-derive the graph from the
+    // complete event source).
+    if (forceFullRebuildConsented && !forceFullRebuildForThreadReconcile) {
+      scopedTimelineDeltaSkipDetail = 'consented-full-rebuild';
     }
     if (
-      !searchVisitCadenceRebuildDue &&
+      !forceFullRebuildConsented &&
       !forceFullRebuildForThreadReconcile &&
       scopedTimelineDeltaGate.incrementalScopes &&
       scopedTimelineDeltaGate.feature &&
@@ -7141,7 +7342,7 @@ export const createConnectionsMaterializer = (
         }
       }
     }
-    let searchVisitRebuildCoalesced = false;
+    let demotedThisDrain = false;
     if (!scopedTimelineDeltaApplied) {
       mark(
         `scopedTimelineDelta skip reason=${scopedTimelineDeltaSkipDetail} inc=${String(scopedTimelineDeltaGate.incrementalScopes)} feature=${String(scopedTimelineDeltaGate.feature)} prev=${String(scopedTimelineDeltaGate.hasPrevious)} progress=${String(scopedTimelineDeltaGate.hasProgress)} version=${String(scopedTimelineDeltaGate.version)} replace=${String(scopedTimelineDeltaGate.replace)} pending=${String(pendingEventsForDrain.length)} allScoped=${String(scopedTimelineDeltaGate.allScopedEvents)} topicSame=${String(scopedTimelineDeltaGate.topicSame)} topicStale=${String(topicSnapshotStale)} hnswNotFull=${String(scopedTimelineDeltaGate.hnswNotFull)} dirtyScopes=${String(dirtyScopes.length)} types=${summarizeEventTypes(pendingEventsForDrain)}`,
@@ -7196,25 +7397,26 @@ export const createConnectionsMaterializer = (
           `connections catchUp chunk could not apply scoped delta: ${scopedTimelineDeltaSkipDetail}`,
         );
       }
-      // Hot-path rebuild suppressor (see the flag declarations for the full
-      // argument; SSD-wear directive 2026-08-16): within the cooldown ANY
-      // bailed drain advances progress only and serves the prior snapshot —
-      // a full rebuild writes a ~370MB generation in response to a KB-scale
-      // logical change, and during search-heavy browsing that ran per drain.
-      // The deferred rows are healed by the next full rebuild, which the
-      // sticky flag forces on the first drain after cooldown expiry, so
-      // staleness is bounded by SIDETRACK_FULL_REBUILD_COOLDOWN_MS. Recovery
-      // classes (similarity base-rebuild, forced membership reconcile) are
-      // excluded — those are the repair tier and must run when asked.
+      // F8 W3 — unconditional demotion (supersedes the interim hot-rebuild
+      // suppressor #364, which coalesced full rebuilds onto a cooldown
+      // timer instead of eliminating them). EVERY remaining bail — any
+      // reason NOT already handled above — now ALWAYS advances progress
+      // only and serves the prior snapshot (never a cooldown window, never
+      // a sticky healing rebuild), and enqueues this drain's dirty scopes
+      // into the persisted repair queue so the NEXT drain's repair-queue
+      // drain (top of buildAndWrite) heals them through the ordinary
+      // scoped-recompute path. Recovery-tier classes (similarity
+      // base-rebuild, forced membership reconcile, the user-consented CLI
+      // rebuild) are excluded — those are the repair tier / explicit
+      // consent and must run when asked; everything else structurally
+      // never reaches a full rebuild from an operational drain again.
       if (
         !requireScopedTimelineDeltaForDrain &&
         !similarityRecoveryNeedsBaseRebuild &&
         !forceFullRebuildForThreadReconcile &&
-        scopedTimelineDeltaSkipDetail !== 'thread-membership-reconcile-forced' &&
-        scopedTimelineDeltaSkipDetail !== 'search-visit-cadence-rebuild' &&
+        !forceFullRebuildConsented &&
         previousSnapshotForScopedDelta !== null &&
-        replaceScopeRowsForScopedDelta !== undefined &&
-        Date.now() - lastFullBaseRebuildAtMs < searchRebuildCoalesceMs()
+        replaceScopeRowsForScopedDelta !== undefined
       ) {
         const progress = progressForDrainSnapshot(previousSnapshotForScopedDelta);
         await replaceScopeRowsForScopedDelta({
@@ -7232,12 +7434,12 @@ export const createConnectionsMaterializer = (
         baseSnapshot = (await deps.store.readCurrent()) ?? previousSnapshotForScopedDelta;
         incrementalGraphView.seed(baseSnapshot);
         scopedTimelineDeltaApplied = true;
-        searchVisitRowsDeferred = true;
-        searchVisitRebuildCoalesced = true;
+        demotedThisDrain = true;
+        if (repairQueueFactStore !== null && dirtyScopes.length > 0) {
+          repairQueueFactStore.enqueue(dirtyScopes, scopedTimelineDeltaSkipDetail);
+        }
         mark(
-          `hotRebuild.coalesced reason=${scopedTimelineDeltaSkipDetail} pending=${String(pendingEventsForDrain.length)} nextEligibleMs=${String(
-            Math.max(0, searchRebuildCoalesceMs() - (Date.now() - lastFullBaseRebuildAtMs)),
-          )}`,
+          `scopedTimelineDelta.demoted reason=${scopedTimelineDeltaSkipDetail} pending=${String(pendingEventsForDrain.length)} dirtyScopes=${String(dirtyScopes.length)} queueDepth=${String(repairQueueFactStore?.depth() ?? -1)}`,
         );
       }
       if (canAttemptBoundedScopedDelta) {
@@ -7246,12 +7448,18 @@ export const createConnectionsMaterializer = (
           `pageEvidence.fullBuildRead records=${String(pageEvidenceByCanonicalUrl.size)} read=${String(readCount)}`,
         );
       }
-      if (!baseSnapshotPrebuilt && !searchVisitRebuildCoalesced) {
-        // Any full base rebuild re-derives cross-search edges, so it resets
-        // the search-visit rebuild cooldown and clears the deferred-rows
-        // sticky (the rebuild below reads the complete event source).
-        lastFullBaseRebuildAtMs = Date.now();
-        searchVisitRowsDeferred = false;
+      // F8 W3 tripwire — after the demotion above, this fallback should be
+      // reachable ONLY via the user-consented CLI rebuild
+      // (forceFullRebuildConsented) or a store that doesn't implement
+      // replaceScopeRows at all (demotion has nothing to write through).
+      // Any OTHER arrival here means a bail slipped past demotion — mark
+      // it loudly so it's never a silent full rebuild.
+      if (!baseSnapshotPrebuilt && !demotedThisDrain && !forceFullRebuildConsented) {
+        mark(
+          `fullRebuildFallback.unexpected reason=${scopedTimelineDeltaSkipDetail} — bail reached the full-rebuild fallback without demotion or consent; see F8 W3`,
+        );
+      }
+      if (!baseSnapshotPrebuilt && !demotedThisDrain) {
         // Full-rebuild fallback (scoped-delta could not apply; NOT a catch-up,
         // which threw above). `input.events` (= merged) is only the pending
         // WINDOW on every warm path, so buildConnectionsSnapshot would yield a
@@ -8877,6 +9085,34 @@ export const createConnectionsMaterializer = (
     return processed.length;
   };
 
+  // F8 W3 — Recovery consent rule. See the interface doc comment. Intended
+  // for a freshly-constructed materializer instance in an isolated process
+  // (the `connections-rebuild` CLI, which holds the vault's process lock
+  // before ever constructing this materializer) — unlike `onAccepted` /
+  // `catchUp`, it does not coordinate with the `running`/`pending`
+  // debounce-scheduling state, since the CLI is the only caller and never
+  // shares a process with the live companion's own drain scheduling.
+  const runConsentedFullRebuild = async (): Promise<ConnectionsSnapshot> => {
+    forceFullRebuildConsented = true;
+    try {
+      const snapshot = await buildAndWrite();
+      const repairStore = await ensureRepairQueueStore();
+      if (repairStore !== null) {
+        // A full rebuild heals every queued scope by construction (it
+        // re-derives the whole graph from the complete event source) —
+        // drain the queue to empty and clear the needs-repair marker this
+        // rebuild just resolved.
+        while (repairStore.takeBatch(10_000).length > 0) {
+          // draining
+        }
+        repairStore.clearNeedsRepair();
+      }
+      return snapshot;
+    } finally {
+      forceFullRebuildConsented = false;
+    }
+  };
+
   // The runner gates event dispatch on `m.handles.has(event.type)`. The
   // materializer ALSO accepts content-lane-only and projection-only events
   // (see onAccepted's three-way classification), so `handles` must report
@@ -8902,6 +9138,7 @@ export const createConnectionsMaterializer = (
     drainContentLaneQueue,
     requalifyVisitForSimilarity,
     isDrainActive,
+    runConsentedFullRebuild,
     dispose,
   };
 };

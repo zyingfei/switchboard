@@ -77,6 +77,7 @@ import {
   USER_TOPIC_RENAMED,
   isUserRejectedRelationPayload,
 } from '../feedback/events.js';
+import { createRepairQueueStore } from '../connections/repairQueueStore.js';
 
 type DiagnosticCandidateMetric = string | number | boolean | null;
 
@@ -289,6 +290,26 @@ export interface WorkGraphHealthReport {
       readonly samples: readonly OverCollapsedRecord[];
     };
   };
+  // F8 W3 — the persisted repair queue (docs/plans/2026-08-16-f8-ivm-designs.md,
+  // "W3"). `depth`/`oldestEnqueuedAt` are the gauge; `status` is 'warning'
+  // when depth > 100 or the oldest entry has been queued > 1h (either
+  // signals the queue isn't draining — a demoted bail class that can't
+  // heal via scoped recompute, e.g. the W1/W2 stores being disabled).
+  // `needsRepair` mirrors the Recovery consent rule's durable marker: set
+  // by the materializer when a catastrophic-recovery condition is
+  // detected on a non-empty vault, cleared by a successful
+  // `connections-rebuild` CLI run.
+  readonly repairQueue: {
+    readonly depth: number;
+    readonly oldestEnqueuedAt: string | null;
+    readonly oldestAgeMs: number | null;
+    readonly status: 'ok' | 'warning' | 'unavailable';
+    readonly needsRepair: {
+      readonly reason: string;
+      readonly command: string;
+      readonly detectedAt: string;
+    } | null;
+  };
   readonly candidates: readonly DiagnosticCandidate[];
 }
 
@@ -369,6 +390,57 @@ const annStatus = async (): Promise<WorkGraphHealthReport['ann']> => {
     return { backend: 'hnsw', fallbackActive: false, reason: null };
   } catch (error) {
     return { backend: 'flat', fallbackActive: true, reason: errorMessage(error) };
+  }
+};
+
+// F8 W3 — repair-queue gauge + needs-repair condition (docs/plans/
+// 2026-08-16-f8-ivm-designs.md, "W3"). Opened fresh (no injected dep,
+// matching the `createTopicRevisionStore(vaultRoot)` inline-read pattern
+// already used above) and closed immediately — this runs on the health
+// poll cadence, not the drain hot path, so a per-call open/close is cheap
+// and avoids holding a second long-lived handle on the sidecar. A store
+// that fails to open (e.g. bun:sqlite unavailable under a non-bun test
+// runner) reports 'unavailable' rather than throwing — health must never
+// crash because one gauge's backing store is momentarily unreachable.
+const REPAIR_QUEUE_DEPTH_WARN_THRESHOLD = 100;
+const REPAIR_QUEUE_OLDEST_AGE_WARN_MS = 60 * 60 * 1000;
+
+const readRepairQueueHealth = async (
+  vaultRoot: string,
+  now: () => Date,
+): Promise<WorkGraphHealthReport['repairQueue']> => {
+  try {
+    const store = await createRepairQueueStore(vaultRoot);
+    try {
+      const stats = store.stats();
+      const needsRepair = store.readNeedsRepair();
+      const oldestAgeMs =
+        stats.oldestEnqueuedAt === null
+          ? null
+          : now().getTime() - Date.parse(stats.oldestEnqueuedAt);
+      const status: WorkGraphHealthReport['repairQueue']['status'] =
+        stats.depth > REPAIR_QUEUE_DEPTH_WARN_THRESHOLD ||
+        (oldestAgeMs !== null && oldestAgeMs > REPAIR_QUEUE_OLDEST_AGE_WARN_MS)
+          ? 'warning'
+          : 'ok';
+      return {
+        depth: stats.depth,
+        oldestEnqueuedAt: stats.oldestEnqueuedAt,
+        oldestAgeMs,
+        status,
+        needsRepair,
+      };
+    } finally {
+      store.close();
+    }
+  } catch {
+    return {
+      depth: 0,
+      oldestEnqueuedAt: null,
+      oldestAgeMs: null,
+      status: 'unavailable',
+      needsRepair: null,
+    };
   }
 };
 
@@ -647,6 +719,7 @@ const buildDiagnosticCandidates = (input: {
   readonly incrementalShadowRevisionId: string | null;
   readonly incrementalShadowReport: ServedTopicProducerReport | null;
   readonly incrementalShadowSecondaryCount: number | null;
+  readonly repairQueue: WorkGraphHealthReport['repairQueue'];
 }): readonly DiagnosticCandidate[] => {
   const producedAt = input.diagnostics.producedAt;
   const diagnosticsObservedAt = producedAt;
@@ -1125,6 +1198,42 @@ const buildDiagnosticCandidates = (input: {
       }),
     },
     {
+      // F8 W3 — repair-queue gauge + needs-repair condition row
+      // (docs/plans/2026-08-16-f8-ivm-designs.md, "W3"). `reason` carries
+      // the needs-repair marker's CLI command verbatim when present, so
+      // the panel surfaces the exact command to run without a new UI
+      // concept (Recovery consent rule item 2).
+      id: 'reconcile.repair-queue',
+      family: 'reconcile',
+      lane: 'queue',
+      servingImpact: 'not-serving',
+      status:
+        input.repairQueue.needsRepair !== null
+          ? 'alarm'
+          : input.repairQueue.status === 'unavailable'
+            ? 'unavailable'
+            : input.repairQueue.status === 'warning'
+              ? 'warning'
+              : 'ok',
+      reason:
+        input.repairQueue.needsRepair !== null
+          ? `needs-repair: ${input.repairQueue.needsRepair.reason} — run: ${input.repairQueue.needsRepair.command}`
+          : input.repairQueue.status === 'unavailable'
+            ? 'repair-queue-store-unavailable'
+            : input.repairQueue.status === 'warning'
+              ? 'repair-queue-backlog'
+              : null,
+      revisionId: null,
+      asOf: liveObservedAt,
+      metrics: metrics({
+        depth: input.repairQueue.depth,
+        oldestEnqueuedAt: input.repairQueue.oldestEnqueuedAt,
+        oldestAgeMs: input.repairQueue.oldestAgeMs,
+        depthWarnThreshold: REPAIR_QUEUE_DEPTH_WARN_THRESHOLD,
+        oldestAgeWarnMs: REPAIR_QUEUE_OLDEST_AGE_WARN_MS,
+      }),
+    },
+    {
       id: 'reconcile.runner-mode',
       family: 'reconcile',
       lane: 'active',
@@ -1234,6 +1343,7 @@ export const collectWorkGraphHealth = async ({
     // topic/secondary counts + churn-vs-served in the health row reflect
     // the latest persisted shadow, not a stale drain-time snapshot.
     incrementalShadowRevision,
+    repairQueue,
   ] = await Promise.all([
     readActiveClosestVisitRankerRevisionManifest(vaultRoot),
     readActiveClosestVisitRankerRevisionManifestProbe(vaultRoot),
@@ -1245,6 +1355,7 @@ export const collectWorkGraphHealth = async ({
     readLatestConnectionsDiagnostics(vaultRoot),
     scanForOverCollapsedPageContentCached(vaultRoot),
     createTopicRevisionStore(vaultRoot).readCandidateShadowRevision(TOPIC_INCREMENTAL_REVISION_KEY),
+    readRepairQueueHealth(vaultRoot, now),
   ]);
   const augmentation = parseRankerAugmentationStatus(diagnostics);
   const activeRevision =
@@ -1552,6 +1663,7 @@ export const collectWorkGraphHealth = async ({
     labelChannels,
     recall,
     hygiene,
+    repairQueue,
     candidates: buildDiagnosticCandidates({
       ranker,
       topicProducer,
@@ -1562,6 +1674,7 @@ export const collectWorkGraphHealth = async ({
       incrementalShadowRevisionId: incrementalShadowRevision?.revisionId ?? null,
       incrementalShadowReport,
       incrementalShadowSecondaryCount,
+      repairQueue,
     }),
   };
 };

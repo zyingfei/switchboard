@@ -61,7 +61,6 @@ const envKeys = [
   'SIDETRACK_CONNECTIONS_DRIFT_DISABLED',
   'SIDETRACK_TOPIC_PRODUCER',
   'SIDETRACK_THREAD_REGISTER_STORE',
-  'SIDETRACK_FULL_REBUILD_COOLDOWN_MS',
   'SIDETRACK_CONNECTIONS_PHASE_LOG',
 ] as const;
 
@@ -176,12 +175,6 @@ describe('F8 W1 — thread register store kills the membership bail', () => {
     process.env['SIDETRACK_CONNECTIONS_DRIFT_DISABLED'] = '1';
     process.env['SIDETRACK_TOPIC_PRODUCER'] = 'union-find';
     process.env['SIDETRACK_CONNECTIONS_PHASE_LOG'] = '1';
-    // The interim hot-rebuild suppressor (#364, F8 design doc "Interim
-    // state") coalesces a second full-rebuild-eligible drain within its
-    // cooldown window (default 10 min) into a no-op, which would mask
-    // this drain's own gate decision. Disable it so every drain's
-    // outcome is directly observable.
-    process.env['SIDETRACK_FULL_REBUILD_COOLDOWN_MS'] = '0';
   });
 
   afterEach(async () => {
@@ -273,9 +266,23 @@ describe('F8 W1 — thread register store kills the membership bail', () => {
     expect(threadInWorkstreamEdges(incremental)).toEqual(fullEdges);
   });
 
-  it('control: with the store disabled, the same reassignment still bails to a base rebuild', async () => {
+  it('control: with the store disabled, the same reassignment now DEMOTES instead of bailing to a base rebuild (F8 W3)', async () => {
     // No SIDETRACK_THREAD_REGISTER_STORE=1 — proves the flag (not some
     // unrelated fast path) is what changes drain behavior above.
+    //
+    // F8 W3 supersedes the interim hot-rebuild suppressor this test used
+    // to exercise: a bail no longer ever falls into
+    // `buildConnectionsSnapshot base` on an operational drain (see
+    // docs/plans/2026-08-16-f8-ivm-designs.md, "W3"). It demotes —
+    // progress-only write, serve the PRIOR snapshot unchanged, enqueue the
+    // dirty thread scope into the persisted repair queue. With the
+    // register store disabled, the SAME structural gate that caused the
+    // bail fires again on any repair-drain attempt (no durable per-thread
+    // history to correct it from), so this scope is a genuine "cannot
+    // heal via scoped recompute" case — it recycles rather than silently
+    // resolving or silently serving the wrong membership. See
+    // connectionsRepairDemotion.test.ts for the general demotion +
+    // repair-drain-heals-when-it-can equivalence tests.
     const replica = await loadOrCreateReplica(vaultRoot);
     const eventLog = createEventLog(vaultRoot, replica);
     const store = createConnectionsStore(vaultRoot);
@@ -296,12 +303,15 @@ describe('F8 W1 — thread register store kills the membership bail', () => {
     const phase = await capturePhaseLog(() => materializer.catchUp(eventLog));
 
     expect(phase).toContain('thread-workstream-membership-changed');
-    expect(phase).toContain('buildConnectionsSnapshot base');
-
-    const incremental = await store.readCurrent();
-    if (incremental === null) throw new Error('expected rebuilt snapshot');
-    expect(threadInWorkstreamEdges(incremental)).toEqual(
-      threadInWorkstreamEdges(fullSnapshotFor([founding, reassigned])),
-    );
+    expect(phase).toContain('scopedTimelineDelta.demoted reason=thread-workstream-membership-changed');
+    // `buildConnectionsSnapshot base` is an unconditional per-drain
+    // diagnostic (it reports whatever `baseSnapshot` ends up being, not
+    // "a rebuild happened") — NOT a reliable rebuild signal on its own,
+    // so the real proof is the served snapshot's CONTENT below: if a full
+    // rebuild had actually run, it would reflect the reassignment (W2).
+    // It does not — demotion served the PRIOR snapshot unchanged.
+    const served = await store.readCurrent();
+    if (served === null) throw new Error('expected the prior snapshot to still be served');
+    expect(threadInWorkstreamEdges(served)).toEqual(threadInWorkstreamEdges(fullSnapshotFor([founding])));
   });
 });

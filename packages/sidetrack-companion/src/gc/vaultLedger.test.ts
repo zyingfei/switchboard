@@ -175,6 +175,7 @@ describe('vaultLedger', () => {
       [['connections', 'thread-register-facts.db'], 'connections-sidecar-dbs'],
       [['connections', 'search-query-index.db'], 'connections-sidecar-dbs'],
       [['connections', 'capture-text-fts.db'], 'connections-sidecar-dbs'],
+      [['connections', 'repair-queue.db'], 'connections-sidecar-dbs'],
       [['connections', 'visit-similarity-hnsw.v1.bin'], 'connections-derived'],
       [['connections', 'topics', 'rev.json'], 'connections-derived'],
       [['connections', 'diagnostics', 'latest.json'], 'diagnostics'],
