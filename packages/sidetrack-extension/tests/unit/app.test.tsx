@@ -2145,6 +2145,166 @@ describe('current-tab capture-state indicator', () => {
   });
 });
 
+// Regression net for the "Page text says metadata only while the header
+// says Indexed chunks" report (2026-08-15). Root cause: the current-tab
+// card's coverage fetch races an in-flight first-visit auto-capture, gets
+// back nothing, and nothing ever re-checked — the null result stuck. Fix:
+// a null/empty first fetch schedules exactly ONE delayed re-check for the
+// same canonicalUrl (App.tsx's copy of the ConnectionsView.tsx fix).
+describe('current-tab card — page-text coverage delayed retry', () => {
+  const URL = 'https://www.pge.com/en/account/billing';
+
+  it('shows the neutral loading label, then picks up real coverage from the one delayed retry', async () => {
+    const base = liveState();
+    const state: WorkboardState = {
+      ...base,
+      companionStatus: 'connected',
+      activeTabUrl: URL,
+      settings: { ...base.settings, noCaptureRules: [] },
+    };
+    // Keyed by canonicalUrl rather than a raw call counter: the FIRST
+    // coverage fetch for a URL is ambiguous (races the auto-capture);
+    // every fetch after that for the SAME url is the real, settled
+    // answer. Robust to the effect firing more than once while
+    // capture-state/settings settle — only the true first fetch for
+    // this URL is ambiguous, exactly matching production.
+    const seenUrls = new Set<string>();
+    let coverageCalls = 0;
+    const sendMessage = vi.fn(
+      (
+        request: WorkboardRequest | { readonly type?: unknown; readonly canonicalUrl?: unknown },
+        callback?: (response: unknown) => void,
+      ) => {
+        const type = (request as { type?: unknown }).type;
+        let response: unknown;
+        if (type === messageTypes.pageContentCoverage) {
+          coverageCalls += 1;
+          const canonicalUrl = (request as { canonicalUrl?: unknown }).canonicalUrl;
+          const firstForUrl = typeof canonicalUrl === 'string' && !seenUrls.has(canonicalUrl);
+          if (typeof canonicalUrl === 'string') seenUrls.add(canonicalUrl);
+          response = firstForUrl
+            ? { ok: true }
+            : { ok: true, coverage: { canonicalUrl, state: 'indexed', quality: 'high', chunkCount: 12 } };
+        } else {
+          response = { ok: true, state, request };
+        }
+        if (typeof callback === 'function') {
+          callback(response);
+          return undefined;
+        }
+        return Promise.resolve(response);
+      },
+    );
+    const localValues: Record<string, unknown> = { [SETUP_COMPLETED_KEY]: true };
+    const get = vi.fn((query: StorageQuery): Promise<Record<string, unknown>> => {
+      if (typeof query === 'string') return Promise.resolve({ [query]: localValues[query] });
+      if (Array.isArray(query)) {
+        return Promise.resolve(Object.fromEntries(query.map((key) => [key, localValues[key]])));
+      }
+      if (query !== null && query !== undefined) {
+        return Promise.resolve(
+          Object.fromEntries(
+            Object.entries(query).map(([key, fallback]) => [key, localValues[key] ?? fallback]),
+          ),
+        );
+      }
+      return Promise.resolve({ ...localValues });
+    });
+    const set = vi.fn((values: Record<string, unknown>): Promise<void> => {
+      Object.assign(localValues, values);
+      return Promise.resolve();
+    });
+    vi.stubGlobal('chrome', {
+      runtime: { sendMessage, onMessage: { addListener: vi.fn(), removeListener: vi.fn() } },
+      storage: { local: { get, set }, session: { get, set } },
+      tabs: {
+        query: vi.fn(() => Promise.resolve([{ url: URL }])),
+        update: vi.fn(() => Promise.resolve({ id: 42 })),
+        create: vi.fn(() => Promise.resolve({ id: 99 })),
+      },
+      windows: { update: vi.fn(() => Promise.resolve({})) },
+    });
+    const urlProjection = {
+      schemaVersion: 1,
+      byCanonicalUrl: {
+        [URL]: {
+          canonicalUrl: URL,
+          firstSeenAt: NOW,
+          lastSeenAt: NOW,
+          visitCount: 1,
+          tabSessionIds: ['tses_racey'],
+          latestUrl: URL,
+          latestTitle: 'Account billing',
+          attributionHistory: [],
+          pageEvidence: {
+            tier: 'indexed_chunks',
+            evidenceRevision: 'evidence-racey',
+            semanticFeatureRevision: 'semantic-racey',
+            updatedAt: NOW,
+            termCount: 48,
+            keyphraseCount: 24,
+            entityCount: 8,
+            quality: 'medium',
+          },
+        },
+      },
+    };
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.includes('/v1/visits/projection')) {
+        return { ok: true, status: 200, json: async () => ({ data: urlProjection }) };
+      }
+      if (url.includes('/v1/visits/inbox')) {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({ data: { items: [], total: 0, limit: 51, offset: 0 } }),
+        };
+      }
+      return { ok: false, status: 404, text: async () => 'not found' };
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    try {
+      vi.useFakeTimers({ shouldAdvanceTime: true });
+      render(<App />);
+      await goToTab('Now');
+      const card = await screen.findByTestId('focused-tab-attribution');
+      await within(card).findByText('Account billing');
+
+      await waitFor(() => {
+        expect(coverageCalls).toBeGreaterThanOrEqual(1);
+      });
+      // The FIRST fetch is ambiguous (races the auto-capture): the card
+      // must show the neutral loading label, never assert "metadata only".
+      await waitFor(() => {
+        expect(within(card).getByTestId('current-tab-summary-toggle')).toHaveTextContent(
+          'checking…',
+        );
+      });
+      expect(within(card).getByTestId('current-tab-summary-toggle')).not.toHaveTextContent(
+        'metadata only',
+      );
+
+      // Advance past the delayed-retry window: the scheduled retry fires
+      // for the SAME canonicalUrl and the real "indexed" state supersedes
+      // the loading label.
+      await vi.advanceTimersByTimeAsync(5_000);
+      await waitFor(() => {
+        const toggle = within(card).getByTestId('current-tab-summary-toggle');
+        expect(toggle).toHaveTextContent('high');
+        expect(toggle).not.toHaveTextContent('checking…');
+      });
+      expect(sendMessage).toHaveBeenCalledWith(
+        { type: messageTypes.pageContentCoverage, canonicalUrl: URL },
+        expect.any(Function),
+      );
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
 // ── Capture lamp strip (R1 "Private Ledger" header spine). The lamp is
 // the ONE always-visible privacy indicator: glyph + current domain +
 // verdict (role=status aria-live=polite — the a11y fix for the reported

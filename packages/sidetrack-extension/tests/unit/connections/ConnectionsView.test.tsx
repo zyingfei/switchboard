@@ -1738,3 +1738,91 @@ describe('ConnectionsView — engineering scaffold', () => {
     neverResolve();
   });
 });
+
+// Regression net for the "Page text says metadata only while the header
+// says Indexed chunks" report (2026-08-15). Root cause: the coverage
+// fetch races an in-flight first-visit auto-capture, gets back nothing,
+// and nothing ever re-checked — the null result stuck. Fix: a null/empty
+// first fetch schedules exactly ONE delayed re-check, scoped to the
+// anchor's canonicalUrl.
+describe('ConnectionsView — page-content coverage delayed retry', () => {
+  beforeEach(() => {
+    setConnectionsClientTransportForTests(null);
+  });
+  afterEach(() => {
+    setConnectionsClientTransportForTests(null);
+    vi.unstubAllGlobals();
+  });
+
+  it('shows the neutral loading label, then picks up real coverage from the one delayed retry', async () => {
+    setConnectionsClientTransportForTests((msg) => {
+      const m = msg as { type: string };
+      if (m.type === messageTypes.loadConnectionsNeighbors) {
+        return Promise.resolve({ ok: true, data: buildFlowSnapshot() });
+      }
+      return Promise.resolve({ ok: false, error: 'unexpected' });
+    });
+
+    let coverageCalls = 0;
+    const sendMessage = vi.fn(
+      (
+        request: { readonly type?: unknown; readonly canonicalUrl?: unknown },
+        callback: (response: unknown) => void,
+      ) => {
+        coverageCalls += 1;
+        // First fetch races the in-flight auto-capture and comes back
+        // ambiguous (no coverage field); every call after that — the
+        // delayed retry — is the real, settled answer.
+        const response =
+          coverageCalls === 1
+            ? { ok: true }
+            : {
+                ok: true,
+                coverage: {
+                  canonicalUrl: request.canonicalUrl,
+                  state: 'indexed',
+                  quality: 'high',
+                  chunkCount: 12,
+                },
+              };
+        callback(response);
+      },
+    );
+    vi.stubGlobal('chrome', { runtime: { sendMessage } });
+
+    try {
+      vi.useFakeTimers({ shouldAdvanceTime: true });
+      render(<ConnectionsView initialAnchor={flowAnchorId} />);
+
+      await waitFor(() => {
+        expect(sendMessage).toHaveBeenCalledWith(
+          {
+            type: messageTypes.pageContentCoverage,
+            canonicalUrl: 'https://example.test/start',
+          },
+          expect.any(Function),
+        );
+      });
+      // Ambiguous first fetch renders the neutral loading label, NOT the
+      // "metadata only" assertion the old code made.
+      const toggle = screen.getByTestId('connections-summary-toggle');
+      expect(toggle).toHaveTextContent('checking…');
+      expect(toggle).not.toHaveTextContent('metadata only');
+
+      // Advance past the delayed-retry window: the one scheduled retry
+      // fires, re-requests coverage for the SAME canonicalUrl, and the
+      // real "indexed" state supersedes the loading label.
+      await vi.advanceTimersByTimeAsync(5_000);
+      await waitFor(() => {
+        expect(coverageCalls).toBeGreaterThanOrEqual(2);
+      });
+      await waitFor(() => {
+        const settled = screen.getByTestId('connections-summary-toggle');
+        expect(settled).toHaveTextContent('high');
+        expect(settled).not.toHaveTextContent('checking…');
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});

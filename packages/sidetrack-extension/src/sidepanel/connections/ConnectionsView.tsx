@@ -432,6 +432,12 @@ const metadataStringList = (
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === 'object' && value !== null && !Array.isArray(value);
 
+// A first-visit auto-capture routinely takes longer than the coverage
+// fetch that races it (extraction + quality classification + the write
+// round-trip). 4s sits comfortably inside typical capture latency while
+// staying well under the reported "sticks forever" complaint window.
+const PAGE_CONTENT_COVERAGE_RETRY_DELAY_MS = 4_000;
+
 const pageContentCoverageFromNode = (node: ConnectionNode | null): PageContentCoverage | null => {
   if (node === null) return null;
   const raw = node.metadata['pageContent'];
@@ -2279,18 +2285,41 @@ export const ConnectionsView = ({
     }
     if (typeof chrome === 'undefined' || chrome.runtime?.sendMessage === undefined) return;
     let active = true;
-    chrome.runtime.sendMessage(
-      { type: messageTypes.pageContentCoverage, canonicalUrl: anchorCanonicalUrl },
-      (response: unknown) => {
-        if (!active) return;
-        const parsed = response as PageContentOperationResponse;
-        if (parsed.ok && parsed.coverage !== undefined) {
-          setPageContentCoverageOverride(parsed.coverage);
-        }
-      },
-    );
+    let retryTimer: ReturnType<typeof setTimeout> | undefined;
+    const requestCoverage = (isRetry: boolean): void => {
+      chrome.runtime.sendMessage(
+        { type: messageTypes.pageContentCoverage, canonicalUrl: anchorCanonicalUrl },
+        (response: unknown) => {
+          if (!active) return;
+          const parsed = response as PageContentOperationResponse;
+          if (parsed.ok && parsed.coverage !== undefined) {
+            setPageContentCoverageOverride(parsed.coverage);
+            return;
+          }
+          // A null/empty result on the FIRST fetch is ambiguous: it can
+          // mean "never captured" OR it raced a first-visit auto-capture
+          // that is still running (the fetch fires as soon as the anchor
+          // resolves, well before a slow extraction settles). There is no
+          // dedicated negative cache to invalidate here — this component's
+          // own `pageContentCoverageOverride` state IS what was sticking —
+          // so a single delayed re-check, scoped to this effect's
+          // `anchorCanonicalUrl` closure, is enough to pick up a capture
+          // that finishes just after the initial miss. Bounded to exactly
+          // one retry (not a poll loop): a genuinely never-indexed page
+          // just renders "checking…" once more, then settles.
+          if (!isRetry) {
+            retryTimer = setTimeout(() => {
+              if (!active) return;
+              requestCoverage(true);
+            }, PAGE_CONTENT_COVERAGE_RETRY_DELAY_MS);
+          }
+        },
+      );
+    };
+    requestCoverage(false);
     return () => {
       active = false;
+      if (retryTimer !== undefined) clearTimeout(retryTimer);
     };
   }, [anchorCanonicalUrl]);
 

@@ -140,16 +140,23 @@ export function AttributionBadge({ record, suggestion, workstreams }: Attributio
   const marker = laneFallback ? null : markerFor(variant);
   // No attribution and no guess: show a muted dash, not a confusing "?" — the
   // tooltip and the provenance row already say "No attribution".
-  const label =
+  const namedLabel =
     variant === 'empty'
       ? '—'
       : ignored !== undefined
         ? 'ignored'
         : workstreamLabel(attribution?.workstreamId ?? suggestedWorkstreamId, workstreams);
+  // Fusion HELD (no candidates reached fusion) and this lean is the
+  // synthesized below-floor lane-fallback pick — showing the workstream name
+  // in the "In workstream:" badge reads as a real, endorsed filing even
+  // though nothing was filed. Say the neutral thing instead; the actual
+  // guessed name still lives in the tooltip (titleFor uses `namedLabel`) and
+  // in SuggestionStats' "Below confidence bar — possibilities" list.
+  const label = variant === 'weak-guess' && laneFallback ? 'No good guess yet' : namedLabel;
   return (
     <span
       className={`tab-session-badge is-${variant}`}
-      title={titleFor(variant, label, laneFallback)}
+      title={titleFor(variant, namedLabel, laneFallback)}
       data-attribution-variant={variant}
     >
       {marker !== null ? (

@@ -574,7 +574,18 @@ export function SuggestionStats({
             weak guess — filed to inbox
           </span>
         ) : null}
-        <span className="suggestion-stats-target">{label}</span>
+        {/* Fusion HELD (gate 'no-candidates') and this pick is the
+            below-floor lane-fallback guess — naming the workstream here reads
+            as a real suggestion even with the "Unconfirmed" chip beside it
+            (live report: "In workstream: interview / crypto · Unconfirmed —
+            from page content (AI-assisted)" read as a filing suggestion).
+            Show the neutral non-answer instead; the fallback guess is still
+            reachable — it rides in `possibilities` below (hasPrimary is false
+            for an un-endorsed pick, so the ranked list surfaces expanded
+            under "Below confidence bar — possibilities:"). */}
+        <span className="suggestion-stats-target">
+          {isLaneFallback ? 'No good guess yet' : label}
+        </span>
         {/* Qualitative lean only — the raw % is uncalibrated and lives in
             the ⓘ tooltip labelled as diagnostics (see above).
             SUPPRESSED whenever an uncertainty chip is showing: "WEAK GUESS —

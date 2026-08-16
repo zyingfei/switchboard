@@ -916,6 +916,12 @@ const writeCachedCompanionStatus = (status: WorkboardState['companionStatus']): 
 // the same cached answer back.
 const ENRICH_REPROBE_WHILE_BLOCKED_MS = 30_000;
 
+// Ported verbatim from ConnectionsView.tsx (see its copy of this constant
+// for the full rationale): a first-visit auto-capture routinely outlasts
+// the coverage fetch that races it, so a single delayed re-check — not a
+// poll loop — picks up the capture once it lands.
+const PAGE_CONTENT_COVERAGE_RETRY_DELAY_MS = 4_000;
+
 const App = () => {
   const [state, setState] = useState<WorkboardState>(() => {
     const cached = readCachedCompanionStatus();
@@ -5926,6 +5932,7 @@ const App = () => {
     }
     if (typeof chrome === 'undefined' || chrome.runtime?.sendMessage === undefined) return;
     let active = true;
+    let retryTimer: ReturnType<typeof setTimeout> | undefined;
     // Clear stale coverage while the new URL's fetch is in flight so
     // the card never shows the previous page's index state.
     setCurrentTabBulkPreview(null);
@@ -5939,16 +5946,39 @@ const App = () => {
     // so fetching here does NOT reintroduce the stale-'Indexed chunks'
     // leak this effect previously guarded against — it only keeps the
     // "Delete text" affordance alive on paused/blocked pages.
-    chrome.runtime.sendMessage(
-      { type: messageTypes.pageContentCoverage, canonicalUrl: currentTabCanonicalUrl },
-      (response: unknown) => {
-        if (!active) return;
-        const parsed = response as PageContentOperationResponse;
-        setCurrentTabCoverage(parsed.ok && parsed.coverage !== undefined ? parsed.coverage : null);
-      },
-    );
+    const requestCoverage = (isRetry: boolean): void => {
+      chrome.runtime.sendMessage(
+        { type: messageTypes.pageContentCoverage, canonicalUrl: currentTabCanonicalUrl },
+        (response: unknown) => {
+          if (!active) return;
+          const parsed = response as PageContentOperationResponse;
+          if (parsed.ok && parsed.coverage !== undefined) {
+            setCurrentTabCoverage(parsed.coverage);
+            return;
+          }
+          setCurrentTabCoverage(null);
+          // Ambiguous null on the FIRST attempt: a first-visit auto-capture
+          // may still be running when this fetch races it (live report,
+          // 2026-08-15 — the evidence badge elsewhere already said "Indexed
+          // chunks" while this card still read "metadata only"). There is
+          // no separate negative-cache module for coverage to invalidate —
+          // `currentTabCoverage` above IS the state that was sticking — so
+          // one delayed re-check, scoped to this effect's
+          // `currentTabCanonicalUrl` closure, picks up a capture that
+          // finishes moments later. Exactly one retry, not a poll loop.
+          if (!isRetry) {
+            retryTimer = setTimeout(() => {
+              if (!active) return;
+              requestCoverage(true);
+            }, PAGE_CONTENT_COVERAGE_RETRY_DELAY_MS);
+          }
+        },
+      );
+    };
+    requestCoverage(false);
     return () => {
       active = false;
+      if (retryTimer !== undefined) clearTimeout(retryTimer);
     };
   }, [currentTabCanonicalUrl, currentTabCaptureSuppressed]);
 

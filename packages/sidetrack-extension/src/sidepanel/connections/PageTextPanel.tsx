@@ -10,8 +10,18 @@ import type { PageContentCoverage } from '../../companion/pageContentClient';
 // two mount sites can drive different targets (the Connections anchor
 // vs the live current tab) with one component.
 
+// `coverage === null` means "we don't actually know yet" — either the
+// coverage fetch hasn't returned, or it raced an in-flight first-visit
+// auto-capture and got back nothing before the capture finished (live
+// report, 2026-08-15: the header elsewhere already said "Indexed
+// chunks" while this panel still read "metadata only"). Rendering that
+// as 'metadata only' asserts a specific, wrong, fetched state. Only a
+// REAL coverage record whose state is genuinely metadata-only earns
+// that label — a null coverage gets neutral loading wording instead,
+// which the host's delayed re-check (see ConnectionsView.tsx /
+// App.tsx) then supersedes once the real state lands.
 export const pageContentStatusLabel = (coverage: PageContentCoverage | null): string => {
-  if (coverage === null) return 'metadata only';
+  if (coverage === null) return 'checking…';
   if (coverage.state === 'indexed') return coverage.quality ?? 'indexed';
   if (coverage.state === 'indexed_low_quality') return 'low quality';
   if (coverage.state === 'stale_index') return 'stale';
