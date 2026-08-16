@@ -1501,7 +1501,9 @@ export const createConnectionsMaterializer = (
   let lastFullBaseRebuildAtMs = 0;
   let searchVisitRowsDeferred = false;
   const searchRebuildCoalesceMs = (): number => {
-    const raw = process.env['SIDETRACK_SEARCH_REBUILD_COALESCE_MS'];
+    const raw =
+      process.env['SIDETRACK_FULL_REBUILD_COOLDOWN_MS'] ??
+      process.env['SIDETRACK_SEARCH_REBUILD_COALESCE_MS'];
     const parsed = raw === undefined ? Number.NaN : Number.parseInt(raw, 10);
     return Number.isFinite(parsed) && parsed >= 0 ? parsed : 600_000;
   };
@@ -6391,16 +6393,22 @@ export const createConnectionsMaterializer = (
           `connections catchUp chunk could not apply scoped delta: ${scopedTimelineDeltaSkipDetail}`,
         );
       }
-      // Search-visit rebuild coalescing (see the flag declarations for the
-      // full argument): within the cooldown a search-visit drain advances
-      // progress only and serves the prior snapshot; the deferred rows are
-      // healed by the next full rebuild, which the sticky flag forces on
-      // the first drain after cooldown expiry.
+      // Hot-path rebuild suppressor (see the flag declarations for the full
+      // argument; SSD-wear directive 2026-08-16): within the cooldown ANY
+      // bailed drain advances progress only and serves the prior snapshot —
+      // a full rebuild writes a ~370MB generation in response to a KB-scale
+      // logical change, and during search-heavy browsing that ran per drain.
+      // The deferred rows are healed by the next full rebuild, which the
+      // sticky flag forces on the first drain after cooldown expiry, so
+      // staleness is bounded by SIDETRACK_FULL_REBUILD_COOLDOWN_MS. Recovery
+      // classes (similarity base-rebuild, forced membership reconcile) are
+      // excluded — those are the repair tier and must run when asked.
       if (
         !requireScopedTimelineDeltaForDrain &&
-        scopedTimelineDeltaSkipDetail === 'pending-search-visit' &&
         !similarityRecoveryNeedsBaseRebuild &&
         !forceFullRebuildForThreadReconcile &&
+        scopedTimelineDeltaSkipDetail !== 'thread-membership-reconcile-forced' &&
+        scopedTimelineDeltaSkipDetail !== 'search-visit-cadence-rebuild' &&
         previousSnapshotForScopedDelta !== null &&
         replaceScopeRowsForScopedDelta !== undefined &&
         Date.now() - lastFullBaseRebuildAtMs < searchRebuildCoalesceMs()
@@ -6424,7 +6432,7 @@ export const createConnectionsMaterializer = (
         searchVisitRowsDeferred = true;
         searchVisitRebuildCoalesced = true;
         mark(
-          `searchVisitRebuild.coalesced pending=${String(pendingEventsForDrain.length)} nextEligibleMs=${String(
+          `hotRebuild.coalesced reason=${scopedTimelineDeltaSkipDetail} pending=${String(pendingEventsForDrain.length)} nextEligibleMs=${String(
             Math.max(0, searchRebuildCoalesceMs() - (Date.now() - lastFullBaseRebuildAtMs)),
           )}`,
         );
