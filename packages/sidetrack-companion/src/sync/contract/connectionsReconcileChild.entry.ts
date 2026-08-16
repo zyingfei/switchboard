@@ -52,6 +52,41 @@ try {
   // Best-effort; scheduling priority is not load-bearing.
 }
 
+// I/O twin of the renice above (F9). CPU niceness does nothing for the
+// disk queue: a full-rebuild generation write pushes gigabytes of WAL
+// through the same volume as the parent's 2KB event-append fsyncs, and
+// captures measured 3-18s queued behind it. IOPOL_THROTTLE puts this
+// process's disk I/O in the macOS background tier — full speed on an
+// idle disk, yields to foreground I/O under contention. Best-effort via
+// bun:ffi; any failure leaves behavior exactly as before.
+try {
+  if (process.platform === 'darwin') {
+    // bun:ffi has no type declarations under the build tsconfig; the
+    // runtime is always bun here (the parent forks with its own execPath).
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const ffi = require('bun:ffi') as {
+      dlopen: (
+        lib: string,
+        symbols: Record<
+          string,
+          { readonly args: readonly number[]; readonly returns: number }
+        >,
+      ) => { symbols: Record<string, (...args: number[]) => number> };
+      FFIType: { readonly i32: number };
+    };
+    const libc = ffi.dlopen('libSystem.dylib', {
+      setiopolicy_np: {
+        args: [ffi.FFIType.i32, ffi.FFIType.i32, ffi.FFIType.i32],
+        returns: ffi.FFIType.i32,
+      },
+    });
+    // IOPOL_TYPE_DISK=0, IOPOL_SCOPE_PROCESS=0, IOPOL_THROTTLE=3
+    libc.symbols['setiopolicy_np']!(0, 0, 3);
+  }
+} catch {
+  // Best-effort; I/O policy is not load-bearing.
+}
+
 interface ReconcileMessage {
   readonly kind: 'reconcile';
   readonly vaultRoot: string;
