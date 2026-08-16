@@ -35,7 +35,7 @@ from reality without being updated in the same PR that changes reality.
 | ID | Goal | Acceptance (coordinator-verified) | State (2026-08-15) |
 |----|------|------------------------------------|--------------------|
 | F1 | Engagement compaction runs | Report-only numbers reproduced (done: 439.7MB = 65.3% of 672.8MB reclaimable, 0 uncovered visits); gated `--apply` on test vault shrinks log with post-apply equivalence (event counts, serving probes); nightly report-only scheduled via runbook → live script | CLI + schedule merged-pending (PR #361); apply scheduled idle window |
-| F2 | JSONL hot-tail retirement | Report-only enumeration with per-day seal proofs; destructive apply behind flag + soak (~Aug 21); one-command flip documented | Pending (after F1 apply) |
+| F2 | JSONL hot-tail retirement | Report-only enumeration with per-day seal proofs; destructive apply behind flag + soak (~Aug 21); one-command flip documented | Report-only landed (PR perf/f2-hot-tail-report, 2026-08-16); real-vault run: 185 shards, 178 eligible, ~244MB retirable, 0 segment alarms; APPLY still pending soak (~Aug 21) |
 | F3 | No full-log walks on hot paths | Survey complete (see below); foreground-nav overlay migrated to typed reads with equivalence test; phase-log shows no full-log walk during a normal drain + nav burst | Overlay migration done; remaining hot readMerged callers (health/§15/ingestor/retrain-worker) migrated + equivalence-tested (PR TBD, 2026-08-16); default-ON flip evaluated and NOT shipped (test-fixture blocker, see landing note) |
 | F4 | Blob diet | Accumulator blob + append-index snapshot off pretty JSON (CBOR/compact or incremental); snapshot load <1s (baseline 2.5s); measured before/after | Pending (after F1–F3) |
 | F5 | Small-file stores → SQLite | page-content (703 files) + page-evidence (3,741 files) each one SQLite; one transaction per capture; #356/#357 manifest upserts deleted as obsolete; migration + rollback documented | Pending |
@@ -103,6 +103,44 @@ SQLite FTS5 is the natural next home for it).
 | DuckDB (embedded) | Same shape mismatch as chDB — excellent for the F2 columnar/analytics lanes (bulk aggregation over sealed history), but its write path is optimized for batch ingestion, not one-row-per-capture upserts; a second embedded-db handle alongside bun:sqlite duplicates crash-recovery work for no workload benefit here. |
 | Workload shape | Point KV writes/reads keyed by canonical URL / content hash + small aggregate counts — squarely SQLite's OLTP sweet spot, not an OLAP engine's. |
 | Verdict | Bespoke SQLite tables under bun:sqlite, one file each for page-content and page-evidence. DuckDB/chDB remain live candidates for F2's analytics lanes, not the durable store here. |
+
+## F2 design note (2026-08-16) — OLAP candidate comparison, analytics side
+
+Binding user rule (2026-08-16): compare candidates before writing retirement
+code. Scope: the ANALYTICS reads only (retirement eligibility report,
+reclaimable-bytes accounting, seal-coverage queries over the columnar
+tier) — NOT a new storage engine; the columnar tier already exists
+(`src/analytics/eventSeal.ts`, `src/analytics/eventScan.ts`,
+`docs/design/2026-08-01-columnar-event-tier.md`) and already answered this
+exact question with a measured PoC gate (2026-08-01, real vault shard, Bun
+1.3.14, macOS arm64): DuckDB embeds cleanly under Bun (25× open/close, zero
+crashes), seals 14.2MB JSONL → 0.6MB Parquet (22.9×), and — the decisive
+number — **DuckDB over raw JSONL was SLOWER than a plain JS loop (98ms vs
+34ms) while DuckDB over sealed Parquet was 17× faster than that same JS
+loop (2ms)**; chDB was evaluated and rejected as unnecessary (DuckDB
+suffices, no maintained Bun-native chDB binding). `@duckdb/node-api` is
+already a production dependency (`package.json`), imported by both
+`eventSeal.ts` (sealing) and `eventScan.ts` (the sealed-vs-store integrity
+A/B this PR's proofs reuse).
+
+| Candidate | Fit for THIS workload (retirement report / seal-coverage) |
+|---|---|
+| Bespoke JS scan of raw hot-tail JSONL | Wrong tool per the PoC's own number (98ms DuckDB vs 34ms JS on raw JSONL — DuckDB adds engine overhead for zero benefit on ungrouped raw text); the report's hot-tail byte accounting is one `stat()` per shard file (already O(shard count), not O(events)), so this candidate is moot for that part and actively worse for anything that DOES need to scan (segment verification). |
+| chDB (embedded ClickHouse) | Rejected 2026-08-01 (design doc): no maintained Bun-native binding; not a dependency; would add a second embedded-analytics runtime for zero measured benefit over the already-proven DuckDB path. |
+| DuckDB over sealed Parquet (existing facade) | **Already the answer.** The columnar tier's format (zstd Parquet, `_BAC/seal/<replica>/<day>.parquet`) is DuckDB-native; `eventScan.ts`'s `read_parquet(...)` aggregate query is the exact seal-coverage primitive this report needs (manifest rows vs parquet aggregate vs store day-stats) — reused directly (`readSealedParquetDayStats`, exported from `eventScan.ts` for this PR), not reimplemented. |
+| Verdict | Wire the retirement report through the existing DuckDB-over-Parquet facade (reuse `eventScan.ts`'s reader), not bespoke JSONL scanning. The only NEW read this PR adds is a readonly `bun:sqlite` query against the event-store mirror for live per-day row counts (`{readonly: true}` — see CLI process-lock discipline below) and `stat()` calls for hot-tail JSONL byte sizes; neither is an OLAP workload, so neither needed DuckDB. |
+
+**Spike (this PR, 2026-08-16), re-verifying under today's Bun/toolchain
+before committing to the design in code:** `bun /tmp/f2-duckdb-spike.mjs`
+against a REAL sealed segment from the test vault
+(`~/.sidetrack-vault-test/_BAC/seal/c4205c0c-.../2026-05-12.parquet`,
+read-only, zero vault mutation) — `DuckDBInstance.create(':memory:')` →
+`connect()` → `read_parquet(...)` grouped aggregate: **SUCCESS**, 8.9ms,
+correct row/seq/type counts
+(`{"replica":"c4205c0c-...","n":2,"lo":1,"hi":2,"distinctTypes":1}`), Bun
+1.3.14. Confirms the 2026-08-01 PoC gate still holds on this machine/Bun
+version; no regression to report. chDB was not re-spiked (never a
+dependency, no code path to verify).
 
 ## Learned per-node aggregator stats — design note (2026-08-16)
 
@@ -718,3 +756,71 @@ chunk-bound is not, and should be revisited only if post-fix telemetry
 
 PR: fix(runtime): SIGTERM shutdown watchdog + bounded recomputeScopes
 chunks (branch `fix/shutdown-watchdog-and-scope-batch`).
+
+**2026-08-16 — F2 hot-tail retirement report, report-only
+(perf/f2-hot-tail-report).** OLAP candidate comparison done FIRST (see "F2
+design note" above): the columnar tier already answered DuckDB-vs-chDB with
+a measured PoC gate; this PR reuses that facade (`eventScan.ts`'s
+`readSealedParquetDayStats` + `entryMatches`, newly exported) rather than
+writing a second scan. New `src/analytics/hotTailRetirement.ts`:
+`buildHotTailRetirementReport(vaultRoot)` computes, per (replica, day)
+hot-tail JSONL shard, one of six verdicts (`sealed-verified`, `store-drift`,
+`segment-corrupt`, `segment-missing`, `never-sealed`, `open`), events
+sealed/live/uncovered, hot-tail bytes retirable (one `stat()` per shard —
+never a line scan), and rolls up totals (shards eligible, bytes retirable,
+segment alarms). Zero writes: the event-store mirror is opened
+`new Database(dbPath, { readonly: true })` directly (bun:sqlite's readonly
+open mode) — NOT `getCaughtUpSharedEventStore` (read-write, does catch-up) —
+so the report never mutates the mirror and is safe alongside a live
+companion (WAL readers don't block on a concurrent writer). Deliberately
+does NOT gate on `eventSealEnabled()`/`eventStoreEnabled()` at CLI-invocation
+time (unlike `runSealIntegrityCheck`, which is a live-companion health check
+by design) — a report tool must read whatever is already on disk regardless
+of the invoking process's own env, or an operator who forgets to export a
+flag gets a silently useless report.
+
+CLI: `retire-hot-tail --report --vault <path> [--json]` (src/cli.ts,
+dispatch + help text). `--apply` does not exist — an explicit `--apply`
+invocation is refused with a message naming the soak gate, rather than
+silently no-op'ing or falling back to `--report`. `--json` emits ONE compact
+line (no pretty-print, unlike sibling subcommands) because §6 of the
+maintenance runbook appends it straight to a `.jsonl` history file.
+
+Compaction-aware proof (the specific ask): a new describe block runs the
+REAL F1 compaction pipeline (`planEngagementCompaction`/
+`applyEngagementCompaction`) against a sealed day and proves three things in
+one test: (1) before compaction, `sealed-verified`/eligible; (2) immediately
+after compaction rewrites the JSONL (dropping receipt-covered interval
+rows), the report reconciles via the manifest + parquet + store day-stats —
+never a raw JSONL rescan — and classifies the day `store-drift` (benign,
+blocked pending re-seal), with `segmentAlarms` staying 0 (the parquet
+segment itself is untouched by compaction, so its own manifest-agreement
+proof "still passes" — no false corruption alarm); (3) re-sealing restores
+`sealed-verified`/eligible at the smaller, post-compaction byte size.
+Tampered-seal counterpart (`eventScan.test.ts`'s existing pattern, mirrored
+here): overwriting/deleting a sealed segment flips that day to
+`segment-corrupt`/`segment-missing` — proof fails as designed, alarm
+counted, sibling days unaffected.
+
+Real-vault verification (`~/.sidetrack-vault-test`, read-only, zero
+mutation confirmed by byte-identical `event-store.db` md5 before/after):
+185 shards, 178 eligible, ~244MB (244,173,905 bytes) retirable, 0 segment
+alarms, 6 `store-drift` shards (one replica, six days in
+2026-06/2026-07 — plausibly the F1 engagement-compaction test run on this
+vault dropping those days' interval rows to zero in the store mirror before
+those days were re-sealed; consistent with the "benign, self-heals on
+re-seal" design, not investigated further as it's outside this PR's scope),
+1 open (today). ~3.6s wall time (includes bun/recall-v2 sqlite-lib startup).
+
+Nightly wiring: docs/runbooks/sidetrack-companion-maintenance.sh gained §6
+(report-only, ENABLED — not commented out, matching §5's compact-engagement
+report-only precedent, since this is genuinely zero-write): human-readable
+summary to the maintenance log, plus one compact JSON line appended to
+`_BAC/system/retirement-reports.jsonl` per vault per run, pruned to the last
+30 lines in the same run. Per the "*** NOT YET SYNCED" convention, §6 is
+repo-only until a coordinator copies it into the live
+`~/.sidetrack-companion-maintenance.sh` at deploy time —
+`src/gc/vaultLedger.ts` and `connectionsMaterializer.ts` were not touched.
+
+PR: perf(store): F2 report-only — hot-tail retirement report + compaction-
+aware seal proofs (branch `perf/f2-hot-tail-report`).
