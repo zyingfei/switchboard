@@ -104,6 +104,308 @@ SQLite FTS5 is the natural next home for it).
 | Workload shape | Point KV writes/reads keyed by canonical URL / content hash + small aggregate counts — squarely SQLite's OLTP sweet spot, not an OLAP engine's. |
 | Verdict | Bespoke SQLite tables under bun:sqlite, one file each for page-content and page-evidence. DuckDB/chDB remain live candidates for F2's analytics lanes, not the durable store here. |
 
+## Learned per-node aggregator stats — design note (2026-08-16)
+
+Not an F1–F7 item; filed here per the "binding plan tracks reality" rule
+because it replaces load-bearing machinery (`ranker/aggregatorProfiles.ts`)
+consumed by two serving guards. Binding user directive: replace the
+hand-maintained per-domain registry (ycombinator/reddit/twitter/… profiles,
+hand-written `isItemUrl` predicates + title-chrome patterns) with LEARNED
+per-node behavioral statistics — no domain list, no URL-shape special-casing
+in the replacement. First shipped as a SHADOW (observe-only); the registry
+keeps deciding until shadow-agreement evidence justifies a follow-up flip.
+
+**Why the registry rots.** One label per domain cannot capture: HN
+(categories + item pages), postgres.org/openai/clickhouse blogs
+(single-source, every page is a distinct object), and Uber/Cloudflare eng
+blogs (multi-source-WITH-preference — categorized but each post still a
+stable object). The registry's `isItemUrl` predicates are per-domain regexes
+that must be hand-added for every new site.
+
+**What the two guards actually consume** (read from their source, not
+inferred): both call sites need exactly `AggregatorPageType` ('feed' |
+'item' | 'not-aggregator') per URL, nothing else from the classification
+surface. `candidates.ts`'s `suppressCoarseGrouping`/`repoOrDomainKeys`
+uses it to decide whether a URL contributes a bare `domain:` grouping key
+(suppressed for feed pages) or participates normally; `titlePathTokenKeys`
+suppresses ALL title/path lexical tokens for any aggregator host
+unconditionally (not gated on feed/item). `tabsession/similarity.ts`'s
+`isAnyAggregatorVisit` (feed OR item, ignoring item-narrowing — see the
+file's own 2026-07-24 comment on why) drops two chrome-derived signal
+classes between any two aggregator pages: raw `embedding_neighborhood`
+candidates and `title_only`-tier persisted resemblance edges. Both guards
+exist because of the 2026-07-10 false-friend (feed pages at 82% confidence
+mis-filed an AI-video HN post next to unrelated linux-security items via
+shared site-chrome title/path tokens) — any replacement must keep that
+protection at least as strong, hence the conservative cold-start rule
+below. `stripSiteTitleSuffix` (site-chrome title stripping,
+`visitSimilarity.ts`) and `aggregatorCommunityKey` (subreddit/author
+grouping, `candidates.ts`) are NOT part of this replacement — they
+inherently encode per-site chrome/community knowledge (a literal " |
+Hacker News" suffix, a subreddit path segment) that a behavioral
+classifier has no basis to reconstruct; only `AggregatorPageType` is in
+scope.
+
+**Signals available without touching `connectionsMaterializer.ts`** (out of
+bounds for this work): `NAVIGATION_COMMITTED` events carry
+`visitId`/`canonicalUrl`/`openerVisitId` (opener-chain edges — the same
+data `candidates.ts`'s `opener_chain`/`navigation_chain` generators use);
+`BROWSER_TIMELINE_OBSERVED` carries `canonicalUrl`/`title` per observation;
+`PAGE_EVIDENCE_EXTRACTED` (`page-evidence/types.ts`
+`PageEvidenceExtractedEventPayload`) carries `contentHash` per capture of a
+URL. All three are typed events, readable via the existing
+`readEventsForHealth`/`forEachChunkOfTypes` indexed-type-filter idiom
+(`system/workGraphHealth.ts:353`) — bounded by matching-event count, never
+a full-log scan.
+
+**Per-node counters** (folded incrementally, one event at a time, over
+these three typed streams — `applyAggregatorStatsEvent(state, event)`):
+- `captureCount` / `distinctContentHashCount` — content churn across
+  captures of the SAME url. A feed URL (root, `/newest`, a listing) is
+  revisited and re-extracted many times with a DIFFERENT content hash each
+  time (the list underneath changes); an item URL's hash is stable once
+  captured. This is the direct behavioral analog of "ephemeral, weak
+  content identity" vs "distinct content object" from the registry's own
+  header comment.
+- `distinctOutlinkTargets` — the set of distinct canonicalUrls this URL was
+  the `openerVisitId` origin for. A hub/feed page fans out to many distinct
+  stories; an item page's descendants are typically the single external
+  article it links to (plus same-site replies). This is "hub-ness is
+  behavior" made concrete: fan-out degree, not a URL shape.
+- `visitCount` / `distinctTitleCount` — revisit cadence and title
+  stability, secondary signals (a stable single-title item vs. a
+  repeatedly-checked, title-stable-but-content-churning feed root).
+
+**Per-domain aggregates** (rolled up from the same fold, keyed by a
+structural registrable-domain approximation — last two hostname labels,
+NOT a hand list): `maxOutlinkFanout` and `urlCount` across all observed
+URLs on the domain. A domain is "hub-like" only if SOME url on it has
+crossed the fan-out bar — this is what lets postgres.org/openai/clickhouse
+blogs classify as `not-aggregator` (never observed fanning out) while HN/
+Reddit/GitHub-shaped domains classify as hub-like from behavior alone.
+
+**Classification** (`classifyLearnedAggregatorPage`): domain not hub-like
+→ `not-aggregator` (no guard applied — conservative in the sense of never
+restricting a normal site's similarity that the registry never restricted
+either). Domain hub-like AND (url unseen, OR high fan-out, OR high capture-
+to-capture content churn) → `feed` (quarantined — the conservative
+default; matches "unknown high-churn shapes stay feed-like" so the
+false-friend guard never weakens under the shadow). Domain hub-like AND
+url seen with low fan-out AND (insufficient churn evidence OR low churn)
+→ `item`.
+
+**Shadow wiring** (`SIDETRACK_LEARNED_AGGREGATOR`, absent/non-`0` = ON,
+matching `aggregatorGroupingGuardEnabled`'s call-time style): a new
+`system/workGraphHealth.ts` `DiagnosticCandidate` (id
+`aggregator.learned-stats-shadow`, family `similarity`, lane `shadow`,
+servingImpact `observe-only` — the existing Experiments-row pattern,
+`topic.incremental-shadow`'s sibling) computed INSIDE
+`collectWorkGraphHealth` from the three typed reads above, never touching
+`connectionsMaterializer.ts`. It classifies every distinct canonicalUrl
+observed against BOTH the registry (`classifyAggregatorPageForUrl`) and
+the learned classifier, and reports agreement/disagreement counts —
+overall, restricted to registry-covered domains, and for domains the
+registry has never heard of (where "the learned stats exceed the
+registry" would show up as newly-flagged hub domains). This PR changes
+zero serving decisions; the registry keeps deciding both guards.
+Registry-replacement is a follow-up gated on shadow-agreement evidence
+from the real vault (see PR body for the actual numbers).
+
+**Known scope limit, resolved during implementation.** The live shadow row
+reads a BOUNDED most-recent-N window via the typed event store's
+`readMostRecentByType(type, limit)` (`sync/eventStore.ts:107`,
+`events_accepted_at_ms_idx`) for `NAVIGATION_COMMITTED` and
+`BROWSER_TIMELINE_OBSERVED` — the same bounded idiom `http/server.ts`'s
+`timelineEventsForCandidateGeneration` already established for
+`SIDETRACK_RESOLVER_CANDIDATE_TIMELINE_WINDOW` (see the 2026-08-16
+"index-backed event-candidate resolve" landing note above) —
+`SIDETRACK_LEARNED_AGGREGATOR_WINDOW`, default 20,000 per type, `0` =
+kill switch back to the unbounded type-scoped `forEachChunkOfTypes` read.
+`readMostRecentByType` returns most-recent-first, not causal order, so the
+health-collection adapter sorts by `acceptedAtMs` ascending before folding
+— required for `NAVIGATION_COMMITTED`'s opener-chain resolution, which
+needs an opener's own commit event folded before its child's. When the
+typed store is unavailable, this diagnostic falls back to
+`eventLog.readMerged()` filtered by type — the SAME fallback cost class
+`readEventsForHealth`'s other callers in this exact file already accept
+(`readFeedbackEvents`, the recall.served/action read), not a new regression
+class. The full-history fold (no window) is reserved for the offline
+measurement CLI, matching the F3 exit-criteria's own carve-out ("allowed:
+cold boot recovery, gap seal, CLI/eval").
+
+## Learned per-node aggregator stats — design note (2026-08-16)
+
+Not an F1–F7 item; filed here per the "binding plan tracks reality" rule
+because it replaces load-bearing machinery (`ranker/aggregatorProfiles.ts`)
+consumed by two serving guards. Binding user directive: replace the
+hand-maintained per-domain registry (ycombinator/reddit/twitter/… profiles,
+hand-written `isItemUrl` predicates + title-chrome patterns) with LEARNED
+per-node behavioral statistics — no domain list, no URL-shape special-casing
+in the replacement. First shipped as a SHADOW (observe-only); the registry
+keeps deciding until shadow-agreement evidence justifies a follow-up flip.
+
+**Why the registry rots.** One label per domain cannot capture: HN
+(categories + item pages), postgres.org/openai/clickhouse blogs
+(single-source, every page is a distinct object), and Uber/Cloudflare eng
+blogs (multi-source-WITH-preference — categorized but each post still a
+stable object). The registry's `isItemUrl` predicates are per-domain regexes
+that must be hand-added for every new site.
+
+**What the two guards actually consume** (read from their source, not
+inferred): both call sites need exactly `AggregatorPageType` ('feed' |
+'item' | 'not-aggregator') per URL, nothing else from the classification
+surface. `candidates.ts`'s `suppressCoarseGrouping`/`repoOrDomainKeys` uses
+it to decide whether a URL contributes a bare `domain:` grouping key
+(suppressed for feed pages) or participates normally; `titlePathTokenKeys`
+suppresses ALL title/path lexical tokens for any aggregator host
+unconditionally (not gated on feed/item). `tabsession/similarity.ts`'s
+`isAnyAggregatorVisit` (feed OR item, ignoring item-narrowing — see the
+file's own 2026-07-24 comment on why) drops two chrome-derived signal
+classes between any two aggregator pages: raw `embedding_neighborhood`
+candidates and `title_only`-tier persisted resemblance edges. `isAggregatorHost`
+is the same classifier collapsed to a boolean (domain has ANY profile).
+Both guards exist because of the 2026-07-10 false-friend (a feed page's
+shared site-chrome title/path tokens filed an AI-video HN post next to
+unrelated linux-security items at 82% confidence) — any replacement must
+default to quarantining unknown/ambiguous shapes on a known-hub domain: the
+guard is allowed to be wrong by over-suppressing (an item briefly loses
+signal), never by under-suppressing (a feed page's chrome links two
+unrelated stories). `stripSiteTitleSuffix` (site-chrome title stripping,
+`visitSimilarity.ts`) and `aggregatorCommunityKey` (subreddit/author
+grouping, `candidates.ts`) are NOT part of this replacement — they
+inherently encode per-site chrome/community knowledge (a literal " | Hacker
+News" suffix, a subreddit path segment) a behavioral classifier has no basis
+to reconstruct; only `AggregatorPageType` is in scope.
+
+**Signals available without touching `connectionsMaterializer.ts`** (out of
+bounds for this work), per the actual data model: `NAVIGATION_COMMITTED`
+carries `{visitId, canonicalUrl, openerVisitId, previousVisitId,
+commitTimestamp}` — opener/navigation-chain edges, the same data
+`ranker/candidates.ts`'s `opener_chain`/`navigation_chain` generators use.
+`BROWSER_TIMELINE_OBSERVED` carries `{canonicalUrl, title, observedAt}` —
+one discrete observation per ~30s dwell window, per that file's own doc
+comment. Both are typed events, readable via the existing
+`readMostRecentByType`/`forEachChunkOfTypes` indexed idiom
+(`system/workGraphHealth.ts:353`), never a full-log scan for the live
+shadow row (see "Known scope limit" above). `PAGE_EVIDENCE_EXTRACTED`
+(`page-evidence/types.ts`) additionally carries a `contentHash` per capture
+— a stronger churn signal than title alone, deliberately NOT wired into
+this PR's counters (title churn is sufficient for a first shadow cut and
+keeps the event surface this PR reads to exactly two types); adding a
+content-hash channel later does not change `AggregatorVisitObservation`'s
+shape, only adds a field to it.
+
+**Design: per-node + per-domain counters, incrementally maintained.**
+Per-URL (`UrlAggregatorCounters`): `captureCount` (distinct timeline
+observations carrying a title), `titleChangeCount` (adjacent-capture title
+deltas — content churn across captures of the SAME url: a feed URL is
+revisited and re-extracted with a changing title each time; an item URL's
+title is stable once captured), `outlinkTargets` (bounded set, capped 64, of
+distinct same-domain canonical URLs this URL was observed opening or
+navigation-chaining to — degree = set size; "hub-ness is behavior" made
+concrete as fan-out, not a URL shape), `inboundSources` (bounded set, capped
+32, of distinct URLs that opened/chained INTO this one — the "reached from a
+hub" signal).
+
+Per-domain (`DomainAggregatorCounters`): `distinctUrlCount`,
+`maxQualifyingOutlinkFanout` and `hubCandidateCount` — but a URL's fan-out
+only counts toward these once it *also* clears a revisit/churn bar
+(`captureCount >= 2 OR titleChangeCount >= 1`), so a single-visit
+table-of-contents page on an otherwise single-source blog doesn't alone
+flip the domain into "hub" (ties fan-out to the revisit-cadence and churn
+signals explicitly called for, not fan-out alone). Both fields are updated
+on the same write that changes the qualifying URL's own counters (O(1)) —
+never recomputed by scanning the domain's URL set, so reads
+(`isLearnedAggregatorHost`) are O(1) too.
+
+Domain qualifies as a **hub** (replaces `isAggregatorHost`) when
+`distinctUrlCount >= 5 AND maxQualifyingOutlinkFanout >= 8` (both thresholds
+named, tunable constants — never a domain-specific override). Below that
+bar → `not-aggregator`, matching the registry's default for everything it
+doesn't list — this is what lets postgres.org/openai/clickhouse-shaped
+domains classify as `not-aggregator` (never observed fanning out) while
+HN/Reddit/GitHub-shaped domains classify as hub-like from behavior alone.
+
+Within a hub domain, per-URL (replaces `isItemUrl`):
+1. No observations yet for this URL → **feed** (cold start, conservative;
+   binding requirement).
+2. URL's own qualifying outlink fan-out ≥ 8 → **feed** (it IS a listing/hub
+   page).
+3. Title churn rate ≥ 0.34 over ≥2 captures → **feed** (content keeps
+   changing under a stable URL — the listing signature).
+4. Reached from a same-domain hub URL (an `inboundSources` member whose own
+   qualifying fan-out ≥ 8) AND this URL's own fan-out ≤ 3 → **item** (the
+   one positive signal, works even on a single visit — most real items are
+   visited once, so requiring revisits to prove "item" would silently
+   revert to the pre-2026-07-24 blanket-feed behavior for the majority of
+   real items).
+5. Otherwise (hub domain, ambiguous URL, no positive item evidence) →
+   **feed** (conservative default; binding requirement).
+
+**Signals considered and NOT used as gates (documented, not silently
+dropped).** Domain-level path-prefix entropy ("distinct path-prefixes /
+authors proxy") is tracked as a diagnostic metric only — HN normalizes path
+shape (`/item` for every story), so a hub's path entropy can be as low as a
+single-author blog's; it doesn't reliably separate the two in isolation. URL
+depth/param count were considered and rejected as gates for the same reason:
+HN items are shallow (`/item?id=`), code-forge items are deep
+(`/owner/repo/pull/N`) — no depth threshold is consistent across observed
+platform shapes without becoming a per-platform special case, which is
+exactly what this replacement must not do.
+
+**Known limitation to resolve with shadow evidence, not a priori.** A
+genuinely single-source, multi-post blog (the user's "postgres.org/openai/
+clickhouse" example) can still have an index/category page that fans out to
+8+ of the *same author's* posts, which the fan-out-only heuristic cannot
+distinguish from a true multi-author hub without an authorship signal this
+vault doesn't capture. This is exactly what the real-vault measurement
+(agreement on registry domains + spot-check plausibility on 5+ non-registry
+domains, single-source blogs included) is for — reported honestly in the PR
+body rather than hidden.
+
+**Second limitation, found BY the real-vault measurement (not predicted up
+front).** Agreement varies enormously by domain: news.ycombinator.com
+80.6% (537 URLs), but github.com/reddit.com/claude.ai 0% and
+chatgpt.com/gemini.google.com under 15% (see PR body for exact counts). Root
+cause: `isLearnedAggregatorHost` requires OBSERVING a page whose own
+qualifying fan-out clears the bar — but this vault's captured navigation
+history rarely contains a same-domain "hub" page as the `openerVisitId`/
+`previousVisitId` source for a repo/thread/comments visit (real visits to
+these arrive via external links, bookmarks, or typed URLs, not by clicking
+through the platform's OWN listing page). The domain-level hub gate never
+clears, so the whole domain falls to the conservative `not-aggregator`
+default — safe (never falsely groups two unrelated items by chrome), but it
+means the shadow currently reproduces much LESS of the registry's coverage
+than hoped on exactly the platforms the registry protects hardest. This is
+the real, load-bearing reason registry-replacement stays a gated follow-up:
+the counters need either a corroborating signal that doesn't require
+observing the launch page directly, or accept a materially different
+(narrower) protection surface than the registry — a decision for the
+follow-up, made from this evidence, not before it.
+
+**Shipping shape.** New module `src/ranker/learnedAggregatorStats.ts`
+(counters + classifier, mutating accumulator, no I/O) and
+`src/ranker/learnedAggregatorStatsEvents.ts` (the one place that resolves
+`NAVIGATION_COMMITTED`'s opener/previous visitId chain to a canonical URL,
+keeping the stats module itself free of event-log/visitId bookkeeping).
+Shadow wiring in `system/workGraphHealth.ts` adds one new
+`DiagnosticCandidate` (`aggregator.learned-stats-shadow`, family
+`similarity`, lane `shadow`, servingImpact `observe-only` — the existing
+Experiments-row pattern, `topic.incremental-shadow`'s sibling) computed
+INSIDE `collectWorkGraphHealth`, never touching `connectionsMaterializer.ts`.
+It classifies every distinct canonicalUrl observed in the bounded window
+against BOTH the registry (`classifyAggregatorPageForUrl`) and the learned
+classifier, and reports agreement/disagreement counts via
+`buildAggregatorShadowAgreement` — overall, and split into registry-only
+(learned under-reaches), learned-only (learned finds hubs the hand list
+doesn't cover — the entire point of this replacement), and feed-vs-item
+disagreement. Behind `SIDETRACK_LEARNED_AGGREGATOR` (absent/non-`0` = ON,
+matching `aggregatorGroupingGuardEnabled`'s call-time style — shadow is
+opt-OUT since it only ever observes). This PR changes zero serving
+decisions; the registry keeps deciding both guards. Registry-replacement is
+a follow-up PR gated on shadow-agreement evidence from the real vault (see
+PR body for the actual numbers).
+
 ## Idle-window checklist (next window, ~04:30 or user-idle)
 
 1. Sync ~/.sidetrack-companion-maintenance.sh from docs/runbooks copy.
