@@ -342,6 +342,14 @@ export interface ReliabilityHealthSection {
     readonly unchangedPublishSkipCount: number;
     readonly progressCheckpointCount: number;
     readonly lastPublishSkipAtMs: number | null;
+    // In-place scoped/overlay publish (2026-08-16) — see the "Storage-tier
+    // incremental publish" design note. Non-zero inPlacePublishCount with a
+    // flat swapCount is the healthy steady state: scoped/overlay writes are
+    // landing without minting new generations.
+    readonly inPlacePublishCount: number;
+    readonly lastInPlacePublishAtMs: number | null;
+    readonly inPlacePublishFallbackCount: number;
+    readonly lastInPlaceCheckpointAtMs: number | null;
   };
 }
 
@@ -382,6 +390,10 @@ export interface ConnectionsDoubleBufferHealth {
   readonly unchangedPublishSkipCount: number;
   readonly progressCheckpointCount: number;
   readonly lastPublishSkipAtMs: number | null;
+  readonly inPlacePublishCount: number;
+  readonly lastInPlacePublishAtMs: number | null;
+  readonly inPlacePublishFallbackCount: number;
+  readonly lastInPlaceCheckpointAtMs: number | null;
 }
 
 export const buildReliabilityHealthSection = async (
@@ -408,6 +420,10 @@ export const buildReliabilityHealthSection = async (
             unchangedPublishSkipCount: doubleBuffer.unchangedPublishSkipCount,
             progressCheckpointCount: doubleBuffer.progressCheckpointCount,
             lastPublishSkipAtMs: doubleBuffer.lastPublishSkipAtMs,
+            inPlacePublishCount: doubleBuffer.inPlacePublishCount,
+            lastInPlacePublishAtMs: doubleBuffer.lastInPlacePublishAtMs,
+            inPlacePublishFallbackCount: doubleBuffer.inPlacePublishFallbackCount,
+            lastInPlaceCheckpointAtMs: doubleBuffer.lastInPlaceCheckpointAtMs,
           },
         }
       : {};

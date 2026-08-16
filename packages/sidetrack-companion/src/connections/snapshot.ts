@@ -113,6 +113,7 @@ import {
 import { projectWorkstream } from '../workstreams/projection.js';
 import type { EngagementClassRevision } from './engagementClassifier.js';
 import {
+  acquirePublishLock,
   casPublish,
   checkpointTruncate,
   clearShadowInFlight,
@@ -121,9 +122,13 @@ import {
   discardShadowGeneration,
   generationDbPath,
   generationExists,
+  inPlaceCheckpointEveryN,
+  inPlaceCheckpointIdleMs,
+  inPlacePublishEnabled,
   migrateLegacyToGeneration,
   reconcileLegacyToPublished,
   readPointer,
+  releasePublishLock,
   residentGenerations,
   type SqliteLikeDb,
 } from './generationBuffer.js';
@@ -4583,6 +4588,17 @@ export interface ConnectionsDoubleBufferDiagnostics {
    *  sidecar instead of cloning/publishing the graph database. */
   readonly progressCheckpointCount: number;
   readonly lastPublishSkipAtMs: number | null;
+  /** In-place scoped/overlay publishes (2026-08-16) — writes applied
+   *  directly to the currently-published generation file with NO clone and
+   *  NO pointer flip. Process-lifetime. See the "Storage-tier incremental
+   *  publish" design note in docs/plans/2026-08-15-foundation-program.md. */
+  readonly inPlacePublishCount: number;
+  readonly lastInPlacePublishAtMs: number | null;
+  /** In-place publishes that fell back to the clone+flip path (disabled,
+   *  legacy/:memory:, or no generation published yet) instead of applying
+   *  in place. Process-lifetime. */
+  readonly inPlacePublishFallbackCount: number;
+  readonly lastInPlaceCheckpointAtMs: number | null;
 }
 
 export class SqliteConnectionsStore implements ConnectionsStore {
@@ -4659,6 +4675,13 @@ export class SqliteConnectionsStore implements ConnectionsStore {
   #unchangedPublishSkipCount = 0;
   #progressCheckpointCount = 0;
   #lastPublishSkipAtMs: number | null = null;
+  // In-place scoped/overlay publish (2026-08-16) counters + idle-checkpoint
+  // timer state. See #acquireInPlaceWriteHandle.
+  #inPlacePublishCount = 0;
+  #lastInPlacePublishAtMs: number | null = null;
+  #inPlacePublishFallbackCount = 0;
+  #lastInPlaceCheckpointAtMs: number | null = null;
+  #inPlaceCheckpointTimer: ReturnType<typeof setTimeout> | null = null;
   #resolverCachePruneScheduledFor: string | null = null;
   #resolverCacheCurrentRevision: string | null = null;
   readonly #resolverCacheStaleRevisions = new Set<string>();
@@ -4784,6 +4807,10 @@ export class SqliteConnectionsStore implements ConnectionsStore {
     unchangedPublishSkipCount: this.#unchangedPublishSkipCount,
     progressCheckpointCount: this.#progressCheckpointCount,
     lastPublishSkipAtMs: this.#lastPublishSkipAtMs,
+    inPlacePublishCount: this.#inPlacePublishCount,
+    lastInPlacePublishAtMs: this.#lastInPlacePublishAtMs,
+    inPlacePublishFallbackCount: this.#inPlacePublishFallbackCount,
+    lastInPlaceCheckpointAtMs: this.#lastInPlaceCheckpointAtMs,
   });
 
   /** True when the currently-open handle can execute the schema DDL / writes.
@@ -6409,14 +6436,38 @@ export class SqliteConnectionsStore implements ConnectionsStore {
     // M4 — the parent runs this overlay to keep projection titles fresh
     // between drains, but under double-buffer the parent's graph handle is
     // READONLY (it can never hold a writable current.db lock — that is the
-    // whole point). So the parent applies the overlay as a MINI SHADOW-PUBLISH:
-    // clone the published generation, apply the metadata-only overlay in a
-    // short transaction on the private shadow, checkpoint + flip the pointer.
-    // The reader reopens onto the new generation on its next request. No writer
-    // ever touches the served file, so the read path stays lock-free (D3's "no
-    // writer on the read path" invariant holds for the overlay too).
+    // whole point). Historically the parent applied the overlay as a MINI
+    // SHADOW-PUBLISH (clone the published generation, apply the
+    // metadata-only overlay in a short transaction on the private shadow,
+    // checkpoint + flip the pointer) — this was the "overlay twin" full
+    // 437MB clone measured on the live vault for a SINGLE folded event (see
+    // the "Storage-tier incremental publish" design note,
+    // docs/plans/2026-08-15-foundation-program.md). In-place publish
+    // (2026-08-16, default ON) applies the same one-row fold directly to
+    // the published generation file instead — no clone, no pointer flip.
+    // `#overlayViaShadowPublish` is kept intact as the SIDETRACK_INPLACE_
+    // PUBLISH=0 kill-switch fallback, and as the fallback for the (rare)
+    // case where in-place publish itself isn't applicable right now (no
+    // generation published yet).
     if (this.#doubleBuffer && this.#role === 'parent-reader') {
-      return await this.#overlayViaShadowPublish(event);
+      const inPlace = await this.#acquireInPlaceWriteHandle();
+      if (inPlace === null) {
+        return await this.#overlayViaShadowPublish(event);
+      }
+      const { db, finalize } = inPlace;
+      try {
+        const bootstrapped = await this.#readMetadata(db);
+        if (bootstrapped === null) {
+          finalize(false);
+          return null;
+        }
+        const result = await this.#applyOverlayOnDb(db, event);
+        finalize(true);
+        return result;
+      } catch (error) {
+        finalize(false);
+        throw error;
+      }
     }
     const db = await this.#database();
     const bootstrapped = await this.#readMetadata(db);
@@ -6625,6 +6676,169 @@ export class SqliteConnectionsStore implements ConnectionsStore {
     } catch (error) {
       db.exec('ROLLBACK');
       throw error;
+    }
+  }
+
+  /**
+   * In-place scoped/overlay publish (2026-08-16). See the "Storage-tier
+   * incremental publish" design note in
+   * docs/plans/2026-08-15-foundation-program.md for the full investigation
+   * and empirical WAL-isolation verification this rests on.
+   *
+   * Opens the CURRENTLY PUBLISHED generation file directly — no
+   * `copyFileSync`, no new generation id, no pointer flip — under the
+   * cross-process publish lock, and hands it back with NO transaction open
+   * (same contract as `#acquireGraphWriteHandle`): the caller's own existing
+   * `BEGIN IMMEDIATE`/`COMMIT`/`ROLLBACK` block is the atomic unit for this
+   * publish, completely unchanged. Readers (this store's own `#db`, and
+   * every other process's readonly handle) need no coordination beyond what
+   * WAL already provides: a plain autocommit SELECT (the store's existing
+   * H6 read pattern) sees a consistent pre- or post-publish snapshot,
+   * never torn, and is never blocked by this writer — verified empirically
+   * (`/tmp/wal-spike/spike.mjs`, `spike2.mjs`), not assumed.
+   *
+   * Returns `null` when in-place publish isn't applicable — disabled via
+   * `SIDETRACK_INPLACE_PUBLISH=0`, `:memory:`/legacy (no generations exist),
+   * or no generation published yet (fresh vault, nothing to write into in
+   * place) — and the caller falls back to `#acquireGraphWriteHandle`'s
+   * clone+CAS-flip path, byte-for-byte unchanged.
+   *
+   * The returned connection is fresh per call (opened here, closed by
+   * `finalize`) rather than a persistent cached writer handle: this store
+   * already caches a readonly `#db` for reads, and giving the in-place
+   * writer its own short-lived connection avoids any new lifecycle
+   * reasoning about a long-lived writable handle surviving across the rare
+   * full-rebuild pointer flip (`#reopenIfPointerChanged` only ever concerns
+   * itself with `#db`, which this path never touches).
+   */
+  async #acquireInPlaceWriteHandle(): Promise<{
+    readonly db: SqliteDatabase;
+    readonly finalize: (committed: boolean) => void;
+  } | null> {
+    if (!this.#doubleBuffer || !inPlacePublishEnabled()) return null;
+    const sqlite = await loadSqlite();
+    const lock = acquirePublishLock(this.#root);
+    // Re-read the pointer INSIDE the lock — the same discipline casPublish
+    // uses — so a concurrent full-rebuild flip (which also takes this lock)
+    // can never be raced: either we observe the gen it just published, or it
+    // hasn't run yet and will serialize behind us.
+    const genId = readPointer(this.#root);
+    if (genId === null || !generationExists(this.#root, genId)) {
+      releasePublishLock(this.#root, lock);
+      this.#inPlacePublishFallbackCount += 1;
+      return null;
+    }
+    let db: SqliteDatabase;
+    try {
+      db = new sqlite.Database(generationDbPath(this.#root, genId), {
+        readwrite: true,
+      }) as unknown as SqliteDatabase;
+    } catch {
+      // Race: the generation vanished between readPointer/generationExists
+      // and open — the same TOCTOU window #openHandleForRole already
+      // documents and recovers from. Fall back rather than fail the write.
+      releasePublishLock(this.#root, lock);
+      this.#inPlacePublishFallbackCount += 1;
+      return null;
+    }
+    // Self-healing schema (WAL pragma, the 2026-08-16 edges_index(src, dst)
+    // fix, etc.) — idempotent, a no-op on an already-current generation.
+    this.#initSchemaOn(db);
+    let finalized = false;
+    return {
+      db,
+      finalize: (committed: boolean): void => {
+        if (finalized) return;
+        finalized = true;
+        // The caller's own BEGIN IMMEDIATE/COMMIT or .../ROLLBACK already
+        // ran by the time finalize() is invoked (mirrors every other
+        // finalize() in this class) — nothing transactional to do here.
+        try {
+          db.close?.();
+        } finally {
+          releasePublishLock(this.#root, lock);
+        }
+        if (committed) this.#recordInPlacePublish(genId);
+      },
+    };
+  }
+
+  /** Bookkeeping + WAL checkpoint policy after a successful in-place
+   *  publish. See the design note's "WAL checkpoint policy" section for the
+   *  measurement behind the defaults. */
+  #recordInPlacePublish(genId: string): void {
+    this.#inPlacePublishCount += 1;
+    this.#lastInPlacePublishAtMs = Date.now();
+    const everyN = inPlaceCheckpointEveryN();
+    if (everyN > 0 && this.#inPlacePublishCount % everyN === 0) {
+      this.#cancelInPlaceCheckpointTimer();
+      void this.#checkpointGenerationIfCurrent(genId).catch(() => undefined);
+      return;
+    }
+    this.#scheduleInPlaceCheckpoint(genId);
+  }
+
+  #cancelInPlaceCheckpointTimer(): void {
+    if (this.#inPlaceCheckpointTimer !== null) {
+      clearTimeout(this.#inPlaceCheckpointTimer);
+      this.#inPlaceCheckpointTimer = null;
+    }
+  }
+
+  /** Idle-timer half of the checkpoint policy: after
+   *  SIDETRACK_INPLACE_CHECKPOINT_IDLE_MS with no further in-place publish,
+   *  fold the WAL back into the main db file. Mirrors
+   *  #scheduleCachedSnapshotSweep's idle-timer shape elsewhere in this
+   *  class. */
+  #scheduleInPlaceCheckpoint(genId: string): void {
+    this.#cancelInPlaceCheckpointTimer();
+    const timer = setTimeout(() => {
+      this.#inPlaceCheckpointTimer = null;
+      void this.#checkpointGenerationIfCurrent(genId).catch(() => undefined);
+    }, inPlaceCheckpointIdleMs());
+    timer.unref?.();
+    this.#inPlaceCheckpointTimer = timer;
+  }
+
+  /** Open a fresh writable handle on `genId` (only if it is STILL the
+   *  published pointer — a full-rebuild flip may have superseded it since
+   *  this checkpoint was scheduled) and run `PRAGMA wal_checkpoint(TRUNCATE)`
+   *  under the publish lock. Best-effort: a failed/skipped checkpoint only
+   *  leaves the WAL slightly larger until the next publish or idle tick
+   *  retries — it never risks correctness (TRUNCATE only ever reclaims
+   *  frames no live reader still needs; SQLite itself decides how much it
+   *  can safely fold back). */
+  async #checkpointGenerationIfCurrent(genId: string): Promise<void> {
+    if (this.#closed) return;
+    if (readPointer(this.#root) !== genId) return;
+    const sqlite = await loadSqlite();
+    const lock = acquirePublishLock(this.#root);
+    try {
+      if (readPointer(this.#root) !== genId) return;
+      let db: SqliteDatabase;
+      try {
+        db = new sqlite.Database(generationDbPath(this.#root, genId), {
+          readwrite: true,
+        }) as unknown as SqliteDatabase;
+      } catch {
+        return; // generation vanished — nothing to checkpoint
+      }
+      try {
+        const checkpoint = checkpointTruncate(db as unknown as SqliteLikeDb);
+        this.#lastCheckpointTruncatedPages = checkpoint.checkpointed;
+        this.#lastCheckpointOk = checkpoint.busy === 0;
+        this.#lastInPlaceCheckpointAtMs = Date.now();
+      } catch {
+        /* best-effort — see doc comment */
+      } finally {
+        try {
+          db.close?.();
+        } catch {
+          /* already closed */
+        }
+      }
+    } finally {
+      releasePublishLock(this.#root, lock);
     }
   }
 
@@ -6986,7 +7200,14 @@ export class SqliteConnectionsStore implements ConnectionsStore {
     readonly projectionAccumulatorWrite?: ConnectionsProjectionAccumulatorWrite;
     readonly progressMode?: 'replace' | 'snapshot-revision-only';
   }): Promise<void> => {
-    const { db, finalize } = await this.#acquireGraphWriteHandle();
+    // In-place publish (2026-08-16, default ON): apply this already-O(delta)
+    // scoped rewrite directly to the published generation file instead of
+    // cloning the whole ~400MB db first. Falls back to the clone+CAS-flip
+    // path (byte-for-byte unchanged) when in-place publish isn't applicable
+    // right now — see #acquireInPlaceWriteHandle's doc comment and the
+    // "Storage-tier incremental publish" design note.
+    const inPlace = await this.#acquireInPlaceWriteHandle();
+    const { db, finalize } = inPlace ?? (await this.#acquireGraphWriteHandle());
     const edgeBuckets = new Map<string, ConnectionEdge[]>();
     for (const edge of input.edges) {
       const key = edgeBucketKey(edge);
@@ -7325,12 +7546,12 @@ export class SqliteConnectionsStore implements ConnectionsStore {
       finalize(false);
       throw error;
     }
-    // D2 — scoped-delta publishes via the SAME shadow+swap path as a full
-    // drain (the child forks per drain regardless of full-vs-scoped, so its
-    // store is already a private shadow). On the parent (foreground-nav overlay
-    // scoped delta) this publishes a fresh shadow generation; the parent never
-    // holds a lock on the served file because it is a pure reader on a
-    // different generation.
+    // D2 (pre-2026-08-16) / in-place publish (2026-08-16, default ON) — see
+    // the acquire call above. Under in-place publish this commit already
+    // landed directly on the published generation file (finalize just closes
+    // the connection + releases the publish lock); under the
+    // SIDETRACK_INPLACE_PUBLISH=0 fallback it publishes a fresh shadow
+    // generation via clone+CAS-flip exactly as before.
     finalize(true);
   };
 
@@ -8194,6 +8415,7 @@ export class SqliteConnectionsStore implements ConnectionsStore {
 
   close(): void {
     this.#closed = true;
+    this.#cancelInPlaceCheckpointTimer();
     this.#db?.close?.();
     this.#db = null;
     this.#initialized = false;
