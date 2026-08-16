@@ -1,10 +1,14 @@
-import { mkdtemp, readdir, readFile, rm } from 'node:fs/promises';
+import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
-import { queryPageContent, writePageContentExtracted } from '../page-content/store.js';
+import {
+  queryPageContent,
+  readPageContentExtractedPayloadForEvidence,
+  writePageContentExtracted,
+} from '../page-content/store.js';
 import type { PageEvidenceExtractedRequest } from './types.js';
 import {
   completeExtractedPageEvidenceEmbedding,
@@ -63,15 +67,14 @@ describe('page-evidence store', () => {
     expect(record.evidenceTier).toBe('content_features_only');
     expect(record.content?.terms.some((term) => term.normalized === 'minipack')).toBe(true);
     await expect(queryPageContent(root, 'minipack fabric', { limit: 5 })).resolves.toEqual([]);
-    await expect(readdir(join(root, '_BAC', 'page-content', 'raw'))).rejects.toThrow();
-    await expect(readdir(join(root, '_BAC', 'page-content', 'chunks'))).rejects.toThrow();
+    // No page-content raw text or chunks were ever written (features-only
+    // never touches the page-content store).
+    await expect(
+      readPageContentExtractedPayloadForEvidence(root, payload().canonicalUrl),
+    ).resolves.toBeNull();
 
-    const evidenceFiles = await readdir(join(root, '_BAC', 'page-evidence', 'by-url'));
-    const evidenceJson = await readFile(
-      join(root, '_BAC', 'page-evidence', 'by-url', evidenceFiles[0]!),
-      'utf8',
-    );
-    expect(evidenceJson).not.toContain(
+    const stored = await readPageEvidence(root, payload().canonicalUrl);
+    expect(JSON.stringify(stored.record)).not.toContain(
       'The full raw content sentence includes a privacy sentinel that must not be persisted.',
     );
   });
@@ -141,9 +144,7 @@ describe('page-evidence store', () => {
       });
     };
 
-    const fastRecord = await writeExtractedPageEvidenceFast(root, payload(), {
-      rebuildManifestAfterWrite: false,
-    });
+    const fastRecord = await writeExtractedPageEvidenceFast(root, payload());
 
     expect(embedCalls).toBe(0);
     expect(fastRecord.content?.embeddingState).toBe('missing');
@@ -153,7 +154,6 @@ describe('page-evidence store', () => {
 
     const finalRecord = await completeExtractedPageEvidenceEmbedding(root, payload(), {
       embedder,
-      rebuildManifestAfterWrite: false,
     });
 
     expect(embedCalls).toBe(1);
@@ -181,11 +181,10 @@ describe('page-evidence store', () => {
       },
     });
 
-    await writeExtractedPageEvidenceFast(root, payload(), { rebuildManifestAfterWrite: false });
-    await writeExtractedPageEvidenceFast(root, newerPayload, { rebuildManifestAfterWrite: false });
+    await writeExtractedPageEvidenceFast(root, payload());
+    await writeExtractedPageEvidenceFast(root, newerPayload);
     const staleResult = await completeExtractedPageEvidenceEmbedding(root, payload(), {
       embedder,
-      rebuildManifestAfterWrite: false,
     });
 
     expect(embedCalls).toBe(0);
@@ -291,12 +290,14 @@ describe('page-evidence store', () => {
     expect(refreshed.record?.metadata.title).toBe('New timeline title');
   });
 
-  it('rebuildManifestAfterWrite:false still writes a directly-readable per-URL record (D)', async () => {
+  it('rebuildManifestAfterWrite:false (inert, kept for call-site compat) still writes a directly-readable record (D)', async () => {
     // D — the timeline-ingest path writes page-evidence records right
-    // after ingest, decoupled from the connections reconcile, and
-    // skips the O(records) manifest walk. readPageEvidence (the badge
-    // poll) reads the per-URL record file directly, so the record
-    // must be present + readable without a manifest rebuild.
+    // after ingest, decoupled from the connections reconcile.
+    // readPageEvidence (the badge poll) reads the row directly, so the
+    // record must be present + readable regardless of this option
+    // (F5: there is no manifest left to rebuild or skip — the option
+    // is accepted only for connectionsMaterializer.ts call-site
+    // compatibility, see ensurePageEvidenceForTimelineEntries).
     const url = 'https://example.test/d-fast-page-evidence';
     const records = await ensurePageEvidenceForTimelineEntries(
       root,

@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
@@ -11,7 +11,9 @@ import {
   canonicalizePageUrl,
   pageContentCoverageCounts,
   queryPageContent,
+  readPageContentChunksForCanonicalUrls,
   readPageContentCoverage,
+  readPageContentExtractedPayloadForEvidence,
   scanForOverCollapsedPageContent,
   sha256Hex,
   writePageContentExtracted,
@@ -144,15 +146,18 @@ describe('page-content store', () => {
     expect(coverage.quality).toBe('high');
     expect(coverage.chunkCount).toBeGreaterThan(0);
 
-    await expect(
-      readFile(join(root, '_BAC', 'page-content', 'raw', 'hash-oracle-cloud.json'), 'utf8'),
-    ).resolves.toContain('Oracle cloud adoption');
+    const extracted = await readPageContentExtractedPayloadForEvidence(
+      root,
+      'https://docs.example.com/oracle/cloud',
+    );
+    expect(extracted?.content.text).toContain('Oracle cloud adoption');
 
-    const chunkManifest = JSON.parse(
-      await readFile(join(root, '_BAC', 'page-content', 'chunks', 'hash-oracle-cloud.json'), 'utf8'),
-    ) as { readonly chunks: readonly { readonly terms?: readonly unknown[]; readonly qualityWeight?: number }[] };
-    expect(chunkManifest.chunks[0]?.terms?.length).toBeGreaterThan(0);
-    expect(chunkManifest.chunks[0]?.qualityWeight).toBe(1);
+    const chunksByUrl = await readPageContentChunksForCanonicalUrls(root, [
+      'https://docs.example.com/oracle/cloud',
+    ]);
+    const chunks = chunksByUrl.get('https://docs.example.com/oracle/cloud');
+    expect(chunks?.[0]?.terms?.length).toBeGreaterThan(0);
+    expect(chunks?.[0]?.qualityWeight).toBe(1);
 
     const queried = await queryPageContent(root, 'oracle guardrails', { limit: 5 });
     expect(queried).toHaveLength(1);

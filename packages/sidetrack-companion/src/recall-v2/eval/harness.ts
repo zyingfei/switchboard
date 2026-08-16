@@ -192,7 +192,7 @@ const writeFixtureDoc = async (
       },
       storageMode: doc.body !== undefined ? 'indexed_chunks' : 'features_only',
     },
-    { embeddingsEnabled: false, rebuildManifestAfterWrite: false },
+    { embeddingsEnabled: false },
   );
   if (doc.body !== undefined) {
     // Body-indexed: also write the page-content record so the page-

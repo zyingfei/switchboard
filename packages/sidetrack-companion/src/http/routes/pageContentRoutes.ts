@@ -187,13 +187,14 @@ export const pageContentRoutes: readonly RouteDefinition[] = [
         // observed in-flight for 114s during a boot catch-up with no way to
         // tell WHICH of the four awaits below was starved.
         const t0 = Date.now();
-        // O(1) manifest upsert instead of the O(records) rebuild — the rebuild
-        // was the measured 16-119s of this route's `content` phase under
-        // catch-up load (see applyPageContentManifestUpsert for the argument;
-        // deferring the same scan onto the event loop was measured worse).
-        const coverage = await writePageContentExtracted(vaultRoot, payload, {
-          manifestUpdate: 'incremental',
-        });
+        // F5 (2026-08-16): page-content and page-evidence are single
+        // SQLite stores now — a write is one small transaction against
+        // this capture's own rows, no manifest file to upsert or
+        // rebuild (rows ARE the manifest; see page-content/store.ts and
+        // page-evidence/store.ts module headers). This replaces the
+        // #356/#357 O(1)-incremental-vs-O(records)-rebuild manifest
+        // machinery entirely — that distinction no longer exists.
+        const coverage = await writePageContentExtracted(vaultRoot, payload);
         const t1 = Date.now();
         // Fast variant: never run doc-embedding inference on the request
         // path. The slow variant waited on the embedder (measured 24s+ when
@@ -201,17 +202,10 @@ export const pageContentRoutes: readonly RouteDefinition[] = [
         // embedding lane owns filling embeddingState:'missing', and an
         // unchanged contentHash still carries the previous embedding forward
         // as 'ready' inside the fast write.
-        const evidence = await writeExtractedPageEvidenceFast(
-          vaultRoot,
-          {
-            ...payload,
-            storageMode: 'indexed_chunks',
-          },
-          // O(1) manifest upsert — the full rebuild reads every record JSON
-          // (3,741 on the dogfood vault) and was this route's measured
-          // 11-16s `evidence` phase under boot load.
-          { manifestUpdate: 'incremental' },
-        );
+        const evidence = await writeExtractedPageEvidenceFast(vaultRoot, {
+          ...payload,
+          storageMode: 'indexed_chunks',
+        });
         const t2 = Date.now();
         if (context.eventLog !== undefined) {
           await context.eventLog.appendServerObserved({
@@ -286,8 +280,9 @@ export const pageContentRoutes: readonly RouteDefinition[] = [
     // Read back the ALREADY-INDEXED page text for a canonical URL:
     // { data: { canonicalUrl, title, text } } or 404 when not indexed.
     // The panel's on-demand content enrichment generates a gist from this
-    // — the page is already extracted + stored at index time
-    // (_BAC/page-content/raw/<hash>.json), so there is no reason to trigger
+    // — the page is already extracted + stored at index time (the
+    // `raw_content` table in _BAC/page-content/page-content.db), so
+    // there is no reason to trigger
     // a SECOND live browser extract (which needs deeper page access and
     // failed with "no obtainable text" on an already-indexed page). Reuses
     // the exact reader page-evidence already uses; text only, no side
@@ -363,16 +358,8 @@ export const pageContentRoutes: readonly RouteDefinition[] = [
             // Once the queue entry exists, a worker may immediately upgrade this
             // same record; writing features afterward could downgrade a completed
             // worker result back to features-only and strand the vector lane.
-            // O(1) manifest upsert, same as the /v1/page-content/extracted
-            // route above — the full rebuild this used to skip entirely
-            // (rebuildManifestAfterWrite:false) read every record JSON and
-            // left the manifest permanently stale for every features_only
-            // capture. This runs on the main HTTP thread, so it shares the
-            // same evidenceManifestUpsertLocks serialization as every other
-            // in-process caller.
-            const evidence = await writeExtractedPageEvidenceFast(vaultRoot, evidencePayload, {
-              manifestUpdate: 'incremental',
-            });
+            // F5: a single SQLite row upsert — no manifest to skip or rebuild.
+            const evidence = await writeExtractedPageEvidenceFast(vaultRoot, evidencePayload);
             // Auto/attention capture intentionally posts `features_only` so the
             // request path stays fast. Preserve its body in a bounded, durable,
             // latest-wins queue before returning. Admission is one atomic file
@@ -390,10 +377,8 @@ export const pageContentRoutes: readonly RouteDefinition[] = [
             async () => {
               await discardQueuedBodyEvidenceUnderLock(vaultRoot, pageContentPayload.canonicalUrl);
               const coverage = await writePageContentExtracted(vaultRoot, pageContentPayload);
-              // O(1) manifest upsert — see the features_only branch above.
-              const evidence = await writeExtractedPageEvidenceFast(vaultRoot, evidencePayload, {
-                manifestUpdate: 'incremental',
-              });
+              // F5: a single SQLite row upsert — see the features_only branch above.
+              const evidence = await writeExtractedPageEvidenceFast(vaultRoot, evidencePayload);
               return { coverage, evidence, bodyEvidenceQueue: null };
             },
           );

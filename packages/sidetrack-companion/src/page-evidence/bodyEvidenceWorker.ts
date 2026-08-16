@@ -1,14 +1,9 @@
 import { stat } from 'node:fs/promises';
-import { join } from 'node:path';
 import { Worker, isMainThread, parentPort, workerData } from 'node:worker_threads';
 import { fileURLToPath } from 'node:url';
 
 import { isPageContentExtractedPayload } from '../page-content/events.js';
-import {
-  readPageContentCoverage,
-  rebuildPageContentManifests,
-  writePageContentExtracted,
-} from '../page-content/store.js';
+import { readPageContentCoverage, writePageContentExtracted } from '../page-content/store.js';
 import type { PageContentExtractedPayload } from '../page-content/types.js';
 import {
   readCurrentBodyEvidence,
@@ -16,6 +11,7 @@ import {
   withBodyEvidenceUrlLock,
 } from './bodyEvidenceQueue.js';
 import {
+  pageEvidenceDbPath,
   pageEvidenceStorageStats,
   readPageEvidence,
   writeExtractedPageEvidenceFast,
@@ -78,16 +74,19 @@ interface BodyEvidenceWorkerJob {
   readonly items: readonly BodyEvidenceMaterializationInput[];
 }
 
-const pageEvidenceRoot = (vaultRoot: string): string => join(vaultRoot, '_BAC', 'page-evidence');
-
 const ratio = (numerator: number, denominator: number): number | null =>
   denominator === 0 ? null : Number((numerator / denominator).toFixed(4));
 
 export const readBodyEvidenceCoverage = async (
   vaultRoot: string,
 ): Promise<BodyEvidenceCoverage> => {
-  const root = await stat(pageEvidenceRoot(vaultRoot)).catch(() => null);
-  if (root === null) {
+  // F5: "absent" now means the SQLite store was never initialized (no
+  // page-evidence.db on disk) — the twin of the old "by-url/ dir
+  // doesn't exist yet" check, before this function reads anything
+  // (pageEvidenceStorageStats below would otherwise lazily CREATE an
+  // empty store as a side effect of merely checking).
+  const dbExists = await stat(pageEvidenceDbPath(vaultRoot)).catch(() => null);
+  if (dbExists === null) {
     return {
       state: 'absent',
       target: BODY_EVIDENCE_COVERAGE_TARGET,
@@ -156,35 +155,14 @@ const materializeOne = async (
     // manually modified queue item cannot bypass redaction/injection handling.
     const payload = scrubBodyEvidencePayload(current.payload).payload;
     try {
-      await writePageContentExtracted(vaultRoot, payload, {
-        rebuildManifestsAfterWrite: false,
-      });
-      // INTENTIONALLY left as skip-forever, not switched to
-      // manifestUpdate:'incremental'. This function runs INSIDE the
-      // materialize-batch worker_threads Worker (see runBodyEvidenceWorker
-      // below + the isMainThread branch at the bottom of this file) — a
-      // separate V8 isolate with its OWN instance of page-evidence/store.ts
-      // and therefore its OWN `evidenceManifestUpsertLocks` Map. That lock
-      // only serializes callers within one isolate; it does not span the
-      // thread boundary. If this called the incremental upsert, it would
-      // race the main thread's HTTP-route and background-embedding-lane
-      // upserts on the same physical manifest.json (read-modify-write from
-      // two isolates, unordered) and could silently drift byTier/recordCount
-      // (a lost-update, not a crash — much harder to notice). The one-shot
-      // full rebuild this used to pay per record was itself self-healing
-      // under that same concurrency (it recomputes fresh from disk, so a
-      // "stale" rebuild is still internally consistent) but too slow to run
-      // per record; skipping it here trades a stale-but-harmless
-      // page-evidence manifest.json (no runtime reader was found for it —
-      // unlike the page-content manifest, which IS part of the served read
-      // model, see rebuildPageContentManifests below) for correctness. If a
-      // reader ever needs this manifest fresh after body-evidence writes,
-      // rebuild it ONCE per batch on the main thread after the worker
-      // returns (mirroring rebuildPageContentManifests), not per record
-      // inside the worker.
-      await writeExtractedPageEvidenceFast(vaultRoot, evidenceRequest(payload), {
-        rebuildManifestAfterWrite: false,
-      });
+      // F5 (2026-08-16): both stores are single SQLite dbs now — each
+      // write is its own small transaction against this record's row,
+      // no manifest file for a worker-thread isolate to skip or race
+      // with the main thread over (the #356/#357 manifest-upsert
+      // machinery this comment used to describe is gone; see
+      // page-content/store.ts and page-evidence/store.ts headers).
+      await writePageContentExtracted(vaultRoot, payload);
+      await writeExtractedPageEvidenceFast(vaultRoot, evidenceRequest(payload));
     } catch {
       return { jobId: input.jobId, ok: false, failureCategory: 'materialization_failed' };
     }
@@ -222,21 +200,10 @@ const materializeOne = async (
 export const materializeBodyEvidenceBatch = async (
   job: Pick<BodyEvidenceWorkerJob, 'vaultRoot' | 'items'>,
 ): Promise<BodyEvidenceWorkerResult> => {
-  let results: BodyEvidenceMaterializationResult[] = [];
-  // Sequential by design: page-content manifest writes are single-writer.
+  const results: BodyEvidenceMaterializationResult[] = [];
+  // Sequential by design (each item's write must land before the next
+  // item's read-back check runs).
   for (const item of job.items) results.push(await materializeOne(job.vaultRoot, item));
-  if (results.some((result) => result.ok)) {
-    try {
-      // One O(records) rebuild for the whole bounded batch, not per page.
-      await rebuildPageContentManifests(job.vaultRoot);
-    } catch {
-      // Manifests are part of the served read model. Leave every successful
-      // item durable in the queue so the idempotent retry repairs the batch.
-      results = results.map((result) =>
-        result.ok ? { jobId: result.jobId, ok: false, failureCategory: 'readback_failed' } : result,
-      );
-    }
-  }
   return { results, coverage: await readBodyEvidenceCoverage(job.vaultRoot) };
 };
 

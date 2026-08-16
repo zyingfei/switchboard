@@ -87,6 +87,23 @@ Run after F1–F7 all land, on the TEST companion first, then daily:
 
 Record results in docs/audits/<date>-foundation-validation.md.
 
+## F5 design note (2026-08-16)
+
+Binding user rule: document the store choice before writing code.
+Workload: per-capture small-doc KV writes (page-content record + raw
+text + chunks; page-evidence record), point reads by canonical URL /
+content hash, aggregate "manifest" counts (byState/byTier), and an FTS
+hook later (lexical index already exists in-process via MiniSearch —
+SQLite FTS5 is the natural next home for it).
+
+| Candidate | Fit for THIS workload |
+|---|---|
+| Bespoke SQLite tables (bun:sqlite) | Matches the vault-wide standard already proven in 12+ stores (engagementFactsStore, captureTextFtsStore, recall-v2, connections/snapshot.ts) — same WAL + busy_timeout + atomic-rename crash-safety patterns, zero new runtime, FTS5 virtual tables are a same-engine follow-up. |
+| chDB (embedded ClickHouse) | Columnar OLAP engine built for scan-heavy analytical queries over large batches; no maintained Bun-native binding in this stack; would add a second storage runtime with its own crash-safety/WAL surface to audit for a workload that is single-row upserts, not analytical scans. |
+| DuckDB (embedded) | Same shape mismatch as chDB — excellent for the F2 columnar/analytics lanes (bulk aggregation over sealed history), but its write path is optimized for batch ingestion, not one-row-per-capture upserts; a second embedded-db handle alongside bun:sqlite duplicates crash-recovery work for no workload benefit here. |
+| Workload shape | Point KV writes/reads keyed by canonical URL / content hash + small aggregate counts — squarely SQLite's OLTP sweet spot, not an OLAP engine's. |
+| Verdict | Bespoke SQLite tables under bun:sqlite, one file each for page-content and page-evidence. DuckDB/chDB remain live candidates for F2's analytics lanes, not the durable store here. |
+
 ## Idle-window checklist (next window, ~04:30 or user-idle)
 
 1. Sync ~/.sidetrack-companion-maintenance.sh from docs/runbooks copy.

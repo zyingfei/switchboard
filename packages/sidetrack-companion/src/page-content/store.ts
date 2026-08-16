@@ -1,10 +1,10 @@
 import { createHash } from 'node:crypto';
-import { mkdir, readFile, readdir, rename, stat, unlink, writeFile } from 'node:fs/promises';
-import { basename, dirname, join } from 'node:path';
+import { existsSync } from 'node:fs';
+import { mkdir, readdir, readFile, rename, rm, stat } from 'node:fs/promises';
+import { join } from 'node:path';
 
 import MiniSearch from 'minisearch';
 
-import { createRevision } from '../domain/ids.js';
 import { extractPageEvidenceFeatures } from '../page-evidence/extract.js';
 import { ANALYZER_VERSION, analyze } from '../search/analyzer.js';
 import {
@@ -21,6 +21,317 @@ import {
 } from './types.js';
 import { recordCanonicalCollision } from './canonicalize-telemetry.js';
 import { classifyPageContentQuality } from './quality.js';
+
+// ─────────────────────────────────────────────────────────────────────
+// F5 — single SQLite store (2026-08-16)
+//
+// Replaces the by-url/*.json + raw/*.json + chunks/*.json +
+// manifest.json + chunks/manifest.json + ingest-state.json small-file
+// layout (~703 files + a 157KB chunks-manifest rewritten on EVERY
+// capture on the test vault — see docs/plans/2026-08-15-foundation-
+// program.md F5 design note for the SQLite-vs-chDB-vs-DuckDB
+// comparison). One `records` table (the full PageContentRecord as
+// JSON plus indexed columns for the manifest-equivalent aggregate
+// queries), one `raw_content` table keyed by contentHash, one `chunks`
+// table keyed by contentHash. Rows ARE the manifest now: the #356/#357
+// incremental-manifest-upsert machinery (applyPageContentManifestUpsert,
+// rebuildPageContentManifests) is deleted — pageContentCoverageCounts
+// reads a live SQL aggregate instead of a persisted, per-write-rewritten
+// artifact. WAL + busy_timeout matches the vault-wide bun:sqlite
+// crash-safety pattern (engagementFactsStore.ts, captureTextFtsStore.ts).
+//
+// ONE-TIME PORT (binding, no back-compat layer): on first open, if no
+// page-content.db exists yet but the legacy by-url/ directory has
+// entries, every legacy record/raw/chunk file is imported into a temp
+// db, verified (row counts must match what was inserted), then
+// published with a single atomic rename over the final path. A crash
+// mid-port leaves only an abandoned temp file — the next open sees no
+// final db and restarts the whole import from the untouched legacy
+// files (idempotent by construction: the port never resumes partial
+// rows, it always rebuilds the temp db from scratch). The legacy files
+// are left on disk for an operator to delete manually; this module
+// never deletes them and stops reading them entirely once the SQLite
+// store exists.
+
+interface SqliteStatement {
+  readonly run: (
+    ...params: readonly unknown[]
+  ) => { readonly changes: number; readonly lastInsertRowid: number | bigint };
+  readonly get: (...params: readonly unknown[]) => unknown;
+  readonly all: (...params: readonly unknown[]) => readonly unknown[];
+}
+interface SqliteDatabase {
+  readonly exec: (sql: string) => unknown;
+  readonly query: (sql: string) => SqliteStatement;
+  readonly close?: (opts?: { readonly throwOnError?: boolean }) => void;
+}
+interface SqliteModule {
+  readonly Database: new (
+    filename: string,
+    options?: { readonly create?: boolean; readonly readwrite?: boolean },
+  ) => SqliteDatabase;
+}
+
+const loadSqlite = async (): Promise<SqliteModule> => {
+  const module = (await import('bun:sqlite')) as Partial<SqliteModule>;
+  if (typeof module.Database !== 'function') {
+    throw new Error('bun:sqlite Database export is unavailable');
+  }
+  return { Database: module.Database };
+};
+
+const SCHEMA = `
+  PRAGMA journal_mode = WAL;
+  PRAGMA busy_timeout = 2500;
+  CREATE TABLE IF NOT EXISTS records (
+    canonical_url TEXT PRIMARY KEY,
+    state TEXT NOT NULL,
+    content_hash TEXT,
+    updated_at TEXT NOT NULL,
+    record_json TEXT NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS records_state ON records(state);
+  CREATE TABLE IF NOT EXISTS raw_content (
+    content_hash TEXT PRIMARY KEY,
+    raw_json TEXT NOT NULL
+  );
+  CREATE TABLE IF NOT EXISTS chunks (
+    content_hash TEXT PRIMARY KEY,
+    chunks_json TEXT NOT NULL
+  );
+`;
+
+export const pageContentRoot = (vaultRoot: string): string => join(vaultRoot, '_BAC', 'page-content');
+export const pageContentDbPath = (vaultRoot: string): string =>
+  join(pageContentRoot(vaultRoot), 'page-content.db');
+
+// Legacy file-layout paths — port source ONLY. Never written again once
+// the SQLite store exists; read here purely to import them once.
+const legacyByUrlDir = (vaultRoot: string): string => join(pageContentRoot(vaultRoot), 'by-url');
+const legacyRawDir = (vaultRoot: string): string => join(pageContentRoot(vaultRoot), 'raw');
+const legacyChunksDir = (vaultRoot: string): string => join(pageContentRoot(vaultRoot), 'chunks');
+
+const readJsonLegacy = async <T>(path: string): Promise<T | null> => {
+  try {
+    return JSON.parse(await readFile(path, 'utf8')) as T;
+  } catch {
+    return null;
+  }
+};
+
+const safeLegacyRecord = (value: unknown): PageContentRecord | null => {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return null;
+  const record = value as Partial<PageContentRecord>;
+  if (
+    typeof record.url !== 'string' ||
+    typeof record.updatedAt !== 'string' ||
+    typeof record.coverage !== 'object' ||
+    record.coverage === null
+  ) {
+    return null;
+  }
+  const coverage = record.coverage as Partial<PageContentCoverage>;
+  if (typeof coverage.canonicalUrl !== 'string' || typeof coverage.state !== 'string') return null;
+  return record as PageContentRecord;
+};
+
+const rmQuiet = async (path: string): Promise<void> => {
+  await rm(path, { force: true });
+};
+
+/** Imports the legacy by-url/raw/chunks file layout into a fresh temp
+ *  db, verifies row counts, then atomically publishes it over
+ *  `finalPath`. Never called when `finalPath` already exists. */
+const portLegacyPageContent = async (
+  vaultRoot: string,
+  finalPath: string,
+  legacyByUrlNames: readonly string[],
+  Database: SqliteModule['Database'],
+): Promise<void> => {
+  const tmpPath = `${finalPath}.porting.tmp`;
+  // A prior crash mid-port may have left a partial temp db (or its
+  // WAL/SHM sidecars) behind. Discard it unconditionally and restart
+  // the import from the untouched legacy files — the port always
+  // rebuilds the temp db from scratch, never resumes partial rows, so
+  // this is safe regardless of how far a prior attempt got.
+  await rmQuiet(tmpPath);
+  await rmQuiet(`${tmpPath}-wal`);
+  await rmQuiet(`${tmpPath}-shm`);
+
+  const db = new Database(tmpPath, { create: true, readwrite: true });
+  let recordCount = 0;
+  let rawCount = 0;
+  let chunkCount = 0;
+  try {
+    db.exec(SCHEMA);
+
+    const insertRecord = db.query(
+      'INSERT OR REPLACE INTO records (canonical_url, state, content_hash, updated_at, record_json) VALUES (?,?,?,?,?)',
+    );
+    db.exec('BEGIN');
+    try {
+      for (const name of legacyByUrlNames) {
+        const record = safeLegacyRecord(
+          await readJsonLegacy(join(legacyByUrlDir(vaultRoot), name)),
+        );
+        if (record === null) continue;
+        insertRecord.run(
+          record.coverage.canonicalUrl,
+          record.coverage.state,
+          record.coverage.contentHash ?? null,
+          record.updatedAt,
+          JSON.stringify(record),
+        );
+        recordCount += 1;
+      }
+      db.exec('COMMIT');
+    } catch (error) {
+      db.exec('ROLLBACK');
+      throw error;
+    }
+
+    const insertRaw = db.query(
+      'INSERT OR REPLACE INTO raw_content (content_hash, raw_json) VALUES (?,?)',
+    );
+    const rawNames = (await readdir(legacyRawDir(vaultRoot)).catch(() => [] as string[])).filter(
+      (name) => name.endsWith('.json'),
+    );
+    db.exec('BEGIN');
+    try {
+      for (const name of rawNames) {
+        const raw = await readJsonLegacy<unknown>(join(legacyRawDir(vaultRoot), name));
+        if (raw === null) continue;
+        insertRaw.run(name.slice(0, -'.json'.length), JSON.stringify(raw));
+        rawCount += 1;
+      }
+      db.exec('COMMIT');
+    } catch (error) {
+      db.exec('ROLLBACK');
+      throw error;
+    }
+
+    const insertChunks = db.query(
+      'INSERT OR REPLACE INTO chunks (content_hash, chunks_json) VALUES (?,?)',
+    );
+    const chunkNames = (
+      await readdir(legacyChunksDir(vaultRoot)).catch(() => [] as string[])
+    ).filter((name) => name.endsWith('.json') && name !== 'manifest.json');
+    db.exec('BEGIN');
+    try {
+      for (const name of chunkNames) {
+        const chunkDoc = await readJsonLegacy<unknown>(join(legacyChunksDir(vaultRoot), name));
+        if (chunkDoc === null) continue;
+        insertChunks.run(name.slice(0, -'.json'.length), JSON.stringify(chunkDoc));
+        chunkCount += 1;
+      }
+      db.exec('COMMIT');
+    } catch (error) {
+      db.exec('ROLLBACK');
+      throw error;
+    }
+
+    // Verify before publishing: the temp db's row counts must match what
+    // we just inserted (a crash/short-write mid-transaction would have
+    // thrown above already, but this catches any silent driver-level
+    // truncation before this becomes the durable store).
+    const countOf = (table: string): number =>
+      (db.query(`SELECT COUNT(*) AS n FROM ${table}`).get() as { n: number }).n;
+    const verifiedRecords = countOf('records');
+    const verifiedRaw = countOf('raw_content');
+    const verifiedChunks = countOf('chunks');
+    if (
+      verifiedRecords !== recordCount ||
+      verifiedRaw !== rawCount ||
+      verifiedChunks !== chunkCount
+    ) {
+      throw new Error(
+        `page-content port count mismatch: records ${String(verifiedRecords)}/${String(recordCount)}, ` +
+          `raw ${String(verifiedRaw)}/${String(rawCount)}, chunks ${String(verifiedChunks)}/${String(chunkCount)}`,
+      );
+    }
+    db.close?.();
+  } catch (error) {
+    db.close?.();
+    await rmQuiet(tmpPath);
+    await rmQuiet(`${tmpPath}-wal`);
+    await rmQuiet(`${tmpPath}-shm`);
+    throw error;
+  }
+
+  // Atomic publish: the fully-populated, verified temp db becomes the
+  // durable store in one rename. A crash before this line leaves only
+  // an abandoned temp file (cleaned up on the next port attempt); a
+  // crash after it is a normal SQLite file, already durable.
+  await rename(tmpPath, finalPath);
+  await rmQuiet(`${tmpPath}-wal`);
+  await rmQuiet(`${tmpPath}-shm`);
+  console.warn(
+    `[page-content] ported legacy file layout to SQLite: ${String(recordCount)} records, ` +
+      `${String(rawCount)} raw text docs, ${String(chunkCount)} chunk docs. ` +
+      `Old layout preserved at ${legacyByUrlDir(vaultRoot)} (and sibling raw/, chunks/) — safe to delete.`,
+  );
+};
+
+const ensurePageContentDbFile = async (vaultRoot: string): Promise<void> => {
+  const finalPath = pageContentDbPath(vaultRoot);
+  if (existsSync(finalPath)) return;
+  await mkdir(pageContentRoot(vaultRoot), { recursive: true });
+  const legacyNames = (
+    await readdir(legacyByUrlDir(vaultRoot)).catch(() => [] as string[])
+  ).filter((name) => name.endsWith('.json'));
+  const { Database } = await loadSqlite();
+  if (legacyNames.length === 0) {
+    // Fresh vault (or nothing legacy to import) — create the store
+    // directly, no port.
+    const db = new Database(finalPath, { create: true, readwrite: true });
+    db.exec(SCHEMA);
+    db.close?.();
+    return;
+  }
+  await portLegacyPageContent(vaultRoot, finalPath, legacyNames, Database);
+};
+
+const dbCache = new Map<string, Promise<SqliteDatabase>>();
+
+const getPageContentDb = (vaultRoot: string): Promise<SqliteDatabase> => {
+  const cached = dbCache.get(vaultRoot);
+  if (cached !== undefined) return cached;
+  const promise = (async (): Promise<SqliteDatabase> => {
+    await ensurePageContentDbFile(vaultRoot);
+    const { Database } = await loadSqlite();
+    const db = new Database(pageContentDbPath(vaultRoot), { create: true, readwrite: true });
+    db.exec(SCHEMA);
+    return db;
+  })();
+  dbCache.set(vaultRoot, promise);
+  promise.catch(() => {
+    // Don't cache a failed open — the next call gets a clean retry.
+    if (dbCache.get(vaultRoot) === promise) dbCache.delete(vaultRoot);
+  });
+  return promise;
+};
+
+/** Boot hook: ports (if needed) and opens the store, so the one-time
+ *  port runs deterministically at startup rather than silently on the
+ *  first request. Safe to call repeatedly (cached). */
+export const ensurePageContentStoreReady = async (vaultRoot: string): Promise<void> => {
+  await getPageContentDb(vaultRoot);
+};
+
+/** Test-only: drop the in-process db-handle cache so a subsequent call
+ *  re-evaluates "does page-content.db exist" from scratch, simulating a
+ *  fresh process boot without actually spawning one. */
+export const __resetPageContentDbCacheForTests = (vaultRoot?: string): void => {
+  if (vaultRoot === undefined) {
+    dbCache.clear();
+    return;
+  }
+  dbCache.delete(vaultRoot);
+};
+
+// ─────────────────────────────────────────────────────────────────────
+// Pure helpers (unaffected by storage backend)
+// ─────────────────────────────────────────────────────────────────────
 
 const MAX_RAW_TEXT_CHARS = 100_000;
 const MAX_CHUNKS_PER_PAGE = 80;
@@ -70,52 +381,6 @@ const canonicalizePageUrlAndRecord = (raw: string): string => {
 
 export const sha256Hex = (input: string): string =>
   createHash('sha256').update(input).digest('hex');
-
-const pageContentRoot = (vaultRoot: string): string => join(vaultRoot, '_BAC', 'page-content');
-const byUrlDir = (vaultRoot: string): string => join(pageContentRoot(vaultRoot), 'by-url');
-const rawDir = (vaultRoot: string): string => join(pageContentRoot(vaultRoot), 'raw');
-const chunksDir = (vaultRoot: string): string => join(pageContentRoot(vaultRoot), 'chunks');
-const recordPathForCanonicalUrl = (vaultRoot: string, canonicalUrl: string): string =>
-  join(byUrlDir(vaultRoot), `${sha256Hex(canonicalUrl)}.json`);
-const rawPathForContentHash = (vaultRoot: string, contentHash: string): string =>
-  join(rawDir(vaultRoot), `${contentHash}.json`);
-const chunksManifestPath = (vaultRoot: string): string =>
-  join(chunksDir(vaultRoot), 'manifest.json');
-const manifestPath = (vaultRoot: string): string =>
-  join(pageContentRoot(vaultRoot), 'manifest.json');
-const ingestStatePath = (vaultRoot: string): string =>
-  join(pageContentRoot(vaultRoot), 'ingest-state.json');
-
-const atomicWriteJson = async (path: string, value: unknown): Promise<void> => {
-  await mkdir(dirname(path), { recursive: true });
-  const tempPath = join(dirname(path), `.${basename(path)}.${createRevision()}.tmp`);
-  await writeFile(tempPath, `${JSON.stringify(value, null, 2)}\n`, 'utf8');
-  await rename(tempPath, path);
-};
-
-const readJson = async <T>(path: string): Promise<T | null> => {
-  try {
-    return JSON.parse(await readFile(path, 'utf8')) as T;
-  } catch {
-    return null;
-  }
-};
-
-const safeRecordFromUnknown = (value: unknown): PageContentRecord | null => {
-  if (typeof value !== 'object' || value === null || Array.isArray(value)) return null;
-  const record = value as Partial<PageContentRecord>;
-  if (
-    typeof record.url !== 'string' ||
-    typeof record.updatedAt !== 'string' ||
-    typeof record.coverage !== 'object' ||
-    record.coverage === null
-  ) {
-    return null;
-  }
-  const coverage = record.coverage as Partial<PageContentCoverage>;
-  if (typeof coverage.canonicalUrl !== 'string' || typeof coverage.state !== 'string') return null;
-  return record as PageContentRecord;
-};
 
 export const splitPageContentIntoChunks = (input: {
   readonly canonicalUrl: string;
@@ -196,17 +461,28 @@ const enrichChunksWithEvidence = (
     qualityWeight: qualityWeightFor(chunk.quality),
   }));
 
+// ─────────────────────────────────────────────────────────────────────
+// SQL-backed record/raw/chunk access
+// ─────────────────────────────────────────────────────────────────────
+
+const parseRecordRow = (row: unknown): PageContentRecord =>
+  JSON.parse((row as { record_json: string }).record_json) as PageContentRecord;
+
 const readAllRecords = async (vaultRoot: string): Promise<readonly PageContentRecord[]> => {
-  const dir = byUrlDir(vaultRoot);
-  const names = await readdir(dir).catch(() => []);
-  const records: PageContentRecord[] = [];
-  for (const name of names.filter((candidate) => candidate.endsWith('.json'))) {
-    const record = safeRecordFromUnknown(await readJson(join(dir, name)));
-    if (record !== null) records.push(record);
-  }
-  return records.sort((left, right) =>
-    left.coverage.canonicalUrl.localeCompare(right.coverage.canonicalUrl),
-  );
+  const db = await getPageContentDb(vaultRoot);
+  const rows = db.query('SELECT record_json FROM records ORDER BY canonical_url').all();
+  return rows.map(parseRecordRow);
+};
+
+const readRecordByCanonicalUrl = async (
+  vaultRoot: string,
+  canonicalUrl: string,
+): Promise<PageContentRecord | null> => {
+  const db = await getPageContentDb(vaultRoot);
+  const row = db
+    .query('SELECT record_json FROM records WHERE canonical_url = ?')
+    .get(canonicalUrl);
+  return row === null || row === undefined ? null : parseRecordRow(row);
 };
 
 export interface OverCollapsedRecord {
@@ -219,15 +495,14 @@ export interface OverCollapsedRecord {
 export const scanForOverCollapsedPageContent = async (
   vaultRoot: string,
 ): Promise<readonly OverCollapsedRecord[]> => {
-  const names = (await readdir(byUrlDir(vaultRoot)).catch(() => []))
-    .filter((candidate) => candidate.endsWith('.json'))
-    .sort()
-    .slice(0, 100);
+  const db = await getPageContentDb(vaultRoot);
+  const rows = db
+    .query('SELECT record_json FROM records ORDER BY canonical_url LIMIT 100')
+    .all();
   const records: OverCollapsedRecord[] = [];
-  for (const name of names) {
-    const record = safeRecordFromUnknown(await readJson(join(byUrlDir(vaultRoot), name)));
-    const coverage = record?.coverage;
-    if (coverage === undefined || typeof coverage.chunkCount !== 'number') continue;
+  for (const row of rows) {
+    const coverage = parseRecordRow(row).coverage;
+    if (typeof coverage.chunkCount !== 'number') continue;
     if (coverage.chunkCount <= 25) continue;
     records.push({
       canonicalUrl: coverage.canonicalUrl,
@@ -239,50 +514,12 @@ export const scanForOverCollapsedPageContent = async (
   return records.sort((left, right) => right.chunkCount - left.chunkCount);
 };
 
-const rebuildManifests = async (vaultRoot: string): Promise<void> => {
-  const records = await readAllRecords(vaultRoot);
-  const chunks = records
-    .flatMap((record) => {
-      const coverage = record.coverage;
-      return coverage.state === 'indexed' || coverage.state === 'indexed_low_quality'
-        ? [
-            {
-              canonicalUrl: coverage.canonicalUrl,
-              contentHash: coverage.contentHash,
-              chunkCount: coverage.chunkCount ?? 0,
-            },
-          ]
-        : [];
-    })
-    .filter((entry) => typeof entry.contentHash === 'string');
-  await atomicWriteJson(manifestPath(vaultRoot), {
-    version: 1,
-    updatedAt: new Date().toISOString(),
-    recordCount: records.length,
-    indexedCount: records.filter((record) => record.coverage.state === 'indexed').length,
-    lowQualityCount: records.filter((record) => record.coverage.state === 'indexed_low_quality')
-      .length,
-    tombstonedCount: records.filter((record) => record.coverage.state === 'tombstoned').length,
-  });
-  await atomicWriteJson(ingestStatePath(vaultRoot), {
-    version: 1,
-    updatedAt: new Date().toISOString(),
-  });
-  await atomicWriteJson(chunksManifestPath(vaultRoot), {
-    version: 1,
-    updatedAt: new Date().toISOString(),
-    pages: chunks,
-  });
-};
-
 export const readPageContentCoverage = async (
   vaultRoot: string,
   rawCanonicalUrl: string,
 ): Promise<PageContentCoverage> => {
   const canonicalUrl = canonicalizePageUrlAndRecord(rawCanonicalUrl);
-  const record = safeRecordFromUnknown(
-    await readJson(recordPathForCanonicalUrl(vaultRoot, canonicalUrl)),
-  );
+  const record = await readRecordByCanonicalUrl(vaultRoot, canonicalUrl);
   return (
     record?.coverage ?? {
       canonicalUrl,
@@ -304,26 +541,34 @@ export const readPageContentCoverageMap = async (
   return out;
 };
 
+const writeRecordRow = (db: SqliteDatabase, record: PageContentRecord): void => {
+  db.query(
+    `INSERT INTO records (canonical_url, state, content_hash, updated_at, record_json)
+     VALUES (?,?,?,?,?)
+     ON CONFLICT(canonical_url) DO UPDATE SET
+       state = excluded.state,
+       content_hash = excluded.content_hash,
+       updated_at = excluded.updated_at,
+       record_json = excluded.record_json`,
+  ).run(
+    record.coverage.canonicalUrl,
+    record.coverage.state,
+    record.coverage.contentHash ?? null,
+    record.updatedAt,
+    JSON.stringify(record),
+  );
+};
+
 export const writePageContentExtracted = async (
   vaultRoot: string,
   payload: PageContentExtractedPayload,
-  options: {
-    readonly rebuildManifestsAfterWrite?: boolean;
-    // 'incremental': O(1) manifest upsert instead of the O(records) rebuild.
-    // For the interactive capture POST — see applyPageContentManifestUpsert.
-    readonly manifestUpdate?: 'rebuild' | 'incremental';
-  } = {},
 ): Promise<PageContentCoverage> => {
-  const incremental = options.manifestUpdate === 'incremental';
-  const rebuildAfterWrite = !incremental && (options.rebuildManifestsAfterWrite ?? true);
   const canonicalUrl = canonicalizePageUrlAndRecord(payload.canonicalUrl);
   recordCanonicalCollision(payload.url, canonicalUrl);
-  const previousCoverage = incremental
-    ? (safeRecordFromUnknown(await readJson(recordPathForCanonicalUrl(vaultRoot, canonicalUrl)))
-        ?.coverage ?? null)
-    : null;
   const contentHash = payload.content.contentHash || sha256Hex(payload.content.text);
   const quality = classifyPageContentQuality(payload.qualitySignals);
+  const db = await getPageContentDb(vaultRoot);
+
   if (quality.state === 'metadata_only_error') {
     const coverage: PageContentCoverage = {
       canonicalUrl,
@@ -333,7 +578,7 @@ export const writePageContentExtracted = async (
       extractionSource: payload.extractionSource,
       ...(quality.error === undefined ? {} : { error: quality.error }),
     };
-    await atomicWriteJson(recordPathForCanonicalUrl(vaultRoot, canonicalUrl), {
+    writeRecordRow(db, {
       coverage,
       url: payload.url,
       ...(payload.title === undefined ? {} : { title: payload.title }),
@@ -341,8 +586,6 @@ export const writePageContentExtracted = async (
       updatedAt: payload.extractedAt,
       sourceEventType: PAGE_CONTENT_EXTRACTED,
     } satisfies PageContentRecord);
-    if (incremental) await applyPageContentManifestUpsert(vaultRoot, previousCoverage, coverage);
-    else if (rebuildAfterWrite) await rebuildManifests(vaultRoot);
     invalidatePageContentLexicalIndex(vaultRoot);
     return coverage;
   }
@@ -360,15 +603,6 @@ export const writePageContentExtracted = async (
       extractionStrategy: payload.extractionSource,
     }),
   );
-  await atomicWriteJson(rawPathForContentHash(vaultRoot, contentHash), {
-    version: 1,
-    canonicalUrl,
-    url: payload.url,
-    ...(payload.title === undefined ? {} : { title: payload.title }),
-    extractedAt: payload.extractedAt,
-    text,
-    ...(payload.content.markdown === undefined ? {} : { markdown: payload.content.markdown }),
-  });
   const coverage: PageContentCoverage = {
     canonicalUrl,
     state: quality.state,
@@ -381,123 +615,45 @@ export const writePageContentExtracted = async (
     chunkCount: chunks.length,
     indexedCharCount: text.length,
   };
-  await atomicWriteJson(recordPathForCanonicalUrl(vaultRoot, canonicalUrl), {
-    coverage,
-    url: payload.url,
-    ...(payload.title === undefined ? {} : { title: payload.title }),
-    ...(payload.provider === undefined ? {} : { provider: payload.provider }),
-    updatedAt: payload.extractedAt,
-    sourceEventType: PAGE_CONTENT_EXTRACTED,
-  } satisfies PageContentRecord);
-  await atomicWriteJson(join(chunksDir(vaultRoot), `${contentHash}.json`), { version: 1, chunks });
-  if (incremental) await applyPageContentManifestUpsert(vaultRoot, previousCoverage, coverage);
-  else if (rebuildAfterWrite) await rebuildManifests(vaultRoot);
+  // One transaction per capture: record + raw text + chunks land
+  // together (all-or-nothing), replacing what used to be 3 separate
+  // file writes plus a 157KB manifest rewrite.
+  db.exec('BEGIN');
+  try {
+    writeRecordRow(db, {
+      coverage,
+      url: payload.url,
+      ...(payload.title === undefined ? {} : { title: payload.title }),
+      ...(payload.provider === undefined ? {} : { provider: payload.provider }),
+      updatedAt: payload.extractedAt,
+      sourceEventType: PAGE_CONTENT_EXTRACTED,
+    } satisfies PageContentRecord);
+    db.query(
+      `INSERT INTO raw_content (content_hash, raw_json) VALUES (?,?)
+       ON CONFLICT(content_hash) DO UPDATE SET raw_json = excluded.raw_json`,
+    ).run(
+      contentHash,
+      JSON.stringify({
+        version: 1,
+        canonicalUrl,
+        url: payload.url,
+        ...(payload.title === undefined ? {} : { title: payload.title }),
+        extractedAt: payload.extractedAt,
+        text,
+        ...(payload.content.markdown === undefined ? {} : { markdown: payload.content.markdown }),
+      }),
+    );
+    db.query(
+      `INSERT INTO chunks (content_hash, chunks_json) VALUES (?,?)
+       ON CONFLICT(content_hash) DO UPDATE SET chunks_json = excluded.chunks_json`,
+    ).run(contentHash, JSON.stringify({ version: 1, chunks }));
+    db.exec('COMMIT');
+  } catch (error) {
+    db.exec('ROLLBACK');
+    throw error;
+  }
   invalidatePageContentLexicalIndex(vaultRoot);
   return coverage;
-};
-
-/**
- * Batch seam for off-serving body materialization. The worker writes a bounded
- * group with `rebuildManifestsAfterWrite:false`, then rebuilds once after the
- * group rather than performing an O(records) scan for every page.
- */
-export const rebuildPageContentManifests = async (vaultRoot: string): Promise<void> => {
-  await rebuildManifests(vaultRoot);
-  invalidatePageContentLexicalIndex(vaultRoot);
-};
-
-// O(1) incremental manifest maintenance for the interactive capture path.
-// The capture POST (/v1/page-content/extracted — the panel's "index this
-// page" and the auto-capture path, with a 15s client timeout behind the
-// "Companion did not respond" banner) must not re-derive the manifests from
-// ALL records per write: the O(records) rebuild measured 16-119s under
-// catch-up disk load, and deferring the same scan onto the event loop was
-// worse (a 43s starved tick — 703 microtask-chained readJson awaits never
-// let timers run). Instead a single write adjusts exactly its own record's
-// contribution: read the two manifests, swap this canonicalUrl's bucket
-// counts (previous coverage → next coverage) and chunks-manifest entry,
-// write back. Serialized per vault (promise-chain lock) so interleaved
-// captures can't lose updates; the lane/batch full rebuilds
-// (rebuildPageContentManifests) remain the drift-healing source of truth.
-const manifestUpsertLocks = new Map<string, Promise<void>>();
-
-const objectFromUnknown = (value: unknown): Record<string, unknown> | null =>
-  typeof value === 'object' && value !== null && !Array.isArray(value)
-    ? (value as Record<string, unknown>)
-    : null;
-
-const numberField = (record: Record<string, unknown> | null, key: string): number => {
-  const value = record?.[key];
-  return typeof value === 'number' && Number.isFinite(value) ? value : 0;
-};
-
-const manifestStateBucket = (state: string): 'indexed' | 'low' | 'tombstoned' | null =>
-  state === 'indexed'
-    ? 'indexed'
-    : state === 'indexed_low_quality'
-      ? 'low'
-      : state === 'tombstoned'
-        ? 'tombstoned'
-        : null;
-
-export const applyPageContentManifestUpsert = async (
-  vaultRoot: string,
-  previous: PageContentCoverage | null,
-  next: PageContentCoverage,
-): Promise<void> => {
-  const prior = manifestUpsertLocks.get(vaultRoot) ?? Promise.resolve();
-  const run = prior.then(async () => {
-    const manifest = objectFromUnknown(await readJson(manifestPath(vaultRoot)));
-    const chunksManifest = objectFromUnknown(await readJson(chunksManifestPath(vaultRoot)));
-    const counts = {
-      recordCount: numberField(manifest, 'recordCount'),
-      indexedCount: numberField(manifest, 'indexedCount'),
-      lowQualityCount: numberField(manifest, 'lowQualityCount'),
-      tombstonedCount: numberField(manifest, 'tombstonedCount'),
-    };
-    if (previous === null) counts.recordCount += 1;
-    const bucketDelta = (bucket: 'indexed' | 'low' | 'tombstoned' | null, by: number): void => {
-      if (bucket === 'indexed') counts.indexedCount += by;
-      else if (bucket === 'low') counts.lowQualityCount += by;
-      else if (bucket === 'tombstoned') counts.tombstonedCount += by;
-    };
-    if (previous !== null) bucketDelta(manifestStateBucket(previous.state), -1);
-    bucketDelta(manifestStateBucket(next.state), 1);
-    const updatedAt = new Date().toISOString();
-    await atomicWriteJson(manifestPath(vaultRoot), {
-      version: 1,
-      updatedAt,
-      recordCount: Math.max(0, counts.recordCount),
-      indexedCount: Math.max(0, counts.indexedCount),
-      lowQualityCount: Math.max(0, counts.lowQualityCount),
-      tombstonedCount: Math.max(0, counts.tombstonedCount),
-    });
-    const pagesRaw = chunksManifest?.['pages'];
-    const pages = (Array.isArray(pagesRaw) ? pagesRaw : []).filter(
-      (page) =>
-        typeof page === 'object' &&
-        page !== null &&
-        (page as Record<string, unknown>)['canonicalUrl'] !== next.canonicalUrl,
-    );
-    if (
-      (next.state === 'indexed' || next.state === 'indexed_low_quality') &&
-      typeof next.contentHash === 'string'
-    ) {
-      pages.push({
-        canonicalUrl: next.canonicalUrl,
-        contentHash: next.contentHash,
-        chunkCount: next.chunkCount ?? 0,
-      });
-    }
-    await atomicWriteJson(chunksManifestPath(vaultRoot), { version: 1, updatedAt, pages });
-    await atomicWriteJson(ingestStatePath(vaultRoot), { version: 1, updatedAt });
-    invalidatePageContentLexicalIndex(vaultRoot);
-  });
-  manifestUpsertLocks.set(
-    vaultRoot,
-    run.catch(() => undefined),
-  );
-  return run;
 };
 
 export const writePageContentTombstoned = async (
@@ -507,10 +663,6 @@ export const writePageContentTombstoned = async (
   const canonicalUrl = canonicalizePageUrlAndRecord(payload.canonicalUrl);
   const previous = await readPageContentCoverage(vaultRoot, canonicalUrl);
   const contentHash = payload.contentHash ?? previous.contentHash;
-  if (contentHash !== undefined) {
-    await unlink(rawPathForContentHash(vaultRoot, contentHash)).catch(() => undefined);
-    await unlink(join(chunksDir(vaultRoot), `${contentHash}.json`)).catch(() => undefined);
-  }
   const coverage: PageContentCoverage = {
     canonicalUrl,
     state: 'tombstoned',
@@ -519,13 +671,24 @@ export const writePageContentTombstoned = async (
     ...(previous.lastIndexedAt === undefined ? {} : { lastIndexedAt: previous.lastIndexedAt }),
     ...(contentHash === undefined ? {} : { contentHash }),
   };
-  await atomicWriteJson(recordPathForCanonicalUrl(vaultRoot, canonicalUrl), {
-    coverage,
-    url: canonicalUrl,
-    updatedAt: payload.tombstonedAt,
-    sourceEventType: PAGE_CONTENT_TOMBSTONED,
-  } satisfies PageContentRecord);
-  await rebuildManifests(vaultRoot);
+  const db = await getPageContentDb(vaultRoot);
+  db.exec('BEGIN');
+  try {
+    writeRecordRow(db, {
+      coverage,
+      url: canonicalUrl,
+      updatedAt: payload.tombstonedAt,
+      sourceEventType: PAGE_CONTENT_TOMBSTONED,
+    } satisfies PageContentRecord);
+    if (contentHash !== undefined) {
+      db.query('DELETE FROM raw_content WHERE content_hash = ?').run(contentHash);
+      db.query('DELETE FROM chunks WHERE content_hash = ?').run(contentHash);
+    }
+    db.exec('COMMIT');
+  } catch (error) {
+    db.exec('ROLLBACK');
+    throw error;
+  }
   invalidatePageContentLexicalIndex(vaultRoot);
   return coverage;
 };
@@ -535,9 +698,7 @@ export const readPageContentExtractedPayloadForEvidence = async (
   rawCanonicalUrl: string,
 ): Promise<PageContentExtractedPayload | null> => {
   const canonicalUrl = canonicalizePageUrlAndRecord(rawCanonicalUrl);
-  const record = safeRecordFromUnknown(
-    await readJson(recordPathForCanonicalUrl(vaultRoot, canonicalUrl)),
-  );
+  const record = await readRecordByCanonicalUrl(vaultRoot, canonicalUrl);
   const coverage = record?.coverage;
   if (
     record === null ||
@@ -552,13 +713,20 @@ export const readPageContentExtractedPayloadForEvidence = async (
   ) {
     return null;
   }
-  const raw = await readJson<{
-    readonly url?: unknown;
-    readonly title?: unknown;
-    readonly extractedAt?: unknown;
-    readonly text?: unknown;
-    readonly markdown?: unknown;
-  }>(rawPathForContentHash(vaultRoot, coverage.contentHash));
+  const db = await getPageContentDb(vaultRoot);
+  const rawRow = db
+    .query('SELECT raw_json FROM raw_content WHERE content_hash = ?')
+    .get(coverage.contentHash) as { raw_json: string } | null | undefined;
+  const raw =
+    rawRow === null || rawRow === undefined
+      ? null
+      : (JSON.parse(rawRow.raw_json) as {
+          readonly url?: unknown;
+          readonly title?: unknown;
+          readonly extractedAt?: unknown;
+          readonly text?: unknown;
+          readonly markdown?: unknown;
+        });
   if (raw === null || typeof raw.text !== 'string' || raw.text.length === 0) return null;
   return {
     payloadVersion: 1,
@@ -587,6 +755,51 @@ export const readPageContentExtractedPayloadForEvidence = async (
   };
 };
 
+const readChunksRowByContentHash = async (
+  vaultRoot: string,
+  contentHash: string,
+): Promise<readonly PageContentChunk[] | null> => {
+  const db = await getPageContentDb(vaultRoot);
+  const row = db.query('SELECT chunks_json FROM chunks WHERE content_hash = ?').get(contentHash) as
+    | { chunks_json: string }
+    | null
+    | undefined;
+  if (row === null || row === undefined) return null;
+  const parsed = JSON.parse(row.chunks_json) as { readonly chunks?: readonly PageContentChunk[] };
+  return parsed.chunks ?? [];
+};
+
+/** Direct by-contentHash chunk read, no coverage-state gating. Used by
+ *  recall-v2's backfill (readers that already know a contentHash — from
+ *  either the current page-content record or a page-evidence record's
+ *  remembered contentHash — and want exactly the chunks stored under
+ *  it, the same semantics the old direct `chunks/<hash>.json` file read
+ *  had). Chunks are returned exactly as stored (already
+ *  evidence-enriched at write time) — never null unless nothing was
+ *  ever written under this hash. */
+export const readPageContentChunksByContentHash = async (
+  vaultRoot: string,
+  contentHash: string,
+): Promise<readonly PageContentChunk[] | null> => readChunksRowByContentHash(vaultRoot, contentHash);
+
+/** Test-only: write an arbitrary raw chunks JSON blob (`{version, chunks}`
+ *  shape) directly into the `chunks` table for one contentHash,
+ *  bypassing extraction entirely. Lets recall-v2's backfill tests seed
+ *  chunk fixtures with deterministic ids without running the real
+ *  splitter/enrichment pipeline. Same `__`-prefixed test-hook
+ *  convention as page-evidence's __writeRawPageEvidenceRowForTests. */
+export const __writeRawPageContentChunksForTests = async (
+  vaultRoot: string,
+  contentHash: string,
+  rawChunksJson: string,
+): Promise<void> => {
+  const db = await getPageContentDb(vaultRoot);
+  db.query(
+    `INSERT INTO chunks (content_hash, chunks_json) VALUES (?,?)
+     ON CONFLICT(content_hash) DO UPDATE SET chunks_json = excluded.chunks_json`,
+  ).run(contentHash, rawChunksJson);
+};
+
 export const readPageContentChunksForCanonicalUrls = async (
   vaultRoot: string,
   rawCanonicalUrls: readonly string[],
@@ -596,9 +809,7 @@ export const readPageContentChunksForCanonicalUrls = async (
     ...new Set(rawCanonicalUrls.map(canonicalizePageUrlAndRecord)),
   ].sort();
   for (const canonicalUrl of uniqueCanonicalUrls) {
-    const record = safeRecordFromUnknown(
-      await readJson(recordPathForCanonicalUrl(vaultRoot, canonicalUrl)),
-    );
+    const record = await readRecordByCanonicalUrl(vaultRoot, canonicalUrl);
     const coverage = record?.coverage;
     if (
       coverage === undefined ||
@@ -609,10 +820,7 @@ export const readPageContentChunksForCanonicalUrls = async (
     ) {
       continue;
     }
-    const raw = await readJson<{ readonly chunks?: readonly PageContentChunk[] }>(
-      join(chunksDir(vaultRoot), `${coverage.contentHash}.json`),
-    );
-    const chunks = raw?.chunks ?? [];
+    const chunks = (await readChunksRowByContentHash(vaultRoot, coverage.contentHash)) ?? [];
     if (chunks.length > 0) out.set(canonicalUrl, enrichChunksWithEvidence(chunks));
   }
   return out;
@@ -706,10 +914,8 @@ const buildPageContentLexicalIndex = async (
     ) {
       continue;
     }
-    const raw = await readJson<{ readonly chunks?: readonly PageContentChunk[] }>(
-      join(chunksDir(vaultRoot), `${coverage.contentHash}.json`),
-    );
-    for (const chunk of raw?.chunks ?? []) {
+    const chunks = (await readChunksRowByContentHash(vaultRoot, coverage.contentHash)) ?? [];
+    for (const chunk of chunks) {
       // Chunk ids are `<contentHash>:<ix>`, so two records with IDENTICAL
       // content (canonical-URL twins) collide. mini.add throws on a
       // duplicate id, and one throw used to kill the ENTIRE warm build —
@@ -770,7 +976,7 @@ export const queryPageContent = async (
   const limit = Math.min(Math.max(options.limit ?? 20, 1), 50);
   // MiniSearch returns results sorted by its internal score. We keep
   // those raw scores for downstream RRF (rank-based, score-scale
-  // irrelevant) and emit hits in MiniSearch's order \u2014 never re-sort
+  // irrelevant) and emit hits in MiniSearch's order — never re-sort
   // by raw score across sources.
   const results = index.mini.search(trimmed);
   const out: ContentSearchHit[] = [];
@@ -795,23 +1001,32 @@ export const queryPageContent = async (
   return out;
 };
 
+/** Total on-disk bytes the store occupies: the db file plus its
+ *  WAL/SHM sidecars (WAL-mode writes land in `-wal` between
+ *  checkpoints). Replaces the old recursive directory walk. */
+const pageContentDbBytes = async (vaultRoot: string): Promise<number> => {
+  const base = pageContentDbPath(vaultRoot);
+  const sizes = await Promise.all(
+    [base, `${base}-wal`, `${base}-shm`].map(async (path) => {
+      const info = await stat(path).catch(() => null);
+      return info?.size ?? 0;
+    }),
+  );
+  return sizes.reduce((sum, size) => sum + size, 0);
+};
+
 export const pageContentStorageStats = async (
   vaultRoot: string,
 ): Promise<{ readonly bytes: number; readonly records: number; readonly indexed: number }> => {
-  const root = pageContentRoot(vaultRoot);
-  const walk = async (path: string): Promise<number> => {
-    const info = await stat(path).catch(() => null);
-    if (info === null) return 0;
-    if (!info.isDirectory()) return info.size;
-    const names = await readdir(path).catch(() => []);
-    const sizes = await Promise.all(names.map((name) => walk(join(path, name))));
-    return sizes.reduce((sum, value) => sum + value, 0);
-  };
-  const records = await readAllRecords(vaultRoot);
+  const db = await getPageContentDb(vaultRoot);
+  const total = (db.query('SELECT COUNT(*) AS n FROM records').get() as { n: number }).n;
+  const indexed = (
+    db.query("SELECT COUNT(*) AS n FROM records WHERE state = 'indexed'").get() as { n: number }
+  ).n;
   return {
-    bytes: await walk(root),
-    records: records.length,
-    indexed: records.filter((record) => record.coverage.state === 'indexed').length,
+    bytes: await pageContentDbBytes(vaultRoot),
+    records: total,
+    indexed,
   };
 };
 
@@ -830,17 +1045,24 @@ export const pageContentCoverageCounts = async (
   const byState: Record<PageContentCoverageState, number> = Object.fromEntries(
     PAGE_CONTENT_COVERAGE_STATES.map((state) => [state, 0]),
   ) as Record<PageContentCoverageState, number>;
-  const records = await readAllRecords(vaultRoot);
-  for (const record of records) {
-    const state = record.coverage.state;
-    byState[state] = (byState[state] ?? 0) + 1;
+  const db = await getPageContentDb(vaultRoot);
+  const rows = db.query('SELECT state, COUNT(*) AS n FROM records GROUP BY state').all() as {
+    state: string;
+    n: number;
+  }[];
+  let total = 0;
+  for (const row of rows) {
+    if ((PAGE_CONTENT_COVERAGE_STATES as readonly string[]).includes(row.state)) {
+      byState[row.state as PageContentCoverageState] = row.n;
+    }
+    total += row.n;
   }
-  const stats = await pageContentStorageStats(vaultRoot);
+  const bytes = await pageContentDbBytes(vaultRoot);
   return {
     producedAt: new Date().toISOString(),
     byState,
-    total: records.length,
+    total,
     indexed: byState.indexed + byState.indexed_low_quality,
-    bytes: stats.bytes,
+    bytes,
   };
 };
