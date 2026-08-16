@@ -427,4 +427,88 @@ describe('ingestor', () => {
       'delayed-capture chunks must inherit the prior tombstone (rebuild equivalence)',
     ).toBe(true);
   });
+
+  // F3 — ingestIncremental's store-backed branch (`store.readSince` for
+  // fresh events, `store.forEachChunk` for the full-history tombstone
+  // scan) must fold to the SAME index as the readMerged-backed branch it
+  // replaces on default (store-off) installs. Runs the identical fixture
+  // (a live capture + a tombstone for a DIFFERENT thread) through two
+  // fresh vaults, one per branch, and compares the resulting index.
+  it('F3: ingestIncremental is store/readMerged equivalent', async () => {
+    const { createEventLog } = await import('../sync/eventLog.js');
+    const { loadOrCreateReplica } = await import('../sync/replicaId.js');
+    const { getCaughtUpSharedEventStore } = await import('../sync/eventStore.js');
+
+    const seedFixture = async (root: string): Promise<void> => {
+      const replica = await loadOrCreateReplica(root);
+      const eventLog = createEventLog(root, replica);
+      await eventLog.appendClient({
+        clientEventId: 'cap-equiv-live',
+        aggregateId: 'thread_equiv_live',
+        type: 'capture.recorded',
+        payload: {
+          bac_id: 'thread_equiv_live',
+          capturedAt: '2026-05-06T18:00:00.000Z',
+          turns: [{ ordinal: 0, role: 'assistant', text: 'store-vs-log equivalence fixture' }],
+        },
+        baseVector: {},
+      });
+      await eventLog.appendClient({
+        clientEventId: 'tomb-equiv',
+        aggregateId: 'thread_equiv_tomb',
+        type: 'recall.tombstone.target',
+        payload: { threadId: 'thread_equiv_tomb' },
+        baseVector: {},
+      });
+    };
+
+    const priorStoreFlag = process.env['SIDETRACK_EVENT_STORE'];
+    try {
+      const vaultWithoutStore = await mkdtemp(join(tmpdir(), 'sidetrack-ingestor-equiv-off-'));
+      const vaultWithStore = await mkdtemp(join(tmpdir(), 'sidetrack-ingestor-equiv-on-'));
+      await seedFixture(vaultWithoutStore);
+      await seedFixture(vaultWithStore);
+
+      process.env['SIDETRACK_EVENT_STORE'] = '0';
+      const replicaOff = await loadOrCreateReplica(vaultWithoutStore);
+      const summaryOff = await ingestIncremental(
+        vaultWithoutStore,
+        createEventLog(vaultWithoutStore, replicaOff),
+      );
+
+      process.env['SIDETRACK_EVENT_STORE'] = '1';
+      const store = await getCaughtUpSharedEventStore(vaultWithStore);
+      expect(store).not.toBeNull();
+      expect(store?.count()).toBeGreaterThan(0);
+      const replicaOn = await loadOrCreateReplica(vaultWithStore);
+      const summaryOn = await ingestIncremental(
+        vaultWithStore,
+        createEventLog(vaultWithStore, replicaOn),
+      );
+
+      expect(summaryOn.indexedChunks).toBe(summaryOff.indexedChunks);
+      expect(summaryOn.tombstonedChunks).toBe(summaryOff.tombstonedChunks);
+      expect(summaryOn.tombstonedEntries).toBe(summaryOff.tombstonedEntries);
+
+      const indexOff = await readIndex(join(vaultWithoutStore, '_BAC', 'recall', 'index.bin'));
+      const indexOn = await readIndex(join(vaultWithStore, '_BAC', 'recall', 'index.bin'));
+      const shape = (
+        items: readonly { threadId: string; tombstoned: boolean; metadata?: { text?: string } }[],
+      ) =>
+        [...items]
+          .map((item) => ({
+            threadId: item.threadId,
+            tombstoned: item.tombstoned,
+            text: item.metadata?.text,
+          }))
+          .sort((a, b) => a.threadId.localeCompare(b.threadId));
+      expect(shape(indexOn?.items ?? [])).toEqual(shape(indexOff?.items ?? []));
+
+      await rm(vaultWithoutStore, { recursive: true, force: true });
+      await rm(vaultWithStore, { recursive: true, force: true });
+    } finally {
+      if (priorStoreFlag === undefined) delete process.env['SIDETRACK_EVENT_STORE'];
+      else process.env['SIDETRACK_EVENT_STORE'] = priorStoreFlag;
+    }
+  });
 });
