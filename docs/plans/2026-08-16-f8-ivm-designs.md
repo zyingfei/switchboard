@@ -162,3 +162,20 @@ Implications, binding on all waves:
   command rebuilds all derived state after the switch (this is the
   same consent-gated CLI as disaster recovery). Nothing else preserves
   old derived formats.
+
+## W5 review verdict (coordinator, 2026-08-16)
+
+APPROVED. Load-bearing findings: leidenCpmPartition is a pure
+(nodes,edges)->groups fn usable on subgraphs as-is; computeLineage
+already provides max-overlap continue/split/merge/birth id-continuity;
+the generic candidate-shadow slot + workGraphHealth Experiments row are
+the migration vehicle; collectTouchedVisits + the per-drain edge diff
+are the dirty-set primitives; semanticRecallPool is the in-repo
+precedent. Binding notes: (1) topic-revision file retention MUST land
+in-wave (putRevision never GCs; higher mint rate = new disk leak);
+(2) subgraph cap ships with overflow-to-repair-queue + a topic-size
+histogram mark, tuned later from data; (3) primary-promotion rule
+(supportCount>=2 OR score>=threshold+margin) as flag-tunable constants.
+Implementation phase A = new modules (incremental revision builder,
+promotion, revision GC, tests) with NO materializer edits; phase B =
+wiring after W1 lands.
