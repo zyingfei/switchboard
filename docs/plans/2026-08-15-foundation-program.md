@@ -567,3 +567,154 @@ also logged an unrelated embedding-model load taking 6.9s (normally
 under 1s) and a 637ms event-loop stall immediately before the timeout —
 independent evidence the runner itself was heavily contended that pass,
 not that anything in this PR slowed the materializer down.
+
+**2026-08-16 — SIGTERM shutdown watchdog + bounded recomputeScopes
+(fix/shutdown-watchdog-and-scope-batch).** Not an F1–F7 item; filed here
+per the "binding plan tracks reality" rule — two independent
+post-restart operational-reliability bugs found live today, same PR/goal
+(operator recovery after a restart).
+
+*Item 1 — SIGTERM hang (root-caused, fixed, watchdog added).* Observed
+twice live: SIGTERM closed the HTTP listener, then graceful shutdown
+hung FOREVER — the process stayed alive (body-evidence lane cycles kept
+logging), held `_BAC/recall/.lock`, and the next boot refused to start
+("Another companion (pid N) already owns the recall index"). Operator
+recovery both times required SIGKILL.
+
+Root cause, confirmed by reading the exact call chain: `close()` in
+`runtime/companion.ts` closed the HTTP listener then awaited
+`syncContractRunner.awaitIdle()` — but never stopped the background
+lanes that can append NEW accepted events (the R3 body-evidence
+materialization lane, the background content-embedding lane, the
+collector framework's promotion path). Each materialized item's
+`onMaterialized` hook calls `eventLog.appendServerObserved(...)`, which
+synchronously feeds `syncContractRunner.onAcceptedEvent` and re-marks
+`connectionsMaterializer` dirty. `connectionsMaterializer.awaitIdle()`
+is a bare `while (running || dirty) await sleep(5)` with no deadline —
+as long as a lane keeps producing dirty-triggers faster than a drain
+settles, the loop never sees both conditions false at once. The
+`teardown[]` array these lanes' `.stop()` calls were registered on is
+ONLY drained on the startup-FAILURE rollback path (`catch` block, never
+reached once boot succeeds) — nothing had ever called `lane.stop()` on a
+normal SIGTERM shutdown.
+
+Fix (a), root cause: `close()` now stops every background lane/scheduler
+(body-evidence lane, background-embedding lane, collector framework,
+anti-entropy, derived-revision GC, event-seal loop, SQLite VACUUM GC,
+event-loop monitor, the four drain-triggered health-artifact schedulers)
+BEFORE closing the HTTP listener / draining the contract runner, and
+stops the recall indexer + embedder child processes AFTER
+`recallLifecycle.waitForRebuild()` (preserving the pre-existing,
+deliberate ordering comment: drain → dispose materializer → wait
+rebuild → release lock).
+
+Fix (b), watchdog: `runtime/shutdownWatchdog.ts` (new). SIGINT/SIGTERM
+now start `close()` under a bounded grace timer
+(`SIDETRACK_SHUTDOWN_GRACE_MS`, default 15000; non-finite/≤0 falls back
+to the default — 0 is NOT "unbounded"). If `close()` hasn't resolved
+when the timer fires, it logs one line naming the stuck stage
+(`companion.ts` now tracks a coarse `shutdownStage` string) and every
+pending materializer (from `syncContractRunner.health()`), then
+force-exits(1). A second SIGINT/SIGTERM while a shutdown is already in
+flight skips the grace period entirely and force-exits(1) immediately.
+`cli.ts` switched from `process.once` to `process.on` for both signals
+so this state machine (not Node's default per-signal-once behavior)
+owns the double-signal path.
+
+Tests: `runtime/shutdownWatchdog.test.ts` (13 cases, dependency-injected
+timers — no real `setTimeout`/`process.exit`) proves the watchdog
+contract in isolation: grace resolution/fallback, clean-exit-0,
+timeout-force-exit-1-with-diagnostics, double-signal-immediate-exit,
+rejecting-close-force-exits, SIGINT/SIGTERM sharing one gate.
+`page-evidence/bodyEvidenceLane.test.ts` gained a case proving the
+mechanism `close()` now depends on: `stop()` called mid-cycle lets the
+in-flight batch finish but schedules no further cycle. And a REAL
+full-boot regression test, `runtime/companion.test.ts`'s "SIGTERM
+shutdown drain" — real `startCompanion()` (real child processes, same as
+production; `useChildProcesses` untouched), 6 real seeded body-evidence
+queue items (>batchCap so the lane's own scheduler re-arms a second
+cycle ~5s out, mirroring a SIGTERM landing on a still-backlogged lane),
+asserts `close()` resolves <20s, the recall lock file is gone, AND — the
+load-bearing check — that the lane's scheduled second cycle never fires
+even 6s after `close()` resolves. Verified this test actually catches
+the regression: temporarily disabling the two `stop*Lane()` calls made
+it fail (`cycleLogCount` 1→2, a second cycle fired) in 6.1s; restoring
+them made it pass. A true separate-OS-process `SIGTERM` (vs. calling
+`close()` in-process) was evaluated and skipped as impractical within
+budget — signal delivery/exit-code wiring is covered by the
+dependency-injected watchdog unit tests instead; `close()` is the exact
+function both paths call.
+
+*Item 2 — recomputeScopes cost (root-caused, fixed; chunk-bound NOT
+reachable, flagged).* Measured live during backlog catch-up:
+`scopedDelta.recomputeScopes n=4781 nodes=4614 edges=81046 dt=723004ms`
+— ~151ms/scope, 12 minutes inside one catch-up chunk (child process;
+doesn't block serving but stretches post-restart catch-up to ~an hour).
+
+Profile: the implementation (`recomputeScope`/`rowsForScope` in
+`connections/scopeRecompute.ts` — NOT
+`sync/contract/connectionsMaterializer.ts`, which this PR does not
+touch) called `scopesForGraphRows` — a full O(nodes) pass plus TWO
+O(edges log edges) sorts — from scratch on EVERY SINGLE scope, then
+linearly filtered the whole nodes/edges arrays again to extract that
+one scope's rows. `connectionsMaterializer.ts` calls `recomputeScope`
+once per dirty scope, in a loop, against the SAME snapshot object,
+across (at least) four independent call sites — so the whole operation
+was O(scopes × (nodes + edges log edges)) when it only needs to be
+O(nodes + edges log edges) once, shared across every scope.
+
+Fix: build a per-scope node/edge index once per snapshot
+(`buildScopeMembershipIndex`) and cache it in a `WeakMap` keyed on
+snapshot object identity. `ConnectionsSnapshot.nodes`/`.edges` are
+`readonly` and each drain constructs a genuinely new snapshot object, so
+the cache is automatically correct (a new object is always a cache
+miss — nothing can serve a stale index for mutated content) and
+automatically bounded (entries are GC'd once a drain's snapshot goes
+out of scope; no manual eviction, no size cap, no env gate needed). No
+call-site signature changed — `connectionsMaterializer.ts` is
+byte-identical.
+
+Synthetic-scale measurement (`bun test`, ring-topology fixture,
+`nodes=scopes`, `edges=scopes*edgesPerNode`):
+
+| scopes | nodes | edges | uncached (old) | cached (new) | speedup |
+|-------:|------:|------:|----------------:|--------------:|--------:|
+| 400 | 400 | 2,000 | 513.8ms | 2.0ms | 252× |
+| 1,200 | 1,200 | 9,600 | 7,192.9ms | 7.1ms | 1,011× |
+| 2,400 | 2,400 | 28,800 | 42,783.3ms | 22.1ms | 1,939× |
+
+Growth confirms the analysis (old ≈ quadratic-plus in scope count, new ≈
+linear, dominated by the one-time index build). Extrapolating the old
+curve toward the live incident's scale (4,781 scopes / 81,046 edges)
+lands in the same tens-of-seconds-to-minutes order of magnitude as the
+measured 723s (the synthetic ring topology and the real graph's degree
+distribution differ, so this is a sanity check, not a precise
+prediction) — same mechanism, same order of magnitude.
+`connections/scopeRecompute.perf.test.ts` (new) carries this
+measurement plus a byte-identical-output correctness proof against the
+original filter-based implementation (kept inline in the test as
+`rowsForScopeUncached`) and two cache-identity proofs (`WeakMap` build
+count stays 1 across repeated queries of one snapshot; a fresh snapshot
+object always triggers exactly one fresh build, never a stale hit).
+
+*Chunk-bound (`SIDETRACK_SCOPE_RECOMPUTE_BATCH`, part (b) of the ask):
+NOT implemented — genuinely not reachable without touching
+`connectionsMaterializer.ts`.* "Cap scopes per chunk, carry the
+remainder to the next chunk" is a property of the catch-up/drain loop
+that calls `recomputeScope` in a `for`/`.map()` (which chunk a scope
+belongs to, when "the next chunk" runs, where a carried-forward
+remainder would be persisted so a crash mid-chunk doesn't drop it) —
+all of that state lives inside the forbidden file, not in
+`scopeRecompute.ts`. Given the caching fix above turns the per-scope
+cost from ~151ms into microseconds (dominated by one O(nodes+edges)
+build shared across the whole chunk), the specific 12-minute/4,781-scope
+symptom this item was filed for should already be closed by item (a)
+alone — a chunk bound would only still matter for a single snapshot
+large enough that even the ONE index build is slow, which is a
+materially different (and so far unmeasured) failure mode. Flagging per
+the task's own contingency: everything reachable is implemented; the
+chunk-bound is not, and should be revisited only if post-fix telemetry
+(`scopedDelta.recomputeScopes` mark) still shows multi-second chunks.
+
+PR: fix(runtime): SIGTERM shutdown watchdog + bounded recomputeScopes
+chunks (branch `fix/shutdown-watchdog-and-scope-batch`).

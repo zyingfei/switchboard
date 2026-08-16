@@ -362,6 +362,15 @@ export interface CompanionRuntimeOptions {
   };
 }
 
+// Snapshot of where a graceful close() has gotten to. Read by the CLI's
+// shutdown watchdog (SIDETRACK_SHUTDOWN_GRACE_MS) to name what's still
+// pending when a shutdown blows through its grace period — see cli.ts.
+export interface CompanionShutdownDiagnostics {
+  readonly stage: string;
+  readonly pendingMaterializers: readonly string[];
+  readonly recallRebuildInFlight: boolean;
+}
+
 export interface CompanionRuntime {
   readonly url: string;
   readonly vaultPath: string;
@@ -376,6 +385,7 @@ export interface CompanionRuntime {
   readonly replicaId: string;
   readonly replicaIdCreated: boolean;
   readonly close: () => Promise<void>;
+  readonly getShutdownDiagnostics: () => CompanionShutdownDiagnostics;
 }
 
 export const startCompanion = async (
@@ -395,6 +405,11 @@ export const startCompanion = async (
   // now-zombie pid, blocking every subsequent launch on the
   // recovery's stale-pid takeover path.
   const teardown: (() => Promise<void> | void)[] = [];
+  // Coarse stage marker for close(), updated at each major step below.
+  // Read by the CLI's shutdown watchdog (SIDETRACK_SHUTDOWN_GRACE_MS) so a
+  // hung shutdown logs WHICH step it's stuck on instead of just "timed
+  // out" — see cli.ts's shutdown handler.
+  let shutdownStage = 'not-started';
   const runTeardown = async (): Promise<void> => {
     while (teardown.length > 0) {
       const fn = teardown.pop();
@@ -682,9 +697,13 @@ export const startCompanion = async (
     const connectionsStore = createConnectionsStore(options.vaultPath, {
       role: 'parent-reader',
     });
-    teardown.push(
-      scheduleSqliteVacuumGc(connectionsStore, hygieneStatus, { everyMs: sqliteVacuumEveryMs }),
-    );
+    // Captured (not just pushed to teardown[]) so close() can stop it on a
+    // normal shutdown too — teardown[] only drains on a startup-failure
+    // rollback (see runTeardown below), never on the success/close() path.
+    const disposeSqliteVacuumGc = scheduleSqliteVacuumGc(connectionsStore, hygieneStatus, {
+      everyMs: sqliteVacuumEveryMs,
+    });
+    teardown.push(disposeSqliteVacuumGc);
     const connectionsMaterializer = createConnectionsMaterializer({
       vaultRoot: options.vaultPath,
       eventLog: baseEventLog,
@@ -1133,6 +1152,9 @@ export const startCompanion = async (
       bodyEvidenceWorkerFlag !== 'false' &&
       bodyEvidenceWorkerFlag !== 'off';
     let bodyEvidenceLaneHealth: (() => BodyEvidenceLaneHealth) | undefined;
+    // Captured so close() can stop the lane BEFORE draining the contract
+    // runner below — see the SIGTERM-hang root cause note on close().
+    let stopBodyEvidenceLane: (() => void) | undefined;
 
     // The tombstone snapshot protects both background lanes. The explicit
     // tombstone route also removes queued bodies immediately; this startup
@@ -1164,6 +1186,7 @@ export const startCompanion = async (
         log: (event, fields) => process.stdout.write(`[${event}] ${JSON.stringify(fields)}\n`),
       });
       bodyEvidenceLaneHealth = bodyEvidenceLane.health;
+      stopBodyEvidenceLane = bodyEvidenceLane.stop;
       bodyEvidenceLane.start();
       teardown.push(() => bodyEvidenceLane.stop());
     }
@@ -1192,6 +1215,8 @@ export const startCompanion = async (
     // inert lane (the 90-min soak failure) is observable. Absent → the
     // lane is off and /status omits the field.
     let backgroundEmbeddingLaneHealth: (() => BackgroundEmbeddingLaneHealth) | undefined;
+    // Same rationale as stopBodyEvidenceLane above.
+    let stopBackgroundEmbeddingLane: (() => void) | undefined;
     if (backgroundEmbeddingLaneEnabled) {
       // Load the privacy tombstone set once at startup. A page whose
       // domain is tombstoned is never embedded (privacy gate). The set is
@@ -1227,6 +1252,7 @@ export const startCompanion = async (
       // Expose the lane's health snapshot to /v1/status so an inert lane
       // is VISIBLE within minutes instead of a 90-min silent stall.
       backgroundEmbeddingLaneHealth = backgroundEmbeddingLane.health;
+      stopBackgroundEmbeddingLane = backgroundEmbeddingLane.stop;
       backgroundEmbeddingLane.start();
       teardown.push(() => {
         backgroundEmbeddingLane.stop();
@@ -1755,31 +1781,93 @@ export const startCompanion = async (
       replicaId: replica.replicaId,
       replicaIdCreated: replica.created,
       close: async () => {
-        // Stop the resolve canary first so its unref'd timer + registry
-        // entry are released before we tear the server down.
+        // SIGTERM-hang root cause (observed live, 2026-08-15/16): this used
+        // to jump straight from closing the HTTP listener to
+        // `await syncContractRunner.awaitIdle()`. That leaves every
+        // background lane that can append NEW accepted events — the
+        // body-evidence materialization lane, the background content-
+        // embedding lane, and the collector framework's promotion path —
+        // running. Each of them calls `eventLog.appendServerObserved(...)`
+        // (or appendClient*), which synchronously feeds
+        // `syncContractRunner.onAcceptedEvent`, which re-marks materializers
+        // (e.g. connectionsMaterializer) dirty. A materializer's awaitIdle()
+        // is a bare `while (running || dirty) await sleep(5)` with no
+        // deadline — if a lane is mid-cycle and keeps producing new dirty
+        // events faster than drains settle, awaitIdle() never sees BOTH
+        // conditions false at once and blocks forever, holding the recall
+        // process lock and starving the next boot
+        // ("Another companion (pid N) already owns the recall index").
+        // Fix: stop every event-producing lane/child FIRST — before the
+        // drain — so awaitIdle() is waiting on a bounded, non-growing
+        // amount of work. Everything below (except the two child-process
+        // stops explicitly placed after the rebuild wait) is safe to run in
+        // any order since none of it depends on the others being alive yet.
+        shutdownStage = 'stopping-lanes';
         stopResolveCanary?.();
         clearInterval(idempotencyGc);
         clearInterval(auditRetention);
+        clearInterval(derivedRevisionGc);
+        clearTimeout(derivedRevisionGcKickoff);
+        clearInterval(eventSealLoop);
+        clearTimeout(eventSealKickoff);
+        disposeSqliteVacuumGc();
+        antiEntropy.stop();
+        eventLoopMonitor.stop();
+        workGraphArtifactScheduler.teardown();
+        section15ArtifactScheduler.teardown();
+        reliabilityArtifactScheduler.teardown();
+        attributionV1ArtifactScheduler.teardown();
+        // The event producers — MUST be stopped before awaitIdle() below.
+        stopBodyEvidenceLane?.();
+        stopBackgroundEmbeddingLane?.();
+        if (collectorFramework !== null) {
+          try {
+            await collectorFramework.close();
+          } catch {
+            // Best-effort — a stuck collector must never block shutdown.
+          }
+        }
         if (relayTransport !== null) stopRelayTransport(relayTransport);
+        shutdownStage = 'closing-watcher';
         await watcher?.close();
+        shutdownStage = 'closing-http';
         await started.close();
-        // Drain the contract runner FIRST — extraction/projection/recall
-        // materializers may still be processing accepted events.
-        // Without this drain, a recall materializer ingest could be
+        // Drain the contract runner. Extraction/projection/recall
+        // materializers may still be processing accepted events already in
+        // flight. Without this drain, a recall materializer ingest could be
         // mid-write when we release the lock, and the next companion
         // starting up would race the still-running background write.
-        // Reviewer-flagged ordering.
+        // Reviewer-flagged ordering. Safe now that every producer above has
+        // been told to stop, so this converges instead of spinning forever.
+        shutdownStage = 'draining-contract-runner';
         await syncContractRunner.awaitIdle();
         // Pending work has drained; now cancel any drain-debounce
         // timer that got re-armed during the drain-out so no ghost
         // drain fires after the lock is released. (The teardown[]
         // array holds the same dispose for the startup-failure path.)
+        shutdownStage = 'disposing-materializer';
         connectionsMaterializer.dispose();
         // Then wait for any rebuild that those materializers (or a
         // direct path) kicked off.
+        shutdownStage = 'waiting-for-rebuild';
         await recallLifecycle.waitForRebuild();
+        // Recall/embedder child processes are only stopped now — after the
+        // rebuild they drive has finished — so an in-flight rebuild never
+        // races its own child's teardown.
+        shutdownStage = 'stopping-children';
+        if (indexerClient !== null) await indexerClient.stop();
+        if (embedderClient !== null) await embedderClient.stop();
+        shutdownStage = 'releasing-lock';
         await recallLock.release();
+        shutdownStage = 'done';
       },
+      getShutdownDiagnostics: () => ({
+        stage: shutdownStage,
+        pendingMaterializers: Object.entries(syncContractRunner.health())
+          .filter(([, health]) => health.pending)
+          .map(([name]) => name),
+        recallRebuildInFlight: recallLifecycle.isRebuilding(),
+      }),
     };
   } catch (error) {
     // Startup failed partway through. Roll back every side-effect
