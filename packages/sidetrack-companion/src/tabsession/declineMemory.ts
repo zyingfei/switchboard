@@ -62,6 +62,12 @@ import { USER_ORGANIZED_ITEM, isUserOrganizedItemPayload } from '../feedback/eve
 import type { AcceptedEvent } from '../sync/causal.js';
 import type { EventLog } from '../sync/eventLog.js';
 import { eventStoreCoverageToken, getSharedEventStoreServeStale } from '../sync/eventStore.js';
+import {
+  isSuggestionAcceptedPayload,
+  isSuggestionDeclinedPayload,
+  SUGGESTION_ACCEPTED,
+  SUGGESTION_DECLINED,
+} from '../workstreams/suggestionEvents.js';
 
 // ---- env flag ---------------------------------------------------------
 
@@ -83,9 +89,24 @@ export const declineMemoryEnabled = (): boolean => {
 export interface DeclineLookup {
   /** Canonical URLs whose LATEST organize-move was a decline (toContainer null). */
   readonly declinedUrls: ReadonlySet<string>;
+  // Phase 1 multi-membership (docs/plans/2026-08-16-category-flexibility-
+  // hyde.md §5) — E6 built at the granularity the feature review actually
+  // asked for: "declined workstream A, still open to B" is a DIFFERENT
+  // assertion than "not in any stream" (declinedUrls above), and the two
+  // are consulted separately by `isWorkstreamDeclined`. Keyed by subjectId
+  // (canonical URL, thread bac_id, or tab-session id — same subject space
+  // as `workstreams/membershipEvents.ts`), folded from SUGGESTION_ACCEPTED
+  // / SUGGESTION_DECLINED with the accept clearing a prior decline for that
+  // exact pair (a user who declines Monday and accepts Tuesday has
+  // un-declined it — same "latest wins, not an append-only set" principle
+  // as declinedUrls itself).
+  readonly declinedWorkstreamsByUrl: ReadonlyMap<string, ReadonlySet<string>>;
 }
 
-export const EMPTY_DECLINE_LOOKUP: DeclineLookup = { declinedUrls: new Set<string>() };
+export const EMPTY_DECLINE_LOOKUP: DeclineLookup = {
+  declinedUrls: new Set<string>(),
+  declinedWorkstreamsByUrl: new Map<string, ReadonlySet<string>>(),
+};
 
 // Exact-URL keyed lookups drift on trailing slashes across stores (projection
 // vs recall-store vs event-payload key shapes) — try both spellings, the same
@@ -109,6 +130,32 @@ export const isUrlDeclined = (
   if (lookup === null || lookup === undefined) return false;
   for (const variant of slashVariants(canonicalUrl)) {
     if (lookup.declinedUrls.has(variant)) return true;
+  }
+  return false;
+};
+
+/**
+ * True when `workstreamId` specifically was declined for `subjectId` — OR
+ * the subject carries a global "not in any stream" decline (which subsumes
+ * every per-workstream case). Declining workstream C leaves suggestions for
+ * A/B unaffected: this is the (subject, workstream) pair check the feature
+ * review's E6 asked for, layered on top of the existing global one so every
+ * consulting site (split-suggestion surfacer today; the prototype lane and
+ * `laneFallback.ts` per the design) gets both checks from one call.
+ *
+ * Same safe-default contract as `isUrlDeclined`: false when the flag is off
+ * or the lookup is unavailable.
+ */
+export const isWorkstreamDeclined = (
+  lookup: DeclineLookup | null | undefined,
+  subjectId: string,
+  workstreamId: string,
+): boolean => {
+  if (!declineMemoryEnabled()) return false;
+  if (lookup === null || lookup === undefined) return false;
+  if (isUrlDeclined(lookup, subjectId)) return true;
+  for (const variant of slashVariants(subjectId)) {
+    if (lookup.declinedWorkstreamsByUrl.get(variant)?.has(workstreamId) === true) return true;
   }
   return false;
 };
@@ -155,14 +202,59 @@ export const foldDeclineMemory = (events: readonly AcceptedEvent[]): DeclineLook
   for (const [canonicalUrl, move] of latest) {
     if (move.declined) declinedUrls.add(canonicalUrl);
   }
-  return { declinedUrls };
+  return { declinedUrls, declinedWorkstreamsByUrl: foldWorkstreamDeclines(events) };
+};
+
+// Per-(subjectId, workstreamId) pair latest-wins, folded from
+// SUGGESTION_ACCEPTED/DECLINED. Accept and decline share one accumulator so
+// a later accept clears an earlier decline for the exact same pair — same
+// tie-break as the global fold above (acceptedAtMs, then dot.seq).
+const foldWorkstreamDeclines = (
+  events: readonly AcceptedEvent[],
+): ReadonlyMap<string, ReadonlySet<string>> => {
+  const latest = new Map<string, LatestMove & { readonly workstreamId: string }>();
+  for (const event of events) {
+    let subjectId: string;
+    let workstreamId: string;
+    let declined: boolean;
+    if (event.type === SUGGESTION_DECLINED && isSuggestionDeclinedPayload(event.payload)) {
+      subjectId = event.payload.subjectId;
+      workstreamId = event.payload.workstreamId;
+      declined = true;
+    } else if (event.type === SUGGESTION_ACCEPTED && isSuggestionAcceptedPayload(event.payload)) {
+      subjectId = event.payload.subjectId;
+      workstreamId = event.payload.workstreamId;
+      declined = false;
+    } else {
+      continue;
+    }
+    const key = `${subjectId} ${workstreamId}`;
+    const candidate = { at: event.acceptedAtMs, seq: event.dot.seq, declined, workstreamId };
+    const incumbent = latest.get(key);
+    if (
+      incumbent === undefined ||
+      candidate.at > incumbent.at ||
+      (candidate.at === incumbent.at && candidate.seq > incumbent.seq)
+    ) {
+      latest.set(key, candidate);
+    }
+  }
+  const byUrl = new Map<string, Set<string>>();
+  for (const [key, move] of latest) {
+    if (!move.declined) continue;
+    const subjectId = key.slice(0, key.length - move.workstreamId.length - 1);
+    const set = byUrl.get(subjectId) ?? new Set<string>();
+    set.add(move.workstreamId);
+    byUrl.set(subjectId, set);
+  }
+  return byUrl;
 };
 
 // ---- typed store read (fold source) -----------------------------------
 
 const emptyEvents: readonly AcceptedEvent[] = [];
 
-const DECLINE_FOLD_TYPES = [USER_ORGANIZED_ITEM] as const;
+const DECLINE_FOLD_TYPES = [USER_ORGANIZED_ITEM, SUGGESTION_ACCEPTED, SUGGESTION_DECLINED] as const;
 
 // Typed read via events_type_idx. The untyped forEachChunk full-scan is the
 // 45s-timeout shape this repo has fixed five times (see the event-scan
@@ -176,8 +268,9 @@ const readOrganizedItemEvents = async (
   // 30-70s post-boot). The store is read as-is; the kicked background pass
   // freshens it for later reads.
   const store = await getSharedEventStoreServeStale(vaultRoot);
+  const foldTypes: ReadonlySet<string> = new Set(DECLINE_FOLD_TYPES);
   if (store === null) {
-    return (await eventLog.readMerged()).filter((event) => event.type === USER_ORGANIZED_ITEM);
+    return (await eventLog.readMerged()).filter((event) => foldTypes.has(event.type));
   }
   const events: AcceptedEvent[] = [];
   await store.forEachChunkOfTypes(

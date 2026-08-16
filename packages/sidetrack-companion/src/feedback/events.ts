@@ -53,6 +53,15 @@ export const USER_ORGANIZED_ITEM_ACTIONS = [
   'rename',
   'promote',
   'ignore',
+  // Multi-membership (docs/plans/2026-08-16-category-flexibility-hyde.md
+  // §1/§2). Every `workstream.membership.set{role:'secondary'}` /
+  // `workstream.membership.removed` mutation ALSO appends one of these so
+  // the existing `recordOrganizedItemFeedback` → lane-outcome telemetry
+  // path (feedback/events.ts -> tabsession/lanePrequential.ts's
+  // `recordLaneOutcome`) keeps working unchanged for additive operations.
+  // Distinct from `move`, which stays the single-primary replace channel.
+  'add-container',
+  'remove-container',
 ] as const;
 
 export type UserOrganizedItemAction = (typeof USER_ORGANIZED_ITEM_ACTIONS)[number];

@@ -10,7 +10,7 @@ import {
   type UserAssertedVisitRelation,
   type VisitSimilarityEdge,
 } from './topicClusterer.js';
-import { UnionFind } from './unionFind.js';
+import { UnionFind, type UnionFindComponent } from './unionFind.js';
 
 export const HDBSCAN_TOPIC_MIN_SAMPLES = 3;
 
@@ -127,8 +127,12 @@ const adjacencyFor = (
 const coreDistancesFor = (
   eligibleVisitKeys: ReadonlySet<string>,
   adjacency: ReadonlyMap<string, readonly DensityEdge[]>,
+  // Parametrized (default HDBSCAN_TOPIC_MIN_SAMPLES) so
+  // `densityConnectedComponents` below can reuse this exact function for a
+  // caller that wants a different min-sample floor without duplicating it.
+  minSamples: number = HDBSCAN_TOPIC_MIN_SAMPLES,
 ): ReadonlyMap<string, number> => {
-  const requiredNeighborCount = HDBSCAN_TOPIC_MIN_SAMPLES - 1;
+  const requiredNeighborCount = minSamples - 1;
   const coreDistances = new Map<string, number>();
   for (const visitKey of [...eligibleVisitKeys].sort(compareString)) {
     const distances = [...(adjacency.get(visitKey) ?? [])]
@@ -288,4 +292,86 @@ export const buildHdbscanTopicRevision = async (
       algorithmVersion: TOPIC_HDBSCAN_REVISION_KEY,
     },
   });
+};
+
+// ---- generic density-connected-components primitive ----------------------
+//
+// Extracted so callers OUTSIDE the visit-topic domain can reuse the same
+// mutual-reachability MST + cosine-threshold-cut algorithm re-scoped to an
+// arbitrary member pool, instead of duplicating it. First consumer: the
+// workstream split-suggestion engine (docs/plans/2026-08-16-category-
+// flexibility-hyde.md §4), which clusters ONE workstream's own evidence
+// embeddings — a member pool the engagement-gated, TopicRevision-shaped
+// pipeline above isn't scoped for. Domain-free: no engagement gating, no
+// user-asserted-relation union, no TopicRevision assembly.
+
+export interface DensitySimilarityEdge {
+  readonly fromId: string;
+  readonly toId: string;
+  readonly cosine: number;
+}
+
+const normalizeGenericDensityEdge = (
+  edge: DensitySimilarityEdge,
+  memberIds: ReadonlySet<string>,
+  cosineThreshold: number,
+): DensityEdge | null => {
+  if (!Number.isFinite(edge.cosine) || edge.cosine < cosineThreshold) return null;
+  if (!memberIds.has(edge.fromId) || !memberIds.has(edge.toId)) return null;
+  if (edge.fromId === edge.toId) return null;
+  const cosine = clampCosine(edge.cosine);
+  const fromVisitKey = edge.fromId < edge.toId ? edge.fromId : edge.toId;
+  const toVisitKey = edge.fromId < edge.toId ? edge.toId : edge.fromId;
+  return { fromVisitKey, toVisitKey, cosine, distance: 1 - cosine };
+};
+
+const genericDensityEdgesFor = (
+  edges: readonly DensitySimilarityEdge[],
+  memberIds: ReadonlySet<string>,
+  cosineThreshold: number,
+): readonly DensityEdge[] => {
+  const byPair = new Map<string, DensityEdge>();
+  for (const edge of edges) {
+    const normalized = normalizeGenericDensityEdge(edge, memberIds, cosineThreshold);
+    if (normalized === null) continue;
+    const key = pairKey(normalized.fromVisitKey, normalized.toVisitKey);
+    const existing = byPair.get(key);
+    if (existing === undefined || normalized.cosine > existing.cosine) {
+      byPair.set(key, normalized);
+    }
+  }
+  return [...byPair.values()].sort((a, b) => {
+    const from = compareString(a.fromVisitKey, b.fromVisitKey);
+    if (from !== 0) return from;
+    return compareString(a.toVisitKey, b.toVisitKey);
+  });
+};
+
+/**
+ * Cluster an arbitrary member-id pool by cosine-similarity edges: mutual-
+ * reachability MST, cut at `cosineThreshold`, core distance requires
+ * `minSamples` mutual neighbors (HDBSCAN's own density definition — no new
+ * metric). Deterministic and order-independent (sorted internally).
+ * Singleton "components" (no edge survived) are still returned — callers
+ * that only want real clusters filter on `members.length >= N` themselves.
+ */
+export const densityConnectedComponents = (
+  memberIds: ReadonlySet<string>,
+  edges: readonly DensitySimilarityEdge[],
+  cosineThreshold: number,
+  minSamples: number = HDBSCAN_TOPIC_MIN_SAMPLES,
+): readonly UnionFindComponent[] => {
+  const densityEdges = genericDensityEdgesFor(edges, memberIds, cosineThreshold);
+  const adjacency = adjacencyFor(memberIds, densityEdges);
+  const coreDistances = coreDistancesFor(memberIds, adjacency, minSamples);
+  const mutualReachabilityEdges = mutualReachabilityEdgesFor(densityEdges, coreDistances);
+  const minimumSpanningTree = minimumSpanningTreeFor(memberIds, coreDistances, mutualReachabilityEdges);
+  const maxDensityDistance = 1 - cosineThreshold;
+  const uf = new UnionFind();
+  for (const memberId of [...memberIds].sort(compareString)) uf.add(memberId);
+  for (const edge of minimumSpanningTree) {
+    if (edge.mutualReachabilityDistance > maxDensityDistance) continue;
+    uf.union(edge.fromVisitKey, edge.toVisitKey);
+  }
+  return uf.components();
 };

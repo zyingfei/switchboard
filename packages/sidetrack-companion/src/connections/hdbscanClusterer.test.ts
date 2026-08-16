@@ -14,7 +14,7 @@ import {
   type VisitSimilarityEdge,
   type VisitSimilarityRevisionInput,
 } from './topicClusterer.js';
-import { buildHdbscanTopicRevision } from './hdbscanClusterer.js';
+import { buildHdbscanTopicRevision, densityConnectedComponents } from './hdbscanClusterer.js';
 
 const producedAt = Date.parse('2026-05-08T12:00:00.000Z');
 
@@ -181,5 +181,61 @@ describe('buildHdbscanTopicRevision', () => {
     expect(hdbscanRevision.topics[0]?.metadata.cohesion).toBe(
       unionFindRevision.topics[0]?.metadata.cohesion,
     );
+  });
+});
+
+describe('densityConnectedComponents — generic member-pool primitive', () => {
+  const ids = (...values: readonly string[]): ReadonlySet<string> => new Set(values);
+
+  it('clusters a tight triangle above threshold with minSamples=3', () => {
+    const members = ids('a', 'b', 'c');
+    const edges = [
+      { fromId: 'a', toId: 'b', cosine: 0.95 },
+      { fromId: 'b', toId: 'c', cosine: 0.94 },
+      { fromId: 'a', toId: 'c', cosine: 0.93 },
+    ];
+    const components = densityConnectedComponents(members, edges, 0.9, 3);
+    const real = components.filter((c) => c.members.length > 1);
+    expect(real).toHaveLength(1);
+    expect([...real[0]?.members ?? []].sort()).toEqual(['a', 'b', 'c']);
+  });
+
+  it('below cosineThreshold, nothing clusters (each id its own singleton)', () => {
+    const members = ids('a', 'b', 'c');
+    const edges = [
+      { fromId: 'a', toId: 'b', cosine: 0.5 },
+      { fromId: 'b', toId: 'c', cosine: 0.5 },
+    ];
+    const components = densityConnectedComponents(members, edges, 0.9, 3);
+    expect(components.every((c) => c.members.length === 1)).toBe(true);
+  });
+
+  it('two disjoint dense groups produce two components, not one', () => {
+    const members = ids('a', 'b', 'c', 'x', 'y', 'z');
+    const edges = [
+      { fromId: 'a', toId: 'b', cosine: 0.95 },
+      { fromId: 'b', toId: 'c', cosine: 0.95 },
+      { fromId: 'a', toId: 'c', cosine: 0.95 },
+      { fromId: 'x', toId: 'y', cosine: 0.95 },
+      { fromId: 'y', toId: 'z', cosine: 0.95 },
+      { fromId: 'x', toId: 'z', cosine: 0.95 },
+    ];
+    const components = densityConnectedComponents(members, edges, 0.9, 3);
+    const real = components.filter((c) => c.members.length > 1).map((c) => [...c.members].sort());
+    expect(real).toHaveLength(2);
+  });
+
+  it('is order-independent (edge order does not change the result)', () => {
+    const members = ids('a', 'b', 'c');
+    const edges = [
+      { fromId: 'a', toId: 'b', cosine: 0.95 },
+      { fromId: 'b', toId: 'c', cosine: 0.94 },
+      { fromId: 'a', toId: 'c', cosine: 0.93 },
+    ];
+    const forward = densityConnectedComponents(members, edges, 0.9, 3);
+    const reversed = densityConnectedComponents(members, [...edges].reverse(), 0.9, 3);
+    const normalize = (cs: typeof forward) =>
+      [...cs].map((c) => [...c.members].sort()).sort((a, b) => (a[0] ?? '').localeCompare(b[0] ?? ''));
+    expect(normalize(reversed)).toEqual(normalize(forward));
   });
 });

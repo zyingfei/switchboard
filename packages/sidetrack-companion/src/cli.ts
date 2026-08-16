@@ -237,6 +237,19 @@ export const renderHelp = (): string =>
     "    if a live companion owns it — quit the companion (or its background",
     '    service) before running this. Clears the repair queue + needs-repair',
     '    marker on success (a full rebuild heals everything by construction).',
+    '',
+    'Membership-backfill subcommand (user-consented, one-time derivation):',
+    '  sidetrack-companion membership-backfill --vault <path> [--apply] [--json]',
+    '    Derives workstream.membership.set{role:\'primary\'} events from the',
+    '    THREE existing single-membership sources (urls.attribution.inferred /',
+    '    tabsession.attribution.inferred / user.organized.item moves, plus',
+    "    thread.upserted's primaryWorkstreamId register) — docs/plans/2026-08-",
+    '    16-category-flexibility-hyde.md §1 "Migration". Report-only by',
+    '    default (plans and prints; never touches disk); --apply appends via',
+    "    importPeerEvent under a dedicated synthetic replica. Deterministic",
+    '    and idempotent: safe to re-run (regenerates identical dots, so a',
+    '    re-run dedups rather than duplicating). Takes the vault\'s recall',
+    '    process-lock first and refuses if a live companion owns it.',
   ].join('\n');
 
 // Post-install guidance printed after `--install-service` succeeds. Pure
@@ -1577,6 +1590,114 @@ const runConnectionsRebuildSubcommand = async (
   }
 };
 
+// Phase 1 multi-membership (docs/plans/2026-08-16-category-flexibility-hyde.md
+// §1 "Migration") — the one-time, consent-gated backfill from the three
+// existing single-membership sources into `workstream.membership.set{role:
+// 'primary'}` events. Same "no migrations/ directory, rebuild-from-canonical-
+// log" convention and same process-lock discipline as connections-rebuild
+// above (a second process appending derived events while a live companion
+// holds warm append-index state over the same shards would desync them).
+// REPORT-ONLY by default; --apply is the sole write path.
+const runMembershipBackfillSubcommand = async (
+  argv: readonly string[],
+  streams: CliStreams,
+): Promise<number> => {
+  if (argv.includes('--help') || argv.includes('help')) {
+    writeLine(
+      streams.stdout,
+      'Usage: sidetrack-companion membership-backfill --vault <path> [--apply] [--json]',
+    );
+    return 0;
+  }
+  const vaultPath = findArgValue(argv, '--vault');
+  if (vaultPath === undefined || vaultPath.length === 0) {
+    writeLine(streams.stderr, '--vault <path> is required for membership-backfill.');
+    return 2;
+  }
+  const apply = argv.includes('--apply');
+  const json = argv.includes('--json');
+
+  const { acquireRecallProcessLock, RecallLockHeldError } = await import('./recall/recovery.js');
+  let lock;
+  try {
+    lock = await acquireRecallProcessLock(vaultPath);
+  } catch (error) {
+    if (error instanceof RecallLockHeldError) {
+      writeLine(
+        streams.stderr,
+        `membership-backfill refuses: a live companion (pid ${String(error.pid)}) owns ${vaultPath}.`,
+      );
+      writeLine(
+        streams.stderr,
+        'Quit the companion (or its background service) first, then re-run this command.',
+      );
+      return 1;
+    }
+    throw error;
+  }
+  try {
+    const { createEventLog } = await import('./sync/eventLog.js');
+    const { loadOrCreateReplica } = await import('./sync/replicaId.js');
+    const { planMembershipBackfill } = await import('./workstreams/membershipBackfill.js');
+
+    const replica = await loadOrCreateReplica(vaultPath);
+    const eventLog = createEventLog(vaultPath, replica);
+    const events = await eventLog.readMerged();
+    const plan = planMembershipBackfill(events);
+
+    if (!json) {
+      writeLine(
+        streams.stdout,
+        `membership-backfill: urls=${String(plan.stats.urlsBackfilled)}/${String(
+          plan.stats.urlsConsidered,
+        )} tab-sessions=${String(plan.stats.tabSessionsBackfilled)}/${String(
+          plan.stats.tabSessionsConsidered,
+        )} threads=${String(plan.stats.threadsBackfilled)}/${String(plan.stats.threadsConsidered)}`,
+      );
+    }
+    if (!apply) {
+      if (json) {
+        writeLine(streams.stdout, JSON.stringify({ vaultPath, apply: false, stats: plan.stats }, null, 2));
+      } else {
+        writeLine(streams.stdout, 'dry-run: no events written. Re-run with --apply to append.');
+      }
+      return 0;
+    }
+    let imported = 0;
+    let skipped = 0;
+    let errors = 0;
+    for (const event of plan.events) {
+      try {
+        const result = await eventLog.importPeerEvent(event);
+        if (result.imported) imported += 1;
+        else skipped += 1;
+      } catch (error) {
+        errors += 1;
+        writeLine(
+          streams.stderr,
+          `[membership-backfill] ${event.payload.subjectKind}:${event.payload.subjectId}: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        );
+      }
+    }
+    if (json) {
+      writeLine(
+        streams.stdout,
+        JSON.stringify({ vaultPath, apply: true, stats: plan.stats, imported, skipped, errors }, null, 2),
+      );
+    } else {
+      writeLine(
+        streams.stdout,
+        `membership-backfill: imported=${String(imported)} skipped=${String(skipped)} errors=${String(errors)}`,
+      );
+    }
+    return errors > 0 ? 1 : 0;
+  } finally {
+    await lock.release();
+  }
+};
+
 export const runCli = async (argv: readonly string[], streams: CliStreams): Promise<number> => {
   // Sub-command dispatch happens BEFORE the flag-driven parser so a
   // verb like `models` doesn't get interpreted as a positional vault
@@ -1592,6 +1713,9 @@ export const runCli = async (argv: readonly string[], streams: CliStreams): Prom
   }
   if (argv[0] === 'connections-rebuild') {
     return await runConnectionsRebuildSubcommand(argv, streams);
+  }
+  if (argv[0] === 'membership-backfill') {
+    return await runMembershipBackfillSubcommand(argv, streams);
   }
   if (argv[0] === 'recall') {
     return await runRecallSubcommand(argv, streams);

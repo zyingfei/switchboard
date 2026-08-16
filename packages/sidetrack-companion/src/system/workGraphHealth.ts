@@ -94,6 +94,18 @@ import {
   isUserRejectedRelationPayload,
 } from '../feedback/events.js';
 import { createRepairQueueStore } from '../connections/repairQueueStore.js';
+import {
+  isSuggestionAcceptedPayload,
+  isSuggestionDeclinedPayload,
+  SUGGESTION_ACCEPTED,
+  SUGGESTION_DECLINED,
+} from '../workstreams/suggestionEvents.js';
+import {
+  isWorkstreamMembershipRemovedPayload,
+  isWorkstreamMembershipSetPayload,
+  WORKSTREAM_MEMBERSHIP_REMOVED,
+  WORKSTREAM_MEMBERSHIP_SET,
+} from '../workstreams/membershipEvents.js';
 
 // Absent/non-'0'/non-'false' = ON (shadow observe-only by default) —
 // mirrors ranker/candidates.ts's aggregatorGroupingGuardEnabled call-time
@@ -153,7 +165,14 @@ type DiagnosticCandidateMetric = string | number | boolean | null;
 
 export interface DiagnosticCandidate {
   readonly id: string;
-  readonly family: 'topic' | 'similarity' | 'ranker' | 'content-lane' | 'reconcile' | 'quality';
+  readonly family:
+    | 'topic'
+    | 'similarity'
+    | 'ranker'
+    | 'content-lane'
+    | 'reconcile'
+    | 'quality'
+    | 'workstreams';
   readonly lane: 'active' | 'standby' | 'shadow' | 'diagnostic' | 'incremental' | 'queue';
   readonly servingImpact: 'serving' | 'not-serving' | 'observe-only';
   readonly status: 'ok' | 'off' | 'pending' | 'warning' | 'alarm' | 'unavailable';
@@ -796,6 +815,16 @@ const buildDiagnosticCandidates = (input: {
   // live, never read from a persisted diagnostics blob).
   readonly aggregatorShadowEnabled: boolean;
   readonly aggregatorShadowAgreement: AggregatorShadowAgreement | null;
+  // Phase 1 multi-membership (docs/plans/2026-08-16-category-flexibility-
+  // hyde.md §5) — folded live in collectWorkGraphHealth, same idiom as the
+  // rejected-relation counter beside it.
+  readonly workstreamMembership: {
+    readonly suggestionAcceptedCount: number;
+    readonly suggestionDeclinedCount: number;
+    readonly suggestionAcceptedBySource: Readonly<Record<string, number>>;
+    readonly suggestionDeclinedBySource: Readonly<Record<string, number>>;
+    readonly membershipEditCount: number;
+  };
 }): readonly DiagnosticCandidate[] => {
   const producedAt = input.diagnostics.producedAt;
   const diagnosticsObservedAt = producedAt;
@@ -1382,6 +1411,41 @@ const buildDiagnosticCandidates = (input: {
       asOf: liveObservedAt,
       metrics: metrics({ learnedModelLoaded: false }),
     },
+    // Phase 1 multi-membership (docs/plans/2026-08-16-category-flexibility-
+    // hyde.md §5 falsifiability spine) — "declines are captured but not
+    // consulted" (feature review G5) has counters now: suggestion accept/
+    // decline volume by source, and raw membership-edit volume, folded live
+    // from the merged log every health poll (same idiom as
+    // `similarity.served-signal-floor`'s lifetime-vs-current split, minus
+    // the lifetime/current distinction since there's no serving-collapse
+    // risk here to distinguish). `observe-only`: nothing here gates or
+    // changes serving; it exists so a future promotion decision has real
+    // numbers instead of "declines unconsulted" (E6's ancestor finding).
+    {
+      id: 'workstreams.membership-suggestions',
+      family: 'workstreams',
+      lane: 'diagnostic',
+      servingImpact: 'observe-only',
+      status: 'ok',
+      reason: null,
+      revisionId: null,
+      asOf: liveObservedAt,
+      metrics: metrics({
+        suggestionAcceptedCount: input.workstreamMembership.suggestionAcceptedCount,
+        suggestionDeclinedCount: input.workstreamMembership.suggestionDeclinedCount,
+        membershipEditCount: input.workstreamMembership.membershipEditCount,
+        ...Object.fromEntries(
+          Object.entries(input.workstreamMembership.suggestionAcceptedBySource).map(
+            ([source, count]) => [`accepted.${source}`, count],
+          ),
+        ),
+        ...Object.fromEntries(
+          Object.entries(input.workstreamMembership.suggestionDeclinedBySource).map(
+            ([source, count]) => [`declined.${source}`, count],
+          ),
+        ),
+      }),
+    },
   ];
 
   return allCandidates.filter((c) => !isStaleDiagnostic(c));
@@ -1447,6 +1511,13 @@ export const collectWorkGraphHealth = async ({
     // Move 2(b) — typed-index read so the rejected-relation diagnostics count
     // stays O(matching events), never a full-log scan.
     USER_REJECTED_RELATION,
+    // Phase 1 multi-membership (docs/plans/2026-08-16-category-flexibility-
+    // hyde.md §5 falsifiability spine) — suggestion emitted/accepted/
+    // declined + membership-edit counters, same typed-index discipline.
+    SUGGESTION_ACCEPTED,
+    SUGGESTION_DECLINED,
+    WORKSTREAM_MEMBERSHIP_SET,
+    WORKSTREAM_MEMBERSHIP_REMOVED,
   ]);
   // Learned aggregator-stats SHADOW (observe-only; default ON via
   // SIDETRACK_LEARNED_AGGREGATOR). Recomputed fresh from a BOUNDED typed
@@ -1734,6 +1805,16 @@ export const collectWorkGraphHealth = async ({
   // counter; no consumer applies the rejection to serving/edges yet.
   let rejectedRelationCount = 0;
   const rejectedRelationsBySurface: Record<string, number> = {};
+  // Phase 1 multi-membership (docs/plans/2026-08-16-category-flexibility-
+  // hyde.md §5) — suggestion accept/decline bucketed by suggestionSource,
+  // plus a raw membership-edit count (SET + REMOVED). Folded live from the
+  // same typed merged read above; no persisted cross-poll cursor, same
+  // shape as the rejected-relation counter beside it.
+  let suggestionAcceptedCount = 0;
+  let suggestionDeclinedCount = 0;
+  const suggestionAcceptedBySource: Record<string, number> = {};
+  const suggestionDeclinedBySource: Record<string, number> = {};
+  let membershipEditCount = 0;
   for (const event of merged) {
     if (event.type === 'recall.served') {
       servedCount += 1;
@@ -1747,6 +1828,20 @@ export const collectWorkGraphHealth = async ({
       rejectedRelationCount += 1;
       const surface = event.payload.surface;
       rejectedRelationsBySurface[surface] = (rejectedRelationsBySurface[surface] ?? 0) + 1;
+    } else if (event.type === SUGGESTION_ACCEPTED && isSuggestionAcceptedPayload(event.payload)) {
+      suggestionAcceptedCount += 1;
+      const source = event.payload.suggestionSource;
+      suggestionAcceptedBySource[source] = (suggestionAcceptedBySource[source] ?? 0) + 1;
+    } else if (event.type === SUGGESTION_DECLINED && isSuggestionDeclinedPayload(event.payload)) {
+      suggestionDeclinedCount += 1;
+      const source = event.payload.suggestionSource;
+      suggestionDeclinedBySource[source] = (suggestionDeclinedBySource[source] ?? 0) + 1;
+    } else if (
+      (event.type === WORKSTREAM_MEMBERSHIP_SET && isWorkstreamMembershipSetPayload(event.payload)) ||
+      (event.type === WORKSTREAM_MEMBERSHIP_REMOVED &&
+        isWorkstreamMembershipRemovedPayload(event.payload))
+    ) {
+      membershipEditCount += 1;
     }
   }
   const impressionLog: WorkGraphHealthReport['impressionLog'] = {
@@ -1829,6 +1924,13 @@ export const collectWorkGraphHealth = async ({
       repairQueue,
       aggregatorShadowEnabled: learnedAggregatorShadowEnabled(),
       aggregatorShadowAgreement,
+      workstreamMembership: {
+        suggestionAcceptedCount,
+        suggestionDeclinedCount,
+        suggestionAcceptedBySource,
+        suggestionDeclinedBySource,
+        membershipEditCount,
+      },
     }),
   };
 };
