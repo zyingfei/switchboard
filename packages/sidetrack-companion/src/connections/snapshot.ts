@@ -43,6 +43,7 @@ import { generateCandidates } from '../ranker/candidates.js';
 import { FEATURE_SCHEMA_VERSION, type CandidatePairFeatures } from '../ranker/feature-schema.js';
 import { extractFeatures } from '../ranker/features.js';
 import type { Candidate, CandidateSource } from '../ranker/types.js';
+import { yieldToEventLoop } from '../runtime/eventLoopYield.js';
 import { projectSnippetLineage } from '../snippets/projection.js';
 import type { AcceptedEvent, RegisterProjection } from '../sync/causal.js';
 import type { MaterializerProgress } from '../sync/contract/materializerProgress.js';
@@ -4175,7 +4176,7 @@ const snapshotFromParts = (
   metadata: StoredConnectionsMetadata,
   nodes: readonly ConnectionNode[],
   edges: readonly ConnectionEdge[],
-  options?: { readonly preserveMetadataCounts?: boolean },
+  options?: { readonly preserveMetadataCounts?: boolean; readonly truncated?: boolean },
 ): ConnectionsSnapshot => ({
   scope: metadata.scope,
   nodes,
@@ -4183,6 +4184,13 @@ const snapshotFromParts = (
   updatedAt: metadata.updatedAt,
   nodeCount: options?.preserveMetadataCounts === true ? metadata.nodeCount : nodes.length,
   edgeCount: options?.preserveMetadataCounts === true ? metadata.edgeCount : edges.length,
+  // PERF (resolver hub-subgraph budgets) — set only when a traversal budget
+  // (node/edge ceiling or hub-degree cap) stopped #readTraversedSubgraphInner
+  // short of full BFS closure. Every other snapshotFromParts call site omits
+  // `truncated`, so this stays absent (not `false`) on the full-graph reads —
+  // matching the optional-field convention every other additive field here
+  // follows.
+  ...(options?.truncated === true ? { truncated: true } : {}),
   ...(metadata.urlProjection === undefined ? {} : { urlProjection: metadata.urlProjection }),
   ...(metadata.tabSessionProjection === undefined
     ? {}
@@ -4209,6 +4217,67 @@ const incrementalScopesEnabled = (): boolean => true;
 const SQLITE_IN_CLAUSE_CHUNK_SIZE = 400;
 const RESOLVER_SUBGRAPH_HOPS = 4;
 const RESOLVER_URL_SUBGRAPH_HOPS = 2;
+
+// PERF (2026-08-16) — hub-subgraph traversal budgets. See
+// docs/plans/2026-08-15-foundation-program.md (2026-08-16 entry) for the
+// measurement this responds to: #readTraversedSubgraphInner's BFS below had
+// no node/edge ceiling and no per-node fan-out cap, so a single hub URL (an
+// aggregator front page with thousands of inbound links, in the measured
+// case) pulled 2,800 nodes / 46,565 edges into ONE synchronous bun:sqlite
+// tick (5,266ms). Every knob is read at CALL TIME (never cached at module
+// load), matching every other env-gated switch in this file, so an
+// operator/test flip takes effect without a restart. `0` is the explicit
+// kill switch for THAT knob — it restores the exact pre-budget unbounded
+// behavior for it (the other budgets are independent and still apply).
+const RESOLVER_SUBGRAPH_NODE_BUDGET_ENV = 'SIDETRACK_RESOLVER_SUBGRAPH_NODE_BUDGET';
+const RESOLVER_SUBGRAPH_EDGE_BUDGET_ENV = 'SIDETRACK_RESOLVER_SUBGRAPH_EDGE_BUDGET';
+const RESOLVER_HUB_DEGREE_CAP_ENV = 'SIDETRACK_RESOLVER_HUB_DEGREE_CAP';
+const DEFAULT_RESOLVER_SUBGRAPH_NODE_BUDGET = 1200;
+const DEFAULT_RESOLVER_SUBGRAPH_EDGE_BUDGET = 4000;
+const DEFAULT_RESOLVER_HUB_DEGREE_CAP = 400;
+
+// A non-negative integer env override. `0` means "unlimited" — every call
+// site below treats `<= 0` as "no cap"; an unset/blank/invalid value falls
+// back to `fallback` rather than silently disabling the budget.
+const nonNegativeIntEnv = (envVar: string, fallback: number): number => {
+  const raw = process.env[envVar];
+  if (raw === undefined || raw.length === 0) return fallback;
+  const parsed = Number(raw);
+  return Number.isFinite(parsed) && parsed >= 0 ? Math.floor(parsed) : fallback;
+};
+
+const resolverSubgraphNodeBudget = (): number =>
+  nonNegativeIntEnv(RESOLVER_SUBGRAPH_NODE_BUDGET_ENV, DEFAULT_RESOLVER_SUBGRAPH_NODE_BUDGET);
+const resolverSubgraphEdgeBudget = (): number =>
+  nonNegativeIntEnv(RESOLVER_SUBGRAPH_EDGE_BUDGET_ENV, DEFAULT_RESOLVER_SUBGRAPH_EDGE_BUDGET);
+const resolverHubDegreeCap = (): number =>
+  nonNegativeIntEnv(RESOLVER_HUB_DEGREE_CAP_ENV, DEFAULT_RESOLVER_HUB_DEGREE_CAP);
+
+// Throttled soak-observability line — see the budgets above. Fires at most
+// once per RESOLVER_SUBGRAPH_TRUNCATION_LOG_THROTTLE_MS regardless of how
+// many resolves truncate in that window, so a hub-heavy batch cannot spam
+// stdout the way the pre-fix unbounded traversal spammed the event loop.
+// `seed` is the traversal's first seed node id (a URL, tab-session, or
+// thread node id depending on caller) rather than strictly a URL — kept
+// under the `url=` key from the spec example for grep-ability across the
+// three call sites that DO seed on a URL.
+const RESOLVER_SUBGRAPH_TRUNCATION_LOG_THROTTLE_MS = 30_000;
+let lastResolverSubgraphTruncationLogAtMs = 0;
+const logResolverSubgraphTruncated = (input: {
+  readonly seed: string;
+  readonly nodes: number;
+  readonly edges: number;
+  readonly reason: string;
+}): void => {
+  const now = Date.now();
+  if (now - lastResolverSubgraphTruncationLogAtMs < RESOLVER_SUBGRAPH_TRUNCATION_LOG_THROTTLE_MS) {
+    return;
+  }
+  lastResolverSubgraphTruncationLogAtMs = now;
+  console.warn(
+    `[resolver.subgraph.truncated] url=${input.seed} nodes=${String(input.nodes)} edges=${String(input.edges)} reason=${input.reason}`,
+  );
+};
 
 const chunked = <T>(items: readonly T[], size: number): readonly (readonly T[])[] => {
   const out: T[][] = [];
@@ -5602,10 +5671,21 @@ export class SqliteConnectionsStore implements ConnectionsStore {
     }
   }
 
-  #readNodesByIds(db: SqliteDatabase, nodeIds: readonly string[]): Map<string, ConnectionNode> {
+  // Async (was sync) so a multi-chunk id list can yield BETWEEN chunks — see
+  // the resolver-subgraph budgets above. The single-chunk case (the
+  // overwhelming majority of calls: any request under
+  // SQLITE_IN_CLAUSE_CHUNK_SIZE ids) never awaits a scheduler round trip.
+  // The only callers are inside #readTraversedSubgraphInner, so this stayed
+  // safe to convert without touching any other call site in the file.
+  async #readNodesByIds(
+    db: SqliteDatabase,
+    nodeIds: readonly string[],
+  ): Promise<Map<string, ConnectionNode>> {
     const out = new Map<string, ConnectionNode>();
     const uniqueNodeIds = [...new Set(nodeIds)].filter((nodeId) => nodeId.length > 0);
-    for (const batch of chunked(uniqueNodeIds, SQLITE_IN_CLAUSE_CHUNK_SIZE)) {
+    const batches = chunked(uniqueNodeIds, SQLITE_IN_CLAUSE_CHUNK_SIZE);
+    for (let index = 0; index < batches.length; index += 1) {
+      const batch = batches[index]!;
       if (batch.length === 0) continue;
       const rows = db
         .query(`SELECT data FROM nodes WHERE id IN (${placeholdersFor(batch.length)})`)
@@ -5614,17 +5694,25 @@ export class SqliteConnectionsStore implements ConnectionsStore {
         const node = JSON.parse(textField(row, 'data')) as ConnectionNode;
         out.set(node.id, node);
       }
+      if (index + 1 < batches.length) await yieldToEventLoop();
     }
     return out;
   }
 
-  #readIncidentEdgesForNodes(
+  // Async sibling of #readNodesByIds — same chunk-yield reasoning. Still the
+  // UNBOUNDED read (pulls every edge bucket incident to any id in `nodeIds`,
+  // whole JSON payload and all): callers that need the hub-degree cap use
+  // #readIncidentEdgesRespectingHubCap instead, which calls this ONLY for the
+  // non-hub portion of a frontier.
+  async #readIncidentEdgesForNodes(
     db: SqliteDatabase,
     nodeIds: readonly string[],
-  ): readonly ConnectionEdge[] {
+  ): Promise<readonly ConnectionEdge[]> {
     const out = new Map<string, ConnectionEdge>();
     const uniqueNodeIds = [...new Set(nodeIds)].filter((nodeId) => nodeId.length > 0);
-    for (const batch of chunked(uniqueNodeIds, SQLITE_IN_CLAUSE_CHUNK_SIZE)) {
+    const batches = chunked(uniqueNodeIds, SQLITE_IN_CLAUSE_CHUNK_SIZE);
+    for (let index = 0; index < batches.length; index += 1) {
+      const batch = batches[index]!;
       if (batch.length === 0) continue;
       const placeholders = placeholdersFor(batch.length);
       const rows = db
@@ -5635,8 +5723,111 @@ export class SqliteConnectionsStore implements ConnectionsStore {
           out.set(edge.id, edge);
         }
       }
+      if (index + 1 < batches.length) await yieldToEventLoop();
     }
     return [...out.values()];
+  }
+
+  // Cheap COUNT-only degree precheck (F: hub-subgraph budgets). Touches
+  // idx_edges_src / idx_edges_dst but NEVER the `data` column, so learning
+  // that a node IS a hub never pages its (potentially huge) bucket JSON into
+  // JS — that page-in is exactly the cost the hub-degree cap exists to avoid.
+  // "Degree" here is bucket-ROW count (distinct (src,dst) pairs touching the
+  // node), which is the right unit: a bucket can hold multiple ConnectionEdge
+  // records for the same pair (different kinds), and those never add a new
+  // frontier neighbor, so they should not count toward fan-out risk.
+  #readIncidentEdgeDegrees(
+    db: SqliteDatabase,
+    nodeIds: readonly string[],
+  ): Map<string, number> {
+    const out = new Map<string, number>();
+    const uniqueNodeIds = [...new Set(nodeIds)].filter((nodeId) => nodeId.length > 0);
+    for (const batch of chunked(uniqueNodeIds, SQLITE_IN_CLAUSE_CHUNK_SIZE)) {
+      if (batch.length === 0) continue;
+      const placeholders = placeholdersFor(batch.length);
+      const rows = db
+        .query(
+          `SELECT node, COUNT(*) AS cnt FROM (
+             SELECT src AS node FROM edges WHERE src IN (${placeholders})
+             UNION ALL
+             SELECT dst AS node FROM edges WHERE dst IN (${placeholders})
+           ) GROUP BY node`,
+        )
+        .all(...batch, ...batch);
+      for (const row of rows) {
+        if (!isRecord(row)) continue;
+        const node = row['node'];
+        const cnt = row['cnt'];
+        if (typeof node === 'string' && typeof cnt === 'number') out.set(node, cnt);
+      }
+    }
+    return out;
+  }
+
+  // Bounded sibling of #readIncidentEdgesForNodes for ONE hub node: reads at
+  // most `cap` buckets, in a DETERMINISTIC (src, dst) order — the bucket's
+  // own primary key — so repeated calls against unchanged data return the
+  // identical row subset every time (no Set-iteration-order or sqlite
+  // plan-order dependence; see the determinism requirement on the budgets
+  // above). The returned edge count can still exceed `cap` when buckets hold
+  // multiple ConnectionEdge records — bounded by design, not by exact count.
+  #readIncidentEdgesForNodeCapped(
+    db: SqliteDatabase,
+    nodeId: string,
+    cap: number,
+  ): readonly ConnectionEdge[] {
+    const rows = db
+      .query('SELECT data FROM edges WHERE src = ? OR dst = ? ORDER BY src, dst LIMIT ?')
+      .all(nodeId, nodeId, cap);
+    const out = new Map<string, ConnectionEdge>();
+    for (const row of rows) {
+      for (const edge of JSON.parse(textField(row, 'data')) as ConnectionEdge[]) {
+        out.set(edge.id, edge);
+      }
+    }
+    return [...out.values()];
+  }
+
+  // Hub-aware incident-edge read: splits `nodeIds` into hub (degree over
+  // `hubDegreeCap`) and normal buckets via the cheap COUNT precheck, reads
+  // normal nodes with the ordinary unbounded batched query and hub nodes with
+  // the capped+ordered per-node query, and reports which ids were capped so
+  // the caller can withhold them from frontier expansion. `hubDegreeCap <= 0`
+  // is the kill switch: skip the precheck entirely and fall through to the
+  // exact pre-budget #readIncidentEdgesForNodes call (byte-identical result
+  // set to the unbudgeted traversal).
+  async #readIncidentEdgesRespectingHubCap(
+    db: SqliteDatabase,
+    nodeIds: readonly string[],
+    hubDegreeCap: number,
+  ): Promise<{ readonly edges: readonly ConnectionEdge[]; readonly hubNodeIds: ReadonlySet<string> }> {
+    const sortedIds = [...new Set(nodeIds)].filter((id) => id.length > 0).sort(compareString);
+    if (sortedIds.length === 0) return { edges: [], hubNodeIds: new Set() };
+    if (hubDegreeCap <= 0) {
+      return { edges: await this.#readIncidentEdgesForNodes(db, sortedIds), hubNodeIds: new Set() };
+    }
+    const degrees = this.#readIncidentEdgeDegrees(db, sortedIds);
+    const hubIds: string[] = [];
+    const normalIds: string[] = [];
+    for (const id of sortedIds) {
+      if ((degrees.get(id) ?? 0) > hubDegreeCap) hubIds.push(id);
+      else normalIds.push(id);
+    }
+    const edgeById = new Map<string, ConnectionEdge>();
+    for (const edge of await this.#readIncidentEdgesForNodes(db, normalIds)) {
+      edgeById.set(edge.id, edge);
+    }
+    for (const hubId of hubIds) {
+      for (const edge of this.#readIncidentEdgesForNodeCapped(db, hubId, hubDegreeCap)) {
+        edgeById.set(edge.id, edge);
+      }
+      // Between hub reads too — a single frontier can carry more than one hub.
+      await yieldToEventLoop();
+    }
+    return {
+      edges: [...edgeById.values()].sort((left, right) => compareString(left.id, right.id)),
+      hubNodeIds: new Set(hubIds),
+    };
   }
 
   #threadResolverSeedNodeIds(
@@ -5710,40 +5901,139 @@ export class SqliteConnectionsStore implements ConnectionsStore {
     if (metadata === null) return null;
 
     const maxHops = options.hops ?? Number.POSITIVE_INFINITY;
+    // PERF (2026-08-16) — resolver hub-subgraph budgets. See the constants
+    // above (RESOLVER_SUBGRAPH_*_BUDGET_ENV / RESOLVER_HUB_DEGREE_CAP_ENV)
+    // for the measured root cause and the kill-switch contract (`0` =
+    // unlimited, per knob). `truncated` is sticky for the whole call — once
+    // any budget fires it stays true, and it is folded into the returned
+    // snapshot below so every caller (armedResolve, evidenceGraph, the
+    // batch-resolve route) can observe it.
+    const nodeBudget = resolverSubgraphNodeBudget();
+    const edgeBudget = resolverSubgraphEdgeBudget();
+    const hubDegreeCap = resolverHubDegreeCap();
+    let truncated = false;
+
     const visited = new Set<string>();
     let frontier = new Set<string>();
-    for (const id of this.#readNodesByIds(db, seedNodeIds).keys()) {
+    const seedNodes = await this.#readNodesByIds(db, seedNodeIds);
+    // Deterministic seed order — see the determinism requirement on the
+    // budgets above. A Map's key iteration order otherwise reflects sqlite's
+    // row-return order, which is stable in practice but not a contract.
+    for (const id of [...seedNodes.keys()].sort(compareString)) {
+      if (nodeBudget > 0 && visited.size >= nodeBudget) {
+        truncated = true;
+        break;
+      }
       visited.add(id);
       frontier.add(id);
     }
 
-    const edgeById = new Map<string, ConnectionEdge>();
+    // NODE DISCOVERY ONLY below — this loop grows `visited`/`frontier` but
+    // deliberately does NOT collect edges into the output. Reason: a hop can
+    // discover far more candidate endpoints than the node budget lets
+    // through (e.g. a hub's 12 neighbors when only 1 more node fits), and an
+    // edge collected here for a candidate that is THEN rejected by the node
+    // budget would dangle — present in `edges` with an endpoint absent from
+    // `nodes`. Collecting edges in ONE pass below, after `visited` is final,
+    // makes "every edge's endpoints are in `nodes`" hold unconditionally,
+    // budgeted or not.
     for (let depth = 0; frontier.size > 0 && depth < maxHops; depth += 1) {
-      const next = new Set<string>();
-      const incidentEdges = this.#readIncidentEdgesForNodes(db, [...frontier]);
-      const endpointCandidates = new Set<string>();
-      for (const edge of incidentEdges) {
-        edgeById.set(edge.id, edge);
-        if (!visited.has(edge.fromNodeId)) endpointCandidates.add(edge.fromNodeId);
-        if (!visited.has(edge.toNodeId)) endpointCandidates.add(edge.toNodeId);
+      if (nodeBudget > 0 && visited.size >= nodeBudget) {
+        truncated = true;
+        break;
       }
-      const existingEndpointNodes = this.#readNodesByIds(db, [...endpointCandidates]);
-      for (const endpoint of existingEndpointNodes.keys()) {
-        if (!visited.has(endpoint)) {
+      // Yield BETWEEN hop levels. Each level is individually bounded by the
+      // node budget / hub-degree cap, but RESOLVER_SUBGRAPH_HOPS=4
+      // (tabsession traversal) can still stack several bounded levels into
+      // one uninterrupted tick without this — the trap the yield
+      // primitive's own module doc warns about (a yield alone does not
+      // shrink the work; it caps how long any one tick holds the loop).
+      await yieldToEventLoop();
+
+      const frontierIds = [...frontier].sort(compareString);
+      const { edges: incidentEdges, hubNodeIds } = await this.#readIncidentEdgesRespectingHubCap(
+        db,
+        frontierIds,
+        hubDegreeCap,
+      );
+      if (hubNodeIds.size > 0) truncated = true;
+
+      const next = new Set<string>();
+      const expandableCandidates = new Set<string>();
+      const hubOnlyCandidates = new Set<string>();
+      for (const edge of incidentEdges) {
+        const viaHub = hubNodeIds.has(edge.fromNodeId) || hubNodeIds.has(edge.toNodeId);
+        for (const endpoint of [edge.fromNodeId, edge.toNodeId]) {
+          if (visited.has(endpoint)) continue;
+          if (viaHub) hubOnlyCandidates.add(endpoint);
+          else expandableCandidates.add(endpoint);
+        }
+      }
+      // A node reached by BOTH a hub and a non-hub edge in the SAME hop is
+      // still eligible to expand through — only nodes reached EXCLUSIVELY
+      // via a capped hub are held back from the next frontier. This is the
+      // "hub not expanded through" contract: the hub's own incident edges
+      // are still read (capped) and folded into the output below, just not
+      // used to grow the BFS.
+      for (const id of expandableCandidates) hubOnlyCandidates.delete(id);
+
+      const allNewIds = [...new Set([...expandableCandidates, ...hubOnlyCandidates])].sort(
+        compareString,
+      );
+      if (allNewIds.length > 0) {
+        // Yield between the incident-edge read above and this node read —
+        // the two chunked reads together are the other half of "between
+        // chunked incident-edge reads" from the budgets doc.
+        await yieldToEventLoop();
+        const existingEndpointNodes = await this.#readNodesByIds(db, allNewIds);
+        for (const endpoint of [...existingEndpointNodes.keys()].sort(compareString)) {
+          if (visited.has(endpoint)) continue;
+          if (nodeBudget > 0 && visited.size >= nodeBudget) {
+            truncated = true;
+            break;
+          }
           visited.add(endpoint);
-          next.add(endpoint);
+          if (!hubOnlyCandidates.has(endpoint)) next.add(endpoint);
         }
       }
       frontier = next;
     }
 
-    for (const edge of this.#readIncidentEdgesForNodes(db, [...visited])) {
-      if (visited.has(edge.fromNodeId) && visited.has(edge.toNodeId)) {
+    // SINGLE edge-collection pass, AFTER `visited` is final. Hub-aware +
+    // budget-checked, and — because it runs once `visited` cannot grow any
+    // further — every edge it keeps has both endpoints already in `nodes`.
+    const edgeById = new Map<string, ConnectionEdge>();
+    if (visited.size > 0) {
+      await yieldToEventLoop();
+      const visitedIds = [...visited].sort(compareString);
+      const { edges: closureEdges, hubNodeIds: closureHubIds } =
+        await this.#readIncidentEdgesRespectingHubCap(db, visitedIds, hubDegreeCap);
+      if (closureHubIds.size > 0) truncated = true;
+      for (const edge of closureEdges) {
+        if (!(visited.has(edge.fromNodeId) && visited.has(edge.toNodeId))) continue;
+        if (edgeBudget > 0 && edgeById.size >= edgeBudget) {
+          truncated = true;
+          break;
+        }
         edgeById.set(edge.id, edge);
       }
     }
 
-    const nodes = [...this.#readNodesByIds(db, [...visited]).values()];
+    if (truncated) {
+      logResolverSubgraphTruncated({
+        seed: seedNodeIds[0] ?? '',
+        nodes: visited.size,
+        edges: edgeById.size,
+        reason:
+          nodeBudget > 0 && visited.size >= nodeBudget
+            ? 'node-budget'
+            : edgeBudget > 0 && edgeById.size >= edgeBudget
+              ? 'edge-budget'
+              : 'hub-degree-cap',
+      });
+    }
+
+    const nodes = [...(await this.#readNodesByIds(db, [...visited].sort(compareString))).values()];
     return snapshotFromParts(
       metadata,
       sortAlphaById(nodes),
@@ -5752,6 +6042,7 @@ export class SqliteConnectionsStore implements ConnectionsStore {
         ...(options.preserveMetadataCounts === undefined
           ? {}
           : { preserveMetadataCounts: options.preserveMetadataCounts }),
+        ...(truncated ? { truncated: true } : {}),
       },
     );
   }

@@ -305,6 +305,14 @@ export interface ConnectionsSnapshot {
   // similarity corpus this snapshot was built from. Additive stability term
   // for the graph signature: advances only when the corpus content changes.
   readonly similarityCorpusSignature?: string;
+  // PERF (resolver hub-subgraph budgets, 2026-08-16) — set true when a
+  // bounded BFS traversal (SqliteConnectionsStore#readTraversedSubgraphInner)
+  // stopped short of full closure because a node/edge budget or a per-node
+  // hub-degree cap fired (a hub URL's fan-out would otherwise pull thousands
+  // of nodes/edges into one synchronous tick). Absent — never `false` — on
+  // every snapshot that was NOT read through that bounded traversal (full
+  // reads, scoped reads, etc.), matching every other optional field here.
+  readonly truncated?: boolean;
 }
 
 // Helper id minters — exported so the materializer / tests / HTTP
