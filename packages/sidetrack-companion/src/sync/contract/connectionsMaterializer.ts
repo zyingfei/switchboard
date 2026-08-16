@@ -7663,11 +7663,29 @@ export const createConnectionsMaterializer = (
       // rebuild) are excluded — those are the repair tier / explicit
       // consent and must run when asked; everything else structurally
       // never reaches a full rebuild from an operational drain again.
+      // Bootstrap exemption: an EMPTY previous snapshot cannot be "served
+      // stale" into existence — demoting from it starves forever (the heal
+      // recomputes scopes over the empty base, and every heal drain re-bails
+      // at the same gate; caught by timelineRelaySync: a fresh vault whose
+      // first real window mixed workstream.upserted with timeline visits
+      // ended with zero graph nodes on BOTH peers). An empty base with
+      // pending graph events is bootstrap, not a bail — same consent
+      // semantics as cold boot: small vault builds now; a large vault
+      // already went through (or will go through) the needs-repair path.
+      const previousSnapshotEmptyBootstrap =
+        previousSnapshotForScopedDelta !== null &&
+        previousSnapshotForScopedDelta.nodes.length === 0 &&
+        pendingEventsForDrain.length > 0 &&
+        // A large vault whose base is empty got there via a consent refusal
+        // (needs-repair is already marked) — bootstrap must not bypass the
+        // consent gate; it keeps demoting until the user runs the CLI.
+        !(await vaultIsLargeForConsent());
       if (
         !requireScopedTimelineDeltaForDrain &&
         !similarityRecoveryNeedsBaseRebuild &&
         !forceFullRebuildForThreadReconcile &&
         !forceFullRebuildConsented &&
+        !previousSnapshotEmptyBootstrap &&
         previousSnapshotForScopedDelta !== null &&
         replaceScopeRowsForScopedDelta !== undefined
       ) {
@@ -7707,9 +7725,23 @@ export const createConnectionsMaterializer = (
       // replaceScopeRows at all (demotion has nothing to write through).
       // Any OTHER arrival here means a bail slipped past demotion — mark
       // it loudly so it's never a silent full rebuild.
-      if (!baseSnapshotPrebuilt && !demotedThisDrain && !forceFullRebuildConsented) {
+      if (
+        !baseSnapshotPrebuilt &&
+        !demotedThisDrain &&
+        !forceFullRebuildConsented &&
+        !previousSnapshotEmptyBootstrap
+      ) {
         mark(
           `fullRebuildFallback.unexpected reason=${scopedTimelineDeltaSkipDetail} — bail reached the full-rebuild fallback without demotion or consent; see F8 W3`,
+        );
+      }
+      if (previousSnapshotEmptyBootstrap && !demotedThisDrain && !baseSnapshotPrebuilt) {
+        // Legitimate bootstrap tier (empty base, pending events): the build
+        // below IS the first real materialization, same standing as the
+        // first-run cold build. Size consent was already applied at the
+        // cold-boot gate for large vaults.
+        mark(
+          `fullRebuildFallback.bootstrap reason=${scopedTimelineDeltaSkipDetail} pending=${String(pendingEventsForDrain.length)}`,
         );
       }
       if (!baseSnapshotPrebuilt && !demotedThisDrain) {
