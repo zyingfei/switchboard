@@ -91,3 +91,32 @@ deleted by W3 (demotion supersedes it).
 Steady-state week: zero `buildConnectionsSnapshot base` marks outside
 boot-cold-start/recovery/CLI; repairQueueDepth returns to 0 within one
 drain cycle of any enqueue; equivalence suites green in CI.
+
+## W5 — incremental topics (added 2026-08-16, user directive: no global recompute anywhere)
+
+Replace the scheduled global leiden-cpm recompute with a fully
+incremental producer:
+1. Assignment: the existing incremental topic-membership overlay
+   (flag-off today) attaches new visits to existing topics via
+   similarity neighbors — flip on as the primary path.
+2. Structure: local refinement only — on edge/neighborhood change,
+   re-run community optimization on the BOUNDED perturbed subgraph
+   (affected topic ∪ boundary; DynaMo-style local Leiden). Splits and
+   merges emerge locally; a per-topic modularity-degradation trigger
+   bounds quality drift. The global pass is removed from every
+   scheduled path.
+3. Inventory to reuse before building: the overlay, hot-topics/hdbscan
+   dormant candidates, churnP90 metric (acceptance metric: incremental
+   must not exceed the cadence producer's churn), retired union-find's
+   incremental component substrate.
+4. Audits: SAMPLED — random bounded subgraphs recomputed from stores
+   and diffed; per-scope checksums. No full-graph audit.
+
+## Binding rule (supersedes W3's audit clause)
+
+NO operational or scheduled path may construct any artifact by reading
+the log (or store) from the beginning. Full replay survives in exactly
+one place: catastrophic-loss disaster recovery (`connections rebuild`
+CLI), which nothing schedules. W3's offline audit becomes the sampled
+audit of W5.4. Fact-store `rebuildFromJsonl`-style functions are
+recovery-only.
