@@ -120,3 +120,27 @@ one place: catastrophic-loss disaster recovery (`connections rebuild`
 CLI), which nothing schedules. W3's offline audit becomes the sampled
 audit of W5.4. Fact-store `rebuildFromJsonl`-style functions are
 recovery-only.
+
+## Recovery consent rule (added 2026-08-16, user directive)
+
+Catastrophic-loss recovery is USER-INITIATED, never automatic. When the
+system detects a condition whose only remedy is a full replay/rebuild
+(missing/corrupt generation with no successor, lost fact stores on a
+non-empty vault, Layer-0 similarity corruption, materializer version
+bump on a large vault):
+1. DO NOT run the rebuild. Serve degraded (whatever stores remain,
+   serve-stale doctrine) and mark the affected surfaces honestly.
+2. Surface the condition: health tier 'needs-repair' + a side-panel
+   callout naming the exact command to run
+   (`sidetrack-companion connections rebuild --vault <path>`), reusing
+   the existing health/callout surfaces — no new UI concepts.
+3. The CLI performs the replay with a progress report and the same
+   process-lock discipline as compact-engagement (refuses a live
+   companion; the callout tells the user to quit the companion first or
+   the CLI offers --stop-companion).
+Exemption: a genuinely EMPTY/fresh vault (no prior generations, log
+below a small threshold) may build automatically — first-run setup is
+not recovery. Materializer version bumps on a large vault prompt too:
+an upgrade may not silently rewrite hundreds of MB.
+W3 owns implementing the detection→degrade→callout path and removing
+every auto-invocation of full rebuilds from recovery branches.
