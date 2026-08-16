@@ -7791,7 +7791,7 @@ export const createConnectionsMaterializer = (
           `scopedTimelineDelta.demoted reason=${scopedTimelineDeltaSkipDetail} pending=${String(pendingEventsForDrain.length)} dirtyScopes=${String(dirtyScopes.length)} queueDepth=${String(repairQueueFactStore?.depth() ?? -1)}`,
         );
       }
-      if (canAttemptBoundedScopedDelta) {
+      if (canAttemptBoundedScopedDelta && !demotedThisDrain) {
         const readCount = await loadPageEvidenceForEntries(similarityEntries);
         mark(
           `pageEvidence.fullBuildRead records=${String(pageEvidenceByCanonicalUrl.size)} read=${String(readCount)}`,
@@ -7900,6 +7900,7 @@ export const createConnectionsMaterializer = (
                 timelineDays: fullBuildDays,
               });
       }
+      if (!demotedThisDrain) {
       incrementalGraphView.seed(baseSnapshot);
       if (incrementalGraphPlan.pendingEventCount > 0) {
         mark(
@@ -7909,6 +7910,7 @@ export const createConnectionsMaterializer = (
       mark(
         `buildConnectionsSnapshot base nodes=${String(baseSnapshot.nodes.length)} edges=${String(baseSnapshot.edges.length)}`,
       );
+      }
     }
     const scopeIncrementalEnabled =
       !scopedTimelineDeltaApplied &&
