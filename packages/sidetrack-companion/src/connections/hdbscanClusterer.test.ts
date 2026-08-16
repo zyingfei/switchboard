@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 
 import {
   TOPIC_HDBSCAN_REVISION_KEY,
+  TOPIC_INCREMENTAL_REVISION_KEY,
   TOPIC_LEIDEN_CPM_REVISION_KEY,
   TOPIC_REVISION_KEYS,
   TOPIC_SHADOW_IDF_RKN_SPLIT_REVISION_KEY,
@@ -77,6 +78,7 @@ describe('buildHdbscanTopicRevision', () => {
       TOPIC_HDBSCAN_REVISION_KEY,
       TOPIC_SHADOW_IDF_RKN_SPLIT_REVISION_KEY,
       TOPIC_LEIDEN_CPM_REVISION_KEY,
+      TOPIC_INCREMENTAL_REVISION_KEY,
     ]);
     expect(unionFindRevision.algorithmVersion).toBe(TOPIC_UNION_FIND_REVISION_KEY);
     expect(hdbscanRevision.algorithmVersion).toBe(TOPIC_HDBSCAN_REVISION_KEY);

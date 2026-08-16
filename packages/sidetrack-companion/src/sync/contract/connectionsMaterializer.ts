@@ -163,6 +163,7 @@ import {
   DEFAULT_TOPIC_COSINE_THRESHOLD,
   TOPIC_HDBSCAN_REVISION_KEY,
   TOPIC_LEIDEN_CPM_REVISION_KEY,
+  TOPIC_INCREMENTAL_REVISION_KEY,
   TOPIC_SHADOW_IDF_RKN_SPLIT_REVISION_KEY,
   TOPIC_UNION_FIND_REVISION_KEY,
   createTopicRevisionId,
@@ -964,6 +965,14 @@ const topicRevisionBuilderFor = (algorithm: TopicAlgorithmVersion): TopicRevisio
       return buildLeidenCpmTopicRevision;
     case TOPIC_SHADOW_IDF_RKN_SPLIT_REVISION_KEY:
       return buildTopicRevision;
+    case TOPIC_INCREMENTAL_REVISION_KEY:
+      // The incremental producer (W5) has richer dependencies than the
+      // uniform TopicRevisionBuilder signature and uses a bespoke call
+      // site (buildIncrementalTopicRevision — wired in phase B). It must
+      // never be reached through this registry.
+      throw new Error(
+        'incremental topic producer uses a bespoke call site (buildIncrementalTopicRevision), not the builder registry',
+      );
   }
 };
 
