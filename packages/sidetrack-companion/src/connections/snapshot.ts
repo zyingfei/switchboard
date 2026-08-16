@@ -4655,11 +4655,35 @@ export class SqliteConnectionsStore implements ConnectionsStore {
       if (!this.#childWantsWrite) {
         const pub = readPointer(this.#root);
         if (pub !== null && generationExists(this.#root, pub)) {
-          this.#db = new sqlite.Database(generationDbPath(this.#root, pub), { readonly: true });
-          this.#openGenId = pub;
-          this.#seedGenId = pub;
-          this.#openHandleWritable = false;
-          return;
+          try {
+            this.#db = new sqlite.Database(generationDbPath(this.#root, pub), { readonly: true });
+            this.#openGenId = pub;
+            this.#seedGenId = pub;
+            this.#openHandleWritable = false;
+            return;
+          } catch (error) {
+            // TOCTOU: the parent's generation GC can retire `pub` between
+            // readPointer/generationExists and this open (observed live 3x
+            // 2026-08-16 as a bare "unable to open database file" drain
+            // failure). Re-read the pointer once — a publish moved it — and
+            // open the successor; with no successor fall through to the
+            // shadow path exactly as if the gen had been absent up front.
+            const fresh = readPointer(this.#root);
+            if (fresh !== null && fresh !== pub && generationExists(this.#root, fresh)) {
+              this.#db = new sqlite.Database(generationDbPath(this.#root, fresh), {
+                readonly: true,
+              });
+              this.#openGenId = fresh;
+              this.#seedGenId = fresh;
+              this.#openHandleWritable = false;
+              return;
+            }
+            console.warn(
+              `[connections] readonly gen open failed (retired mid-open, no successor): ${generationDbPath(this.#root, pub)} — ${
+                error instanceof Error ? error.message : String(error)
+              }`,
+            );
+          }
         }
       }
       // The child builds into a fresh SHADOW generation cloned from the
@@ -4699,10 +4723,26 @@ export class SqliteConnectionsStore implements ConnectionsStore {
         this.#openHandleWritable = true; // schema-init the placeholder
         return;
       }
-      this.#db = new sqlite.Database(generationDbPath(this.#root, gen), { readonly: true });
-      this.#openGenId = gen;
-      this.#openHandleWritable = false;
-      return;
+      try {
+        this.#db = new sqlite.Database(generationDbPath(this.#root, gen), { readonly: true });
+        this.#openGenId = gen;
+        this.#openHandleWritable = false;
+        return;
+      } catch (error) {
+        // Same TOCTOU as the child-read path: the gen can be retired between
+        // pointer read and open. One pointer re-read; successor or a
+        // path-attributed failure.
+        const fresh = readPointer(this.#root);
+        if (fresh !== null && fresh !== gen && generationExists(this.#root, fresh)) {
+          this.#db = new sqlite.Database(generationDbPath(this.#root, fresh), { readonly: true });
+          this.#openGenId = fresh;
+          this.#openHandleWritable = false;
+          return;
+        }
+        throw new Error(
+          `${error instanceof Error ? error.message : String(error)} (gen db: ${generationDbPath(this.#root, gen)})`,
+        );
+      }
     }
     // single-buffer: one handle both reads + writes through the pointer. Seed a
     // gen0 if none exists so the first write publishes over a known generation.
