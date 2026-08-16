@@ -72,7 +72,7 @@ const writeEvidence = async (
       },
       storageMode: 'indexed_chunks',
     },
-    { embeddingsEnabled: false, rebuildManifestAfterWrite: false },
+    { embeddingsEnabled: false },
   );
 };
 

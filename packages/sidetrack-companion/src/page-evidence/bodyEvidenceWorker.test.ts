@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -19,6 +19,7 @@ import {
 } from './bodyEvidenceQueue.js';
 import {
   embedBacklogCanonicalUrl,
+  ensurePageEvidenceStoreReady,
   readPageEvidence,
   writeExtractedPageEvidenceFast,
 } from './store.js';
@@ -66,18 +67,16 @@ describe('body-evidence worker materialization', () => {
 
   it('reports absent separately from an initialized empty evidence corpus', async () => {
     expect((await readBodyEvidenceCoverage(root)).state).toBe('absent');
-    await mkdir(join(root, '_BAC', 'page-evidence', 'by-url'), { recursive: true });
+    // F5: "initialized but empty" is now "the SQLite store exists with
+    // zero rows" — the twin of the old empty by-url/ directory.
+    await ensurePageEvidenceStoreReady(root);
     expect(await readBodyEvidenceCoverage(root)).toMatchObject({
       state: 'empty',
       bodyEligibleCount: 0,
       bodyCoverageRatio: null,
       vectorCoverageRatio: null,
     });
-    await writeExtractedPageEvidenceFast(
-      root,
-      { ...payloadFor(0), storageMode: 'features_only' },
-      { rebuildManifestAfterWrite: false },
-    );
+    await writeExtractedPageEvidenceFast(root, { ...payloadFor(0), storageMode: 'features_only' });
     const measured = await readBodyEvidenceCoverage(root);
     expect(measured.state).toBe('measured');
     expect(measured.bodyCoverageRatio).toBe(0);
@@ -88,11 +87,10 @@ describe('body-evidence worker materialization', () => {
     const queued: Array<{ readonly jobId: string; readonly payload: PageContentExtractedPayload }> =
       [];
     for (let index = 0; index < 5; index += 1) {
-      await writeExtractedPageEvidenceFast(
-        root,
-        { ...payloadFor(index), storageMode: 'features_only' },
-        { rebuildManifestAfterWrite: false },
-      );
+      await writeExtractedPageEvidenceFast(root, {
+        ...payloadFor(index),
+        storageMode: 'features_only',
+      });
       if (index < 4) {
         await enqueueBodyEvidence(root, payloadFor(index));
         const item = await readCurrentBodyEvidence(root, urlFor(index));

@@ -79,9 +79,7 @@ describe('background-embedding lane store adapters', () => {
       qualitySignals: payload().qualitySignals,
       content: payload().content,
     });
-    const record = await writeExtractedPageEvidenceFast(root, payload(), {
-      rebuildManifestAfterWrite: false,
-    });
+    const record = await writeExtractedPageEvidenceFast(root, payload());
     expect(record.content?.embeddingState).toBe('missing');
 
     const candidates = await listBackgroundEmbeddingCandidates(root);
@@ -103,7 +101,7 @@ describe('background-embedding lane store adapters', () => {
       qualitySignals: payload().qualitySignals,
       content: payload().content,
     });
-    await writeExtractedPageEvidenceFast(root, payload(), { rebuildManifestAfterWrite: false });
+    await writeExtractedPageEvidenceFast(root, payload());
 
     const embedOne = await embedBacklogCanonicalUrl(root);
     const outcome = await embedOne(CANONICAL);
@@ -119,9 +117,7 @@ describe('background-embedding lane store adapters', () => {
   it('embedBacklogCanonicalUrl skips a record with no indexed content payload', async () => {
     // Evidence written features-only (no page-content raw text on disk):
     // the reconstruction returns null, so the lane must skip (not fail).
-    await writeExtractedPageEvidenceFast(root, payload({ storageMode: 'features_only' }), {
-      rebuildManifestAfterWrite: false,
-    });
+    await writeExtractedPageEvidenceFast(root, payload({ storageMode: 'features_only' }));
     const embedOne = await embedBacklogCanonicalUrl(root);
     expect(await embedOne(CANONICAL)).toBe('skipped');
   });
@@ -150,11 +146,7 @@ describe('incremental background-embedding discovery', () => {
   let root: string;
 
   const writeBacklogRecord = async (canonicalUrl: string): Promise<void> => {
-    await writeExtractedPageEvidenceFast(
-      root,
-      payload({ canonicalUrl, url: canonicalUrl }),
-      { rebuildManifestAfterWrite: false },
-    );
+    await writeExtractedPageEvidenceFast(root, payload({ canonicalUrl, url: canonicalUrl }));
   };
 
   beforeEach(async () => {

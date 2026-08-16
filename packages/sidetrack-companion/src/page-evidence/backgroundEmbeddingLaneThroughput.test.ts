@@ -97,7 +97,7 @@ describe('background-embedding lane throughput (warmup-race regression)', () => 
           qualitySignals: req.qualitySignals,
           content: req.content,
         });
-        await writeExtractedPageEvidenceFast(root, req, { rebuildManifestAfterWrite: false });
+        await writeExtractedPageEvidenceFast(root, req);
       }),
     );
   }, 30_000);
