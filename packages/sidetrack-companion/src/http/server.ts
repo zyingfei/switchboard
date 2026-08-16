@@ -9,40 +9,116 @@ import { bridgeKeysMatch, isBridgeKeyAccepted } from '../auth/bridgeKey.js';
 import type { WorkstreamWriteTool } from '../auth/workstreamTrust.js';
 import { SqliteConnectionsStore, type ConnectionsSnapshot } from '../connections/snapshot.js';
 import { createRequestId } from '../domain/ids.js';
-import { ENTITY_CONTENT_ENRICHED, gistLookupFromMerged, lookupGist, type GistLookup } from '../enrichment/contentEnrichment.js';
+import {
+  ENTITY_CONTENT_ENRICHED,
+  gistLookupFromMerged,
+  lookupGist,
+  type GistLookup,
+} from '../enrichment/contentEnrichment.js';
 import { ENTITY_ENRICHMENT_RETRACTED } from '../enrichment/events.js';
-import { ENTITY_TITLE_ENRICHED, enrichmentLookupFromMerged, lookupSynthesizedTitle, type EnrichmentLookup } from '../enrichment/titleEnrichment.js';
-import { USER_FLOW_REJECTED, USER_ORGANIZED_ITEM, isUserOrganizedItemPayload } from '../feedback/events.js';
+import {
+  ENTITY_TITLE_ENRICHED,
+  enrichmentLookupFromMerged,
+  lookupSynthesizedTitle,
+  type EnrichmentLookup,
+} from '../enrichment/titleEnrichment.js';
+import {
+  USER_FLOW_REJECTED,
+  USER_ORGANIZED_ITEM,
+  isUserOrganizedItemPayload,
+} from '../feedback/events.js';
 import { listPageEvidenceRecords } from '../page-evidence/store.js';
 import { createEmbeddingCache, embedTextHash } from '../recall/embeddingCache.js';
 import { RECALL_MODEL } from '../recall/modelManifest.js';
 import { VECTOR_CORPUS_MODEL_KEY } from '../recall/vectorCorpus.js';
 import { getOrBuildSemanticRecallPool } from '../recall/semanticRecallPool.js';
 import { yieldToEventLoop } from '../runtime/eventLoopYield.js';
-import { completeInflight, registerInflight, routeLabelFromPattern } from '../runtime/inflightRegistry.js';
+import {
+  completeInflight,
+  registerInflight,
+  routeLabelFromPattern,
+} from '../runtime/inflightRegistry.js';
 import type { AcceptedEvent } from '../sync/causal.js';
-import { appendAiLane, appendContentLane, contentLaneEnabled, type AppendContentLaneDeps, type ContentLaneStore } from '../tabsession/contentLane.js';
+import {
+  appendAiLane,
+  appendContentLane,
+  contentLaneEnabled,
+  type AppendContentLaneDeps,
+  type ContentLaneStore,
+} from '../tabsession/contentLane.js';
 import { declineMemoryFromMerged, type DeclineLookup } from '../tabsession/declineMemory.js';
 import { guessLanesEnabled } from '../tabsession/guessLanes.js';
-import { applyLaneCorroboration, laneCorroborationEnabled } from '../tabsession/laneCorroboration.js';
+import {
+  applyLaneCorroboration,
+  laneCorroborationEnabled,
+} from '../tabsession/laneCorroboration.js';
 import { applyLaneFallbackGuess } from '../tabsession/laneFallback.js';
-import { laneOpportunityIdFor, lanePrequentialSummary, recordLanePredictions, type LanePredictionInput, type LanePrequentialSummary } from '../tabsession/lanePrequential.js';
+import {
+  laneOpportunityIdFor,
+  lanePrequentialSummary,
+  recordLanePredictions,
+  type LanePredictionInput,
+  type LanePrequentialSummary,
+} from '../tabsession/lanePrequential.js';
+import {
+  appendPrototypeLane,
+  type AppendPrototypeLaneDeps,
+  type PrototypeLaneStore,
+} from '../tabsession/prototypeLane.js';
 import type { UrlResolutionResult } from '../tabsession/resolver.js';
 import { BROWSER_TIMELINE_OBSERVED } from '../timeline/events.js';
 import { boundArgsSummary, runWithAuditContext, type AuditContext } from '../vault/auditContext.js';
-import { CodingAttachTokenInvalidError, CodingSessionNotFoundError, SettingsRevisionConflictError } from '../vault/writer.js';
+import {
+  CodingAttachTokenInvalidError,
+  CodingSessionNotFoundError,
+  SettingsRevisionConflictError,
+} from '../vault/writer.js';
 import { VaultExportConfinementError, VaultUnavailableError } from './errors.js';
 import { isModelHostPath, serveModelFile } from './modelHostRoute.js';
 import { createProblem, type ValidationIssue } from './problem.js';
-import { queueResolverCacheWrite, resolverCacheDeferEnabled, scheduleResolverCacheFlush } from './resolverCacheDefer.js';
+import {
+  queueResolverCacheWrite,
+  resolverCacheDeferEnabled,
+  scheduleResolverCacheFlush,
+} from './resolverCacheDefer.js';
 import { scheduleReverseShadowFlush } from '../attribution-v1/reverseShadowDefer.js';
 
-import { HttpRouteError, RESOLVER_SIGNAL_EVENT_TYPES, acquireResolveSlot, callerIdentities, callerIdentityFor, connectionsGraphSig, domainTombstoneSetFor, eventReadCoverageSig, eventStoreForContext, objectRecord, readBody, readEventsFromStoreOrLog, releaseResolveSlot, requireVaultRoot, resolveSwrCache } from './routeSupport.js';
-import type { CallerIdentity, CompanionHttpConfig, HttpMethod, RouteDefinition } from './routeSupport.js';
+import {
+  HttpRouteError,
+  RESOLVER_SIGNAL_EVENT_TYPES,
+  acquireResolveSlot,
+  callerIdentities,
+  callerIdentityFor,
+  connectionsGraphSig,
+  domainTombstoneSetFor,
+  eventReadCoverageSig,
+  eventStoreForContext,
+  objectRecord,
+  readBody,
+  readEventsFromStoreOrLog,
+  releaseResolveSlot,
+  requireVaultRoot,
+  resolveSwrCache,
+} from './routeSupport.js';
+import type {
+  CallerIdentity,
+  CompanionHttpConfig,
+  HttpMethod,
+  RouteDefinition,
+} from './routeSupport.js';
 import { urlWorkstreamLookupFromProjection } from './routes/entitiesRoutes.js';
 import { isPrivacyEventType } from './routes/privacyRoutes.js';
 import { loadEmbedderModule } from './routes/recallRoutes.js';
-import { RESOLVER_EXPAND_EVENT_TYPES, armedResolveSig, eventCandidateCacheRevision, resolverCacheRevision, resolverExpandedCandidateUrlsForCanonicalUrls, resolverSignalEventsForCanonicalUrls, resolverSignalEventsForCanonicalUrlsIndexed, resolverTimelineEventsForCanonicalUrlsIndexed } from './routes/visitsRoutes.js';
+import {
+  RESOLVER_EXPAND_EVENT_TYPES,
+  armedResolveSig,
+  eventCandidateCacheRevision,
+  resolverCacheRevision,
+  resolverExpandedCandidateUrlsForCanonicalUrls,
+  resolverSignalEventsForCanonicalUrls,
+  resolverSignalEventsForCanonicalUrlsIndexed,
+  resolverTimelineEventsForCanonicalUrlsIndexed,
+} from './routes/visitsRoutes.js';
 
 import { systemRoutesA, systemRoutesB, systemRoutesC } from './routes/systemRoutes.js';
 import { privacyRoutes } from './routes/privacyRoutes.js';
@@ -220,8 +296,8 @@ const fnv1a64Hex = (input: string): string => {
   }
   // 16 hex chars: 8 from high half, 8 from low half. Right-shift then
   // zero-pad to keep the same width regardless of leading zeros.
-  const hiHex = ((hi >>> 0).toString(16)).padStart(8, '0');
-  const loHex = ((lo >>> 0).toString(16)).padStart(8, '0');
+  const hiHex = (hi >>> 0).toString(16).padStart(8, '0');
+  const loHex = (lo >>> 0).toString(16).padStart(8, '0');
   return `${hiHex}${loHex}`;
 };
 
@@ -447,22 +523,24 @@ const setCallerIdentity = (request: IncomingMessage, identity: CallerIdentity): 
 // (POST /v1/workstreams). Trust management (PUT/GET /trust), DELETE/PATCH
 // workstream, PATCH settings, export, and annotation writes are NOT
 // sanctioned MCP operations → they fall through to the default-deny.
-const MCP_ALLOWED_MUTATING_ROUTES: readonly { readonly method: HttpMethod; readonly pattern: RegExp }[] =
-  [
-    // threads.move — a thread upsert that (re)assigns primaryWorkstreamId.
-    { method: 'POST', pattern: /^\/v1\/threads$/ },
-    // threads.archive / threads.unarchive.
-    { method: 'POST', pattern: /^\/v1\/threads\/[A-Za-z0-9_-]+\/archive$/ },
-    { method: 'POST', pattern: /^\/v1\/threads\/[A-Za-z0-9_-]+\/unarchive$/ },
-    // queue.create.
-    { method: 'POST', pattern: /^\/v1\/queue$/ },
-    // workstreams.bump.
-    { method: 'POST', pattern: /^\/v1\/workstreams\/[A-Za-z0-9_-]+\/bump$/ },
-    // workstreams.create (child create is trust-gated on the parent inside
-    // the handler; a top-level create passes trust but is still a
-    // sanctioned tool, so it is allowed here).
-    { method: 'POST', pattern: /^\/v1\/workstreams$/ },
-  ];
+const MCP_ALLOWED_MUTATING_ROUTES: readonly {
+  readonly method: HttpMethod;
+  readonly pattern: RegExp;
+}[] = [
+  // threads.move — a thread upsert that (re)assigns primaryWorkstreamId.
+  { method: 'POST', pattern: /^\/v1\/threads$/ },
+  // threads.archive / threads.unarchive.
+  { method: 'POST', pattern: /^\/v1\/threads\/[A-Za-z0-9_-]+\/archive$/ },
+  { method: 'POST', pattern: /^\/v1\/threads\/[A-Za-z0-9_-]+\/unarchive$/ },
+  // queue.create.
+  { method: 'POST', pattern: /^\/v1\/queue$/ },
+  // workstreams.bump.
+  { method: 'POST', pattern: /^\/v1\/workstreams\/[A-Za-z0-9_-]+\/bump$/ },
+  // workstreams.create (child create is trust-gated on the parent inside
+  // the handler; a top-level create passes trust but is still a
+  // sanctioned tool, so it is allowed here).
+  { method: 'POST', pattern: /^\/v1\/workstreams$/ },
+];
 
 const MUTATING_METHODS: ReadonlySet<string> = new Set(['POST', 'PUT', 'PATCH', 'DELETE']);
 
@@ -582,10 +660,10 @@ const buildContentLaneDeps = async (
   const embed = embedderUsable
     ? async (text: string): Promise<Float32Array | undefined> => {
         try {
-          const cached = await createEmbeddingCache(
-            vaultRoot,
-            RECALL_MODEL.embeddingDim,
-          ).getMany(VECTOR_CORPUS_MODEL_KEY, [embedTextHash(text)]);
+          const cached = await createEmbeddingCache(vaultRoot, RECALL_MODEL.embeddingDim).getMany(
+            VECTOR_CORPUS_MODEL_KEY,
+            [embedTextHash(text)],
+          );
           const hit = cached.get(embedTextHash(text));
           if (hit !== undefined) return hit;
         } catch {
@@ -914,6 +992,24 @@ const memoizedJoinSnapshot = async (
 // idempotent no-ops when their flags are off or `lanes` is absent, so this
 // function degrades exactly the way the two inline copies it replaces
 // already did.
+// Prototype-lane (guess lane 9) deps, DERIVED from the content-lane deps
+// rather than assembled independently — the underlying store handle, embed
+// fn and embedder-usable flag are the SAME already-open /v2 recall store the
+// content/AI lanes use (see recall-v2/store/sqlite.ts: prototype_vec lives
+// in the same database as docs_vec). Casting `store` to the narrower
+// PrototypeLaneStore shape is safe: the concrete SqliteRecallStore
+// implements both, and the cast is exactly the ContentLaneStore precedent
+// (peekRecallV2Store returns RecallStore; call sites narrow to the subset
+// they need). No second store handle is opened.
+const prototypeLaneDepsFromContent = (
+  contentDeps: AppendContentLaneDeps,
+): AppendPrototypeLaneDeps => ({
+  store: contentDeps.store as unknown as PrototypeLaneStore | undefined,
+  ...(contentDeps.embed === undefined ? {} : { embed: contentDeps.embed }),
+  embedderUsable: contentDeps.embedderUsable,
+  guessLanesEnabled: contentDeps.guessLanesEnabled,
+});
+
 const finalizeBatchResolveResults = async (
   results: Record<string, UrlResolutionResult>,
   urls: readonly string[],
@@ -924,6 +1020,7 @@ const finalizeBatchResolveResults = async (
   synthesizedTitleFor: (canonicalUrl: string) => string | undefined,
   gistFor: (canonicalUrl: string) => string | undefined,
 ): Promise<void> => {
+  const prototypeDeps = prototypeLaneDepsFromContent(contentDeps);
   for (const canonicalUrl of urls) {
     // Two lanes per URL now (content + ai), each a vector KNN plus an FTS
     // query plus a workstream join — all synchronous sqlite. This loop runs
@@ -952,6 +1049,18 @@ const finalizeBatchResolveResults = async (
       results[canonicalUrl]!,
       { canonicalUrl, snapshot: joinSnapshot, title, gist },
       contentDeps,
+    );
+    // PHASE BREAK: lane 8 -> lane 9. Same discipline as the break above —
+    // the prototype lane is a single KNN + O(hits) group-by, cheap, but the
+    // break keeps this loop's per-URL cost from compounding into one
+    // uninterruptible tick across a whole batch.
+    await yieldToEventLoop();
+    // Lane 9 — pure vector match against offline-generated prototypes. NO
+    // LLM call on this path (see prototypeLane.ts's header).
+    results[canonicalUrl] = await appendPrototypeLane(
+      results[canonicalUrl]!,
+      { title, gist },
+      prototypeDeps,
     );
     // The decision layer over the lanes just appended: the corroboration
     // promotion (flagged OFF by default) and the lane-fallback guess, both
@@ -1141,7 +1250,9 @@ export const routes: readonly RouteDefinition[] = [
       const gistFor = (canonicalUrl: string): string | undefined =>
         lookupGist(gistLookup, 'url', canonicalUrl);
       const sqliteStore =
-        context.connectionsStore instanceof SqliteConnectionsStore ? context.connectionsStore : null;
+        context.connectionsStore instanceof SqliteConnectionsStore
+          ? context.connectionsStore
+          : null;
       if (sqliteStore !== null) {
         const metadata = await sqliteStore.readSnapshotMetadata();
         if (metadata === null) {
@@ -1371,10 +1482,7 @@ export const routes: readonly RouteDefinition[] = [
         const missedSnapshot =
           misses.length === 0
             ? null
-            : await sqliteStore.readResolverSubgraphForUrls([
-                ...misses,
-                ...expandedCandidateUrls,
-              ]);
+            : await sqliteStore.readResolverSubgraphForUrls([...misses, ...expandedCandidateUrls]);
         if (misses.length > 0 && missedSnapshot === null) {
           throw new HttpRouteError(
             409,
@@ -1778,8 +1886,7 @@ export const handleRequest = async (
       bridgeKeysMatch(context.mcpBridgeKey, actualKey);
     const accepted =
       typeof actualKey === 'string' &&
-      (isMcpKey ||
-        (await isBridgeKeyAccepted(context.vaultRoot, context.bridgeKey, actualKey)));
+      (isMcpKey || (await isBridgeKeyAccepted(context.vaultRoot, context.bridgeKey, actualKey)));
     if (!accepted) {
       sendJson(
         response,

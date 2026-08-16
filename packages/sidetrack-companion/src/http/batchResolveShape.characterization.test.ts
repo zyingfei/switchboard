@@ -14,8 +14,8 @@
 // stall fix. `lanes` gets its own assertion beyond plain key presence
 // because its order is ALSO contractual: SIDETRACK_GUESS_LANES documents
 // "ALWAYS all six lanes in the fixed GUESS_LANE_ORDER" for the base lanes,
-// plus the two query-time additions (content = lane 7, ai = lane 8)
-// appended after — the panel's lane-disclosure UI renders lanes
+// plus the query-time additions (content = lane 7, ai = lane 8, prototype =
+// lane 9) appended after — the panel's lane-disclosure UI renders lanes
 // positionally, so a reorder is a silent UI bug, not a crash.
 //
 // The literal lists below are GENERATED, not hand-typed: booted the same
@@ -178,6 +178,7 @@ describe('POST /v1/visits/batch-resolve shape characterization (stage S1 pin)', 
       'recency',
       'content',
       'ai',
+      'prototype',
     ]);
   });
 });

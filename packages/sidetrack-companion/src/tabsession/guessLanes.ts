@@ -62,7 +62,20 @@ export type GuessLane =
   // of this page point?", and the difference between them is exactly the
   // AI's marginal contribution. Present only when a gist exists; typed-empty
   // (with the reason) otherwise, never silently absent.
-  | 'ai';
+  | 'ai'
+  // Lane 9 (additive, FROZEN CONTRACT). The prototype lane — pure vector KNN
+  // of the page's query embedding against OFFLINE, per-workstream generated
+  // prototype texts (docs/plans/2026-08-16-category-flexibility-hyde.md §3).
+  // Computed OUTSIDE buildGuessLanes (async, needs the recall store handle),
+  // same append-after-the-fact shape as 'content'/'ai' — see
+  // tabsession/prototypeLane.ts. NO LLM call at serve time: generation is
+  // entirely offline/background; this lane only ever compares vectors.
+  // Typed-empty when no prototype has been generated yet for any workstream,
+  // or the recall store is unavailable. Disclosure only: zero effect on
+  // fusion/policy in this PR (see laneCorroboration.ts / laneFallback.ts,
+  // both of which hardcode their lane set to ['content','ai'] and are
+  // structurally unable to read this lane's opinion).
+  | 'prototype';
 
 export interface GuessLaneCandidate {
   readonly workstreamId: string;
@@ -131,7 +144,10 @@ const topN = (
     .slice(0, n);
 
 // A populated lane (candidates present, never an emptyReason).
-const populated = (lane: GuessLane, candidates: readonly GuessLaneCandidate[]): GuessLaneResult => ({
+const populated = (
+  lane: GuessLane,
+  candidates: readonly GuessLaneCandidate[],
+): GuessLaneResult => ({
   lane,
   candidates: topN(candidates, MAX_LANE_CANDIDATES),
 });
@@ -327,10 +343,7 @@ const recencyAge = (ageMs: number): string => {
   }
   return `last active ${String(Math.round(ageMs / DAY_MS))}d ago`;
 };
-const recencyLane = (
-  signals: GuessLaneVoteSignals,
-  nowMs: number,
-): GuessLaneResult => {
+const recencyLane = (signals: GuessLaneVoteSignals, nowMs: number): GuessLaneResult => {
   if (signals.state === null) {
     return empty('recency', 'no attribution state loaded');
   }
@@ -362,8 +375,11 @@ export interface BuildGuessLanesInput {
 // traversal — reads the already-computed evidence + vote signals. Every lane is
 // present; empty lanes carry an emptyReason, populated lanes never do.
 export const buildGuessLanes = (input: BuildGuessLanesInput): readonly GuessLaneResult[] => {
-  const votes: GuessLaneVoteSignals =
-    input.voteSignals ?? { state: null, title: null, domain: null };
+  const votes: GuessLaneVoteSignals = input.voteSignals ?? {
+    state: null,
+    title: null,
+    domain: null,
+  };
   const nowMs = input.nowMs ?? Date.now();
   return [
     graphLane(input.candidateEvidence),

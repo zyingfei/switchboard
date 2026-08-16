@@ -71,7 +71,11 @@ import { BROWSER_TIMELINE_OBSERVED } from '../../timeline/events.js';
 import { TAB_SESSION_ATTRIBUTION_INFERRED } from '../../tabsession/events.js';
 import { URL_ATTRIBUTION_INFERRED, URL_IGNORED } from '../../urls/events.js';
 import { VISUAL_FINGERPRINT_OBSERVED } from '../../visual/events.js';
-import { WORKSTREAM_DELETED, WORKSTREAM_UPSERTED } from '../../workstreams/events.js';
+import {
+  WORKSTREAM_DELETED,
+  WORKSTREAM_PROTOTYPE_GENERATED,
+  WORKSTREAM_UPSERTED,
+} from '../../workstreams/events.js';
 
 export type StateClass =
   | 'aggregate-projection' // A
@@ -380,6 +384,28 @@ export const CONTRACT_REGISTRY: readonly ContractEntry[] = [
   // is replay-event-log (fold is a pure function of the event stream).
   {
     eventType: ENTITY_CONTENT_ENRICHED,
+    currentPayloadVersion: 1,
+    surfaces: [
+      {
+        surface: 'recall-index',
+        class: 'derived-cache',
+        materializer: 'recall',
+        peerFreshnessMs: 30_000,
+        recovery: 'replay-event-log',
+      },
+    ],
+  },
+  // Prototype-lane offline generation — workstream.prototype.generated
+  // (docs/plans/2026-08-16-category-flexibility-hyde.md §3, Phase 2). One
+  // event per generated/selected prototype text; the derived surface is the
+  // recall-v2 sqlite store's prototype_vec table (same file as docs_vec),
+  // built by re-embedding the persisted `generatedText` — a pure fold, no
+  // re-invocation of the generation engine. Routes to the 'recall'
+  // materializer for the same reason ENTITY_CONTENT_ENRICHED does: it lives
+  // in the same store and re-drives the same serve path (here, the
+  // 'prototype' guess lane's KNN). Recovery is replay-event-log.
+  {
+    eventType: WORKSTREAM_PROTOTYPE_GENERATED,
     currentPayloadVersion: 1,
     surfaces: [
       {
