@@ -70,6 +70,8 @@ import {
 import { ensurePageContentStoreReady } from '../page-content/store.js';
 import {
   createBackgroundEmbeddingLane,
+  DEFAULT_BACKGROUND_EMBEDDING_CONFIG,
+  resolveEmbedBatchCapFromEnv,
   type BackgroundEmbeddingLaneHealth,
 } from '../page-evidence/backgroundEmbeddingLane.js';
 import {
@@ -107,6 +109,7 @@ import { applyGcPlan, buildGcPlan } from '../gc/plan.js';
 import { sweepOrphanGenerations } from '../connections/generationBuffer.js';
 import { schedulePrototypeGenerationLoop } from '../workstreams/prototypeGeneration.js';
 import { scheduleSuggestionRecomputeLoop } from '../workstreams/suggestionRecomputeLane.js';
+import { scheduleKeywordBackfillLoop } from '../enrichment/keywordBackfillLane.js';
 import { createVaultWatcher, type VaultChangeEvent, type VaultWatcher } from '../vault/watcher.js';
 import { createVaultWriter } from '../vault/writer.js';
 import { COMPANION_VERSION } from '../version.js';
@@ -769,6 +772,22 @@ export const startCompanion = async (
     );
     teardown.push(disposeSuggestionRecompute);
 
+    // Keyword-index backfill (2026-08-16 gap fix — enrichment/
+    // keywordBackfillLane.ts's createKeywordBackfillLane had ZERO production
+    // callers: keyword-index.db/keyword-concepts.db were confirmed EMPTY on
+    // the live vault, starving the suggestion-recompute lane above of the
+    // keyword features recomputeSuggestionCandidates joins against. Same
+    // non-blocking shape as scheduleSuggestionRecomputeLoop: opens its OWN
+    // keyword-index/concept-store handles after a short startup delay
+    // (never blocks boot), and the lane's own self-scheduling loop (backlog-
+    // aware fast/idle cadence) takes over from there. Env-gated
+    // (SIDETRACK_KEYWORD_BACKFILL, default ON); the returned disposer is
+    // BOTH pushed to teardown[] (startup-failure rollback) and captured so
+    // close() can stop it explicitly pre-drain, below (#374 lane-stop
+    // discipline).
+    const disposeKeywordBackfill = scheduleKeywordBackfillLoop(baseEventLog, options.vaultPath);
+    teardown.push(disposeKeywordBackfill);
+
     // Reproject on startup if the projector logic has changed since
     // the last run. Writes a `_BAC/.projector-version` sentinel so
     // subsequent startups are no-ops. Recovers from:
@@ -1297,24 +1316,34 @@ export const startCompanion = async (
       const candidateSource = createIncrementalBackgroundEmbeddingCandidateSource(
         options.vaultPath,
       );
-      const backgroundEmbeddingLane = createBackgroundEmbeddingLane({
-        listCandidates: candidateSource.listCandidates,
-        embedCanonicalUrl: embedOne,
-        isDrainActive: () => connectionsMaterializer.isDrainActive(),
-        // WARMUP GATE: do no embed work (and burn no attempts) until the
-        // embedder child has warmed. Before this, the lane's first cycles
-        // fired embeds against a cold child → 'failed' → permanent
-        // quarantine of the whole backlog (the 90-min soak inertness).
-        // embedderClient is non-null here (the lane is gated on
-        // useChildProcesses), but stay defensive.
-        isEmbedderReady: () => embedderClient?.isReady() ?? false,
-        isTombstoned: (page) => pageEvidenceTombstoneSet.matchesPage(page),
-        onEmbedded: (canonicalUrl) =>
-          connectionsMaterializer.requalifyVisitForSimilarity(canonicalUrl),
-        readProgress: () => readBackgroundEmbeddingProgress(options.vaultPath),
-        writeProgress: (progress) => writeBackgroundEmbeddingProgress(options.vaultPath, progress),
-        log: (message) => process.stdout.write(`${message}\n`),
-      });
+      // SIDETRACK_EMBED_BATCH overrides the per-cycle visit cap (default 16
+      // — see resolveEmbedBatchCapFromEnv's doc comment for why this is
+      // safe now that the embed cache writes O(batch), not O(cache-size),
+      // per record). Bad/blank/out-of-range values degrade to the default
+      // rather than failing boot.
+      const embedBatchCap = resolveEmbedBatchCapFromEnv(process.env['SIDETRACK_EMBED_BATCH']);
+      const backgroundEmbeddingLane = createBackgroundEmbeddingLane(
+        {
+          listCandidates: candidateSource.listCandidates,
+          embedCanonicalUrl: embedOne,
+          isDrainActive: () => connectionsMaterializer.isDrainActive(),
+          // WARMUP GATE: do no embed work (and burn no attempts) until the
+          // embedder child has warmed. Before this, the lane's first cycles
+          // fired embeds against a cold child → 'failed' → permanent
+          // quarantine of the whole backlog (the 90-min soak inertness).
+          // embedderClient is non-null here (the lane is gated on
+          // useChildProcesses), but stay defensive.
+          isEmbedderReady: () => embedderClient?.isReady() ?? false,
+          isTombstoned: (page) => pageEvidenceTombstoneSet.matchesPage(page),
+          onEmbedded: (canonicalUrl) =>
+            connectionsMaterializer.requalifyVisitForSimilarity(canonicalUrl),
+          readProgress: () => readBackgroundEmbeddingProgress(options.vaultPath),
+          writeProgress: (progress) =>
+            writeBackgroundEmbeddingProgress(options.vaultPath, progress),
+          log: (message) => process.stdout.write(`${message}\n`),
+        },
+        { ...DEFAULT_BACKGROUND_EMBEDDING_CONFIG, batchCap: embedBatchCap },
+      );
       // Expose the lane's health snapshot to /v1/status so an inert lane
       // is VISIBLE within minutes instead of a 90-min silent stall.
       backgroundEmbeddingLaneHealth = backgroundEmbeddingLane.health;
@@ -1886,6 +1915,13 @@ export const startCompanion = async (
         // The event producers — MUST be stopped before awaitIdle() below.
         stopBodyEvidenceLane?.();
         stopBackgroundEmbeddingLane?.();
+        // Not an event-log-appending lane (writes to its own keyword-index/
+        // concept-store SQLite handles, never eventLog.append*) — so it
+        // cannot itself cause the SIGTERM-hang awaitIdle() failure mode this
+        // block exists for. Stopped explicitly anyway (#374 lane-stop
+        // discipline): a lane left ticking past close() is still a live
+        // timer + live SQLite handles outliving the "shut down" process.
+        disposeKeywordBackfill();
         if (collectorFramework !== null) {
           try {
             await collectorFramework.close();

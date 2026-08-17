@@ -2895,3 +2895,731 @@ describe('Inbound read semantics', () => {
     ).not.toBeInTheDocument();
   });
 });
+
+// Main-card membership chips (docs/plans/2026-08-16-category-flexibility-
+// hyde.md §9 addendum) — PR #384 wired MembershipChips into Inbox/timeline
+// item cards + the WorkstreamPicker + WorkstreamDetailPanel, but never the
+// primary focused-page ("Now") card, which is where the user actually
+// looks. These tests pin the Now card's own wiring: the batched overlay
+// renders chips + an always-visible add affordance, add/remove POST through
+// the SAME #384 membership routes InboxCard uses, and a never-loaded
+// overlay renders an honest fallback instead of a silent empty state.
+describe('main-card membership chips', () => {
+  const FILED_URL = 'https://duckdb.org/2026/05/12/quack-remote-protocol';
+
+  const emptyTabSessionMocks = (fetchHandlers: {
+    readonly [pattern: string]: () => Promise<{
+      readonly ok: boolean;
+      readonly status: number;
+      readonly json?: () => Promise<unknown>;
+      readonly text?: () => Promise<string>;
+    }>;
+  }) =>
+    vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.includes('/v1/tabsessions/projection')) {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({ data: { schemaVersion: 1, bySessionId: {}, openSessionsByTabId: {} } }),
+        };
+      }
+      if (url.includes('/v1/tabsessions/inbox')) {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({ data: { items: [], total: 0, limit: 51, offset: 0 } }),
+        };
+      }
+      for (const [pattern, handler] of Object.entries(fetchHandlers)) {
+        if (url.includes(pattern)) return handler();
+      }
+      return { ok: false, status: 404, text: async () => 'not found' };
+    });
+
+  it('renders "Also in:" secondary chips on the Now card for a page with backfilled memberships', async () => {
+    installChromeMock(
+      { ...liveState(), companionStatus: 'connected', activeTabUrl: FILED_URL },
+      { [SETUP_COMPLETED_KEY]: true },
+    );
+    const urlProjection = {
+      schemaVersion: 1,
+      byCanonicalUrl: {
+        [FILED_URL]: {
+          canonicalUrl: FILED_URL,
+          firstSeenAt: NOW,
+          lastSeenAt: NOW,
+          visitCount: 3,
+          tabSessionIds: [],
+          latestUrl: FILED_URL,
+          latestTitle: 'Quack Remote Protocol',
+          currentAttribution: {
+            workstreamId: 'bac_workstream_root',
+            source: 'user_asserted',
+            observedAt: NOW,
+            clientEventId: 'evt-primary',
+          },
+          attributionHistory: [],
+          memberships: [
+            {
+              workstreamId: 'bac_workstream_root',
+              role: 'primary',
+              provenance: 'user-filed',
+              acceptedAtMs: 1,
+            },
+            {
+              workstreamId: 'bac_workstream_sibling',
+              role: 'secondary',
+              provenance: 'user-filed',
+              acceptedAtMs: 2,
+            },
+          ],
+        },
+      },
+    };
+    vi.stubGlobal(
+      'fetch',
+      emptyTabSessionMocks({
+        '/v1/visits/projection': async () => ({
+          ok: true,
+          status: 200,
+          json: async () => ({ data: urlProjection }),
+        }),
+        '/v1/visits/inbox': async () => ({
+          ok: true,
+          status: 200,
+          json: async () => ({ data: { items: [], total: 0, limit: 51, offset: 0 } }),
+        }),
+      }),
+    );
+
+    render(<App />);
+    await goToTab('Now');
+    const card = await screen.findByTestId('focused-tab-attribution');
+    await within(card).findByText('Quack Remote Protocol');
+
+    expect(within(card).getByText('Also in:')).toBeInTheDocument();
+    expect(within(card).getByText('Sibling')).toBeInTheDocument();
+    expect(
+      within(card).getByRole('button', { name: 'Add to another workstream' }),
+    ).toBeInTheDocument();
+  });
+
+  it('add flow: "+" opens the picker and POSTs a secondary membership for the focused (unfiled) page', async () => {
+    installChromeMock(
+      { ...liveState(), companionStatus: 'connected', activeTabUrl: FILED_URL },
+      { [SETUP_COMPLETED_KEY]: true },
+    );
+    const urlProjection = {
+      schemaVersion: 1,
+      byCanonicalUrl: {
+        [FILED_URL]: {
+          canonicalUrl: FILED_URL,
+          firstSeenAt: NOW,
+          lastSeenAt: NOW,
+          visitCount: 1,
+          tabSessionIds: [],
+          latestUrl: FILED_URL,
+          latestTitle: 'Quack Remote Protocol',
+          attributionHistory: [],
+        },
+      },
+    };
+    const fetchMock = emptyTabSessionMocks({
+      '/v1/visits/projection': async () => ({
+        ok: true,
+        status: 200,
+        json: async () => ({ data: urlProjection }),
+      }),
+      '/v1/visits/inbox': async () => ({
+        ok: true,
+        status: 200,
+        json: async () => ({ data: { items: [], total: 0, limit: 51, offset: 0 } }),
+      }),
+      '/memberships': async () => ({ ok: true, status: 201, json: async () => ({ data: {} }) }),
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    render(<App />);
+    await goToTab('Now');
+    const card = await screen.findByTestId('focused-tab-attribution');
+    await within(card).findByText('Quack Remote Protocol');
+    expect(within(card).queryByText('Also in:')).not.toBeInTheDocument();
+
+    fireEvent.click(within(card).getByRole('button', { name: 'Add to another workstream' }));
+    fireEvent.click(await screen.findByRole('button', { name: /^Sibling/ }));
+
+    await waitFor(() => {
+      expect(fetchMock).toHaveBeenCalledWith(
+        `http://127.0.0.1:17373/v1/visits/${encodeURIComponent(FILED_URL)}/memberships`,
+        expect.objectContaining({
+          method: 'POST',
+          body: JSON.stringify({ workstreamId: 'bac_workstream_sibling' }),
+        }),
+      );
+    });
+  });
+
+  it('remove flow: a secondary chip\'s "×" POSTs a remove for that workstream only', async () => {
+    installChromeMock(
+      { ...liveState(), companionStatus: 'connected', activeTabUrl: FILED_URL },
+      { [SETUP_COMPLETED_KEY]: true },
+    );
+    const urlProjection = {
+      schemaVersion: 1,
+      byCanonicalUrl: {
+        [FILED_URL]: {
+          canonicalUrl: FILED_URL,
+          firstSeenAt: NOW,
+          lastSeenAt: NOW,
+          visitCount: 1,
+          tabSessionIds: [],
+          latestUrl: FILED_URL,
+          latestTitle: 'Quack Remote Protocol',
+          currentAttribution: {
+            workstreamId: 'bac_workstream_root',
+            source: 'user_asserted',
+            observedAt: NOW,
+            clientEventId: 'evt-primary',
+          },
+          attributionHistory: [],
+          memberships: [
+            {
+              workstreamId: 'bac_workstream_root',
+              role: 'primary',
+              provenance: 'user-filed',
+              acceptedAtMs: 1,
+            },
+            {
+              workstreamId: 'bac_workstream_sibling',
+              role: 'secondary',
+              provenance: 'user-filed',
+              acceptedAtMs: 2,
+            },
+          ],
+        },
+      },
+    };
+    const fetchMock = emptyTabSessionMocks({
+      '/v1/visits/projection': async () => ({
+        ok: true,
+        status: 200,
+        json: async () => ({ data: urlProjection }),
+      }),
+      '/v1/visits/inbox': async () => ({
+        ok: true,
+        status: 200,
+        json: async () => ({ data: { items: [], total: 0, limit: 51, offset: 0 } }),
+      }),
+      '/memberships/': async () => ({ ok: true, status: 200, json: async () => ({ data: {} }) }),
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    render(<App />);
+    await goToTab('Now');
+    const card = await screen.findByTestId('focused-tab-attribution');
+    await within(card).findByText('Sibling');
+
+    fireEvent.click(within(card).getByRole('button', { name: 'Remove from Sibling' }));
+
+    await waitFor(() => {
+      expect(fetchMock).toHaveBeenCalledWith(
+        `http://127.0.0.1:17373/v1/visits/${encodeURIComponent(FILED_URL)}/memberships/bac_workstream_sibling/remove`,
+        expect.objectContaining({
+          method: 'POST',
+          body: JSON.stringify({ reason: 'user-removed' }),
+        }),
+      );
+    });
+  });
+
+  it('fetch-error: a never-loaded memberships overlay renders a muted "—" instead of a silent empty row', async () => {
+    installChromeMock(
+      { ...liveState(), companionStatus: 'connected', activeTabUrl: FILED_URL },
+      { [SETUP_COMPLETED_KEY]: true },
+    );
+    const debugSpy = vi.spyOn(console, 'debug').mockImplementation(() => undefined);
+    const fetchMock = emptyTabSessionMocks({
+      '/v1/visits/projection': async () => ({
+        ok: false,
+        status: 500,
+        text: async () => 'database is locked',
+      }),
+      '/v1/visits/inbox': async () => ({
+        ok: true,
+        status: 200,
+        json: async () => ({ data: { items: [], total: 0, limit: 51, offset: 0 } }),
+      }),
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    render(<App />);
+    await goToTab('Now');
+    const card = await screen.findByTestId('focused-tab-attribution');
+
+    const fallback = await within(card).findByTestId('focused-memberships-fallback');
+    expect(fallback).toHaveTextContent('—');
+    expect(
+      within(card).queryByRole('button', { name: 'Add to another workstream' }),
+    ).not.toBeInTheDocument();
+    await waitFor(() => {
+      expect(debugSpy).toHaveBeenCalled();
+    });
+  });
+});
+
+// Guess-lane disclosure in filed mode + primary removal (docs/plans/
+// 2026-08-16-category-flexibility-hyde.md §9 addendum, scopes 3-4). A tiny
+// stateful fake companion: every mutating POST updates a shared `record`
+// object the SAME way the real companion's fold would, so a re-fetch of
+// /v1/visits/projection (or the /attribute route's own inline `projection`
+// echo) reflects the mutation — this is what lets "remove the last
+// membership -> unfiled state" actually exercise the real round trip
+// instead of asserting only the outbound POST.
+describe('main-card lane disclosure + primary removal', () => {
+  const FILED_URL = 'https://duckdb.org/2026/05/12/quack-remote-protocol';
+  const PRIMARY_WS = 'bac_workstream_root'; // "Sidetrack" in liveState()
+  const SECONDARY_WS = 'bac_workstream_sibling'; // "Sibling" in liveState()
+
+  const lanesFixture = [
+    {
+      lane: 'graph',
+      candidates: [{ workstreamId: PRIMARY_WS, score: 0.9, why: 'linked from a filed page' }],
+    },
+    { lane: 'similarity', candidates: [], emptyReason: 'no similar pages' },
+    {
+      lane: 'topic',
+      candidates: [{ workstreamId: SECONDARY_WS, score: 0.4, why: 'sits in a Sibling-heavy topic' }],
+    },
+    { lane: 'title', candidates: [], emptyReason: 'title matched nothing' },
+    { lane: 'domain', candidates: [], emptyReason: 'domain unseen' },
+    { lane: 'recency', candidates: [], emptyReason: 'no recent filing' },
+  ];
+
+  interface FakeUrlRecord {
+    canonicalUrl: string;
+    firstSeenAt: string;
+    lastSeenAt: string;
+    visitCount: number;
+    tabSessionIds: string[];
+    latestUrl: string;
+    latestTitle: string;
+    attributionHistory: unknown[];
+    currentAttribution?: {
+      workstreamId: string;
+      source: string;
+      observedAt: string;
+      clientEventId: string;
+    };
+    memberships?: { workstreamId: string; role: string; provenance: string; acceptedAtMs: number }[];
+  }
+
+  const makeFakeCompanion = (initial: FakeUrlRecord) => {
+    let record: FakeUrlRecord = initial;
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.includes('/v1/tabsessions/projection')) {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({ data: { schemaVersion: 1, bySessionId: {}, openSessionsByTabId: {} } }),
+        };
+      }
+      if (url.includes('/v1/tabsessions/inbox')) {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({ data: { items: [], total: 0, limit: 51, offset: 0 } }),
+        };
+      }
+      if (url.includes('/v1/visits/projection')) {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({ data: { schemaVersion: 1, byCanonicalUrl: { [FILED_URL]: record } } }),
+        };
+      }
+      if (url.includes('/v1/visits/inbox')) {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({ data: { items: [], total: 0, limit: 51, offset: 0 } }),
+        };
+      }
+      if (url.includes('/v1/visits/batch-resolve')) {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({
+            data: {
+              results: {
+                [FILED_URL]: {
+                  canonicalUrl: FILED_URL,
+                  dryRun: true,
+                  decision: { action: 'inbox', margin: 0 },
+                  fusedCandidates: [],
+                  lanes: lanesFixture,
+                },
+              },
+            },
+          }),
+        };
+      }
+      if (/\/memberships\/[^/]+\/remove$/u.test(url)) {
+        const match = /\/memberships\/([^/]+)\/remove$/u.exec(url);
+        const wsId = match?.[1] === undefined ? '' : decodeURIComponent(match[1]);
+        record = {
+          ...record,
+          memberships: (record.memberships ?? []).filter((m) => m.workstreamId !== wsId),
+        };
+        return { ok: true, status: 200, json: async () => ({ data: {} }) };
+      }
+      if (url.endsWith('/memberships')) {
+        const body: { workstreamId?: string } = init?.body === undefined ? {} : JSON.parse(String(init.body));
+        if (typeof body.workstreamId === 'string') {
+          record = {
+            ...record,
+            memberships: [
+              ...(record.memberships ?? []),
+              {
+                workstreamId: body.workstreamId,
+                role: 'secondary',
+                provenance: 'user-filed',
+                acceptedAtMs: Date.now(),
+              },
+            ],
+          };
+        }
+        return { ok: true, status: 201, json: async () => ({ data: { accepted: {} } }) };
+      }
+      if (url.includes('/attribute')) {
+        const body: { workstreamId?: string | null } =
+          init?.body === undefined ? {} : JSON.parse(String(init.body));
+        if (body.workstreamId === null) {
+          const { currentAttribution: _drop, ...rest } = record;
+          record = rest as FakeUrlRecord;
+        } else if (typeof body.workstreamId === 'string') {
+          record = {
+            ...record,
+            currentAttribution: {
+              workstreamId: body.workstreamId,
+              source: 'user_asserted',
+              observedAt: NOW,
+              clientEventId: 'evt-attr',
+            },
+          };
+        }
+        return {
+          ok: true,
+          status: 201,
+          json: async () => ({
+            data: {
+              accepted: {},
+              projection: { schemaVersion: 1, byCanonicalUrl: { [FILED_URL]: record } },
+            },
+          }),
+        };
+      }
+      return { ok: false, status: 404, text: async () => 'not found' };
+    });
+    return { fetchMock, getRecord: () => record };
+  };
+
+  const filedBothRecord = (): FakeUrlRecord => ({
+    canonicalUrl: FILED_URL,
+    firstSeenAt: NOW,
+    lastSeenAt: NOW,
+    visitCount: 3,
+    tabSessionIds: [],
+    latestUrl: FILED_URL,
+    latestTitle: 'Quack Remote Protocol',
+    attributionHistory: [],
+    currentAttribution: {
+      workstreamId: PRIMARY_WS,
+      source: 'user_asserted',
+      observedAt: NOW,
+      clientEventId: 'evt-primary',
+    },
+    memberships: [
+      { workstreamId: PRIMARY_WS, role: 'primary', provenance: 'user-filed', acceptedAtMs: 1 },
+      { workstreamId: SECONDARY_WS, role: 'secondary', provenance: 'user-filed', acceptedAtMs: 2 },
+    ],
+  });
+
+  const filedPrimaryOnlyRecord = (): FakeUrlRecord => ({
+    ...filedBothRecord(),
+    memberships: [
+      { workstreamId: PRIMARY_WS, role: 'primary', provenance: 'user-filed', acceptedAtMs: 1 },
+    ],
+  });
+
+  it('filed page still exposes the guess-lanes disclosure, with an already-member guess inert', async () => {
+    installChromeMock(
+      { ...liveState(), companionStatus: 'connected', activeTabUrl: FILED_URL },
+      { [SETUP_COMPLETED_KEY]: true },
+    );
+    const { fetchMock } = makeFakeCompanion(filedBothRecord());
+    vi.stubGlobal('fetch', fetchMock);
+
+    render(<App />);
+    await goToTab('Now');
+    const card = await screen.findByTestId('focused-tab-attribution');
+    await within(card).findByText('Quack Remote Protocol');
+    // No unfiled-headline machinery for a filed page…
+    expect(within(card).queryByText('No signal yet')).not.toBeInTheDocument();
+    // …but the lane disclosure IS reachable.
+    fireEvent.click(await within(card).findByText(/Guess lanes/u));
+    // Graph lane's top guess (PRIMARY_WS) is already the primary — inert.
+    // (The badge above ALSO reads "Sidetrack" — scope to the lane row.)
+    const graphRow = within(card)
+      .getByText('Sidetrack', { selector: '.guess-lane-name' })
+      .closest('li');
+    expect(graphRow).not.toBeNull();
+    expect(within(graphRow as HTMLElement).getByText('✓ already in')).toBeInTheDocument();
+  });
+
+  it('tapping a not-yet-member lane guess on a filed page adds a SECONDARY membership (not a re-file)', async () => {
+    installChromeMock(
+      { ...liveState(), companionStatus: 'connected', activeTabUrl: FILED_URL },
+      { [SETUP_COMPLETED_KEY]: true },
+    );
+    const { fetchMock } = makeFakeCompanion(filedPrimaryOnlyRecord());
+    vi.stubGlobal('fetch', fetchMock);
+
+    render(<App />);
+    await goToTab('Now');
+    const card = await screen.findByTestId('focused-tab-attribution');
+    await within(card).findByText('Quack Remote Protocol');
+    fireEvent.click(await within(card).findByText(/Guess lanes/u));
+    const topicRow = within(card)
+      .getByText('Sibling', { selector: '.guess-lane-name' })
+      .closest('li');
+    expect(topicRow).not.toBeNull();
+    fireEvent.click(within(topicRow as HTMLElement).getByRole('button', { name: 'Also add' }));
+
+    await waitFor(() => {
+      expect(fetchMock).toHaveBeenCalledWith(
+        `http://127.0.0.1:17373/v1/visits/${encodeURIComponent(FILED_URL)}/memberships`,
+        expect.objectContaining({
+          method: 'POST',
+          body: JSON.stringify({ workstreamId: SECONDARY_WS }),
+        }),
+      );
+    });
+    // Never a re-file: no /attribute call ever fires from this action.
+    expect(fetchMock.mock.calls.some(([reqUrl]) => String(reqUrl).includes('/attribute'))).toBe(
+      false,
+    );
+  });
+
+  it('removing the primary while a secondary exists clears the primary but keeps the secondary — no auto-promote', async () => {
+    installChromeMock(
+      { ...liveState(), companionStatus: 'connected', activeTabUrl: FILED_URL },
+      { [SETUP_COMPLETED_KEY]: true },
+    );
+    const { fetchMock } = makeFakeCompanion(filedBothRecord());
+    vi.stubGlobal('fetch', fetchMock);
+
+    render(<App />);
+    await goToTab('Now');
+    const card = await screen.findByTestId('focused-tab-attribution');
+    // secondary chip present up front (scoped: the topic lane's guess row
+    // ALSO names "Sibling" — always mounted, just visually collapsed).
+    await within(card).findByText('Sibling', { selector: '.membership-chip-label' });
+
+    fireEvent.click(within(card).getByRole('button', { name: 'Remove from Sidetrack' }));
+
+    await waitFor(() => {
+      expect(fetchMock).toHaveBeenCalledWith(
+        `http://127.0.0.1:17373/v1/visits/${encodeURIComponent(FILED_URL)}/memberships/${PRIMARY_WS}/remove`,
+        expect.objectContaining({ method: 'POST' }),
+      );
+    });
+    await waitFor(() => {
+      expect(fetchMock).toHaveBeenCalledWith(
+        `http://127.0.0.1:17373/v1/visits/${encodeURIComponent(FILED_URL)}/attribute`,
+        expect.objectContaining({
+          method: 'POST',
+          body: JSON.stringify({ workstreamId: null }),
+        }),
+      );
+    });
+    // The primary badge goes empty…
+    await waitFor(() => {
+      expect(card.querySelector('[data-attribution-variant="empty"]')).not.toBeNull();
+    });
+    // …but the secondary chip SURVIVES — no silent auto-promotion.
+    expect(
+      within(card).getByText('Sibling', { selector: '.membership-chip-label' }),
+    ).toBeInTheDocument();
+    // Never re-filed to the secondary either.
+    expect(
+      fetchMock.mock.calls.some(
+        ([reqUrl, reqInit]) =>
+          String(reqUrl).includes('/attribute') &&
+          typeof (reqInit as RequestInit | undefined)?.body === 'string' &&
+          ((reqInit as RequestInit).body as string).includes(SECONDARY_WS),
+      ),
+    ).toBe(false);
+  });
+
+  it('removing the LAST membership returns the page to unfiled state (lanes reachable, no longer "already in")', async () => {
+    installChromeMock(
+      { ...liveState(), companionStatus: 'connected', activeTabUrl: FILED_URL },
+      { [SETUP_COMPLETED_KEY]: true },
+    );
+    const { fetchMock } = makeFakeCompanion(filedPrimaryOnlyRecord());
+    vi.stubGlobal('fetch', fetchMock);
+
+    render(<App />);
+    await goToTab('Now');
+    const card = await screen.findByTestId('focused-tab-attribution');
+    await within(card).findByText('Quack Remote Protocol');
+
+    fireEvent.click(within(card).getByRole('button', { name: 'Remove from Sidetrack' }));
+
+    // Unfiled again: the badge goes empty…
+    await waitFor(() => {
+      expect(card.querySelector('[data-attribution-variant="empty"]')).not.toBeNull();
+    });
+    // …and re-opening the lane disclosure shows the SAME graph-lane guess
+    // as an ordinary, actionable "File here" — not inert, not "Also add".
+    fireEvent.click(await within(card).findByText(/Guess lanes/u));
+    const graphRow = within(card)
+      .getByText('Sidetrack', { selector: '.guess-lane-name' })
+      .closest('li');
+    expect(graphRow).not.toBeNull();
+    expect(within(graphRow as HTMLElement).getByRole('button', { name: 'File here' })).toBeInTheDocument();
+    expect(within(graphRow as HTMLElement).queryByText('✓ already in')).not.toBeInTheDocument();
+  });
+
+  it('new-label-hint accept flow creates the workstream and files this page primary', async () => {
+    const base = liveState();
+    const sendMessage = installChromeMock(
+      { ...base, companionStatus: 'connected', activeTabUrl: FILED_URL },
+      { [SETUP_COMPLETED_KEY]: true },
+    );
+    const NEW_WS_ID = 'bac_workstream_quantum';
+    sendMessage.mockImplementation((request: { type?: unknown; workstream?: { title?: string } }) => {
+      if (request.type === messageTypes.createWorkstream) {
+        const newWorkstream = {
+          bac_id: NEW_WS_ID,
+          revision: 'rev_quantum',
+          title: request.workstream?.title ?? 'Untitled',
+          children: [],
+          tags: [],
+          checklist: [],
+          privacy: 'private' as const,
+          updatedAt: NOW,
+        };
+        const nextState = {
+          ...base,
+          companionStatus: 'connected' as const,
+          activeTabUrl: FILED_URL,
+          workstreams: [...base.workstreams, newWorkstream],
+        };
+        return Promise.resolve({ ok: true, state: nextState, request });
+      }
+      return Promise.resolve({
+        ok: true,
+        state: { ...base, companionStatus: 'connected' as const, activeTabUrl: FILED_URL },
+        request,
+      });
+    });
+    const unfiledRecord: FakeUrlRecord = {
+      canonicalUrl: FILED_URL,
+      firstSeenAt: NOW,
+      lastSeenAt: NOW,
+      visitCount: 1,
+      tabSessionIds: [],
+      latestUrl: FILED_URL,
+      latestTitle: 'Quack Remote Protocol',
+      attributionHistory: [],
+    };
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.includes('/v1/tabsessions/projection')) {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({ data: { schemaVersion: 1, bySessionId: {}, openSessionsByTabId: {} } }),
+        };
+      }
+      if (url.includes('/v1/tabsessions/inbox')) {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({ data: { items: [], total: 0, limit: 51, offset: 0 } }),
+        };
+      }
+      if (url.includes('/v1/visits/projection')) {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({
+            data: { schemaVersion: 1, byCanonicalUrl: { [FILED_URL]: unfiledRecord } },
+          }),
+        };
+      }
+      if (url.includes('/v1/visits/inbox')) {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({ data: { items: [], total: 0, limit: 51, offset: 0 } }),
+        };
+      }
+      if (url.includes('/v1/visits/batch-resolve')) {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({
+            data: {
+              results: {
+                [FILED_URL]: {
+                  canonicalUrl: FILED_URL,
+                  dryRun: true,
+                  decision: { action: 'inbox', margin: 0 },
+                  fusedCandidates: [],
+                  newLabelHint: { name: 'Quantum computing', keywords: ['qubit'] },
+                },
+              },
+            },
+          }),
+        };
+      }
+      if (url.endsWith('/memberships')) {
+        void init; // body assertion happens via toHaveBeenCalledWith below
+        return { ok: true, status: 201, json: async () => ({ data: { accepted: {} } }) };
+      }
+      return { ok: false, status: 404, text: async () => 'not found' };
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    render(<App />);
+    await goToTab('Now');
+    const card = await screen.findByTestId('focused-tab-attribution');
+    await within(card).findByText('Quack Remote Protocol');
+    const acceptButton = await within(card).findByRole('button', {
+      name: 'New: Quantum computing',
+    });
+    fireEvent.click(acceptButton);
+
+    await waitFor(() => {
+      expect(sendMessage).toHaveBeenCalledWith(
+        expect.objectContaining({
+          type: messageTypes.createWorkstream,
+          workstream: expect.objectContaining({ title: 'Quantum computing' }),
+        }),
+      );
+    });
+    await waitFor(() => {
+      expect(fetchMock).toHaveBeenCalledWith(
+        `http://127.0.0.1:17373/v1/visits/${encodeURIComponent(FILED_URL)}/memberships`,
+        expect.objectContaining({
+          method: 'POST',
+          body: JSON.stringify({ workstreamId: NEW_WS_ID, role: 'primary' }),
+        }),
+      );
+    });
+  });
+});

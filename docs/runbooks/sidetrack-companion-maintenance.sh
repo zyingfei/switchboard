@@ -41,11 +41,21 @@
 #    event-store mirror it reads is opened `{ readonly: true }`), appended to
 #    a bounded (last-30) JSONL history under each vault's _BAC/system/ so the
 #    trend is visible before APPLY exists.
+#
+# 6. §1's restart decision only ever covered the DAILY companion (:17373).
+#    The TEST companion (:17374, screen sidetrack-companion-test, launcher
+#    ~/.sidetrack-test-companion-launcher.sh, vault ~/.sidetrack-vault-test)
+#    ran with NO automatic restart coverage at all — measured live footprint
+#    2,488M on 2026-08-15 with nothing to catch it. §1 is now a shared
+#    function applied to BOTH companions with the SAME mem/uptime
+#    thresholds; see the "TEST-COMPANION MEMORY" note below §1.
 
 # *** NOT YET SYNCED to ~/.sidetrack-companion-maintenance.sh — §5 (Task F1,
-# *** 2026-08-15) and §6 (Task F2, 2026-08-16) below are new. The coordinator
-# *** must copy the new sections into the live launchd script; nothing
-# *** outside this repo checkout runs them yet.
+# *** 2026-08-15), §6 (Task F2, 2026-08-16), and the §1 test-companion
+# *** restart coverage (2026-08-17, disk-wear/embed-cache task) below are
+# *** new. The coordinator must copy the new/changed sections into the live
+# *** launchd script at $HOME (~/.sidetrack-companion-maintenance.sh) at
+# *** deploy time; nothing outside this repo checkout runs them yet.
 
 LOG="$HOME/.sidetrack-maintenance.log"
 exec >>"$LOG" 2>&1
@@ -55,56 +65,71 @@ fi
 echo "=== $(date -u +%FT%TZ) maintenance start"
 
 COMPANION_DIR="/Users/yingfei/playground/playground/browser-ai-companion/packages/sidetrack-companion"
-LAUNCHER="$HOME/.sidetrack-daily-companion-launcher.sh"
 export PATH="$HOME/.bun/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
 cd "$COMPANION_DIR" || { echo "companion dir missing"; exit 1; }
 
 MEM_LIMIT_MB=3000
 MAX_UPTIME_DAYS=2
 
-# --- 1. Restart decision for the daily companion (:17373) ------------------
-PID="$(lsof -iTCP:17373 -sTCP:LISTEN -t 2>/dev/null | head -1)"
-RESTART=""
-if [ -z "$PID" ]; then
-  RESTART="not running"
-else
-  # top MEM = resident+compressed, the honest footprint (ps rss lies once
-  # the compressor kicks in). Value like "489M" / "7820M" / "1G".
-  MEM_RAW="$(top -l 1 -pid "$PID" -stats mem 2>/dev/null | tail -1 | tr -d ' ')"
-  MEM_MB=0
-  case "$MEM_RAW" in
-    *G) MEM_MB=$(( ${MEM_RAW%G} * 1024 )) ;;
-    *M) MEM_MB=${MEM_RAW%M} ;;
-    *K) MEM_MB=1 ;;
-  esac
-  ETIME="$(ps -o etime= -p "$PID" | tr -d ' ')"
-  DAYS=0
-  case "$ETIME" in *-*) DAYS=${ETIME%%-*} ;; esac
-  echo "daily pid=$PID mem=${MEM_MB}M uptime_days=$DAYS"
-  if [ "$MEM_MB" -gt "$MEM_LIMIT_MB" ]; then RESTART="mem ${MEM_MB}M > ${MEM_LIMIT_MB}M"; fi
-  if [ "$DAYS" -ge "$MAX_UPTIME_DAYS" ]; then RESTART="${RESTART:+$RESTART, }uptime ${DAYS}d >= ${MAX_UPTIME_DAYS}d"; fi
-fi
-
-if [ -n "$RESTART" ]; then
-  echo "restarting daily companion: $RESTART"
-  screen -S sidetrack-companion-main -X quit 2>/dev/null
-  if [ -n "$PID" ]; then
-    pkill -9 -P "$PID" 2>/dev/null
-    kill -9 "$PID" 2>/dev/null
+# --- 1. Restart decision — SAME mem/uptime thresholds for every companion --
+# TEST-COMPANION MEMORY (2026-08-17): this used to be daily-companion-only
+# (:17373). The test companion (:17374) had NO restart coverage at all —
+# live footprint measured 2,488M on 2026-08-15 with nothing to catch it, the
+# same unbounded-footprint failure mode §1's original comment (item 1 above)
+# documented for the daily companion. Factored into one function so both
+# companions get identical thresholds instead of a second hand-copied block
+# silently drifting out of sync.
+check_and_restart_companion() {
+  local LABEL="$1" PORT="$2" SCREEN_NAME="$3" LAUNCHER_PATH="$4" LOG_PATH="$5"
+  local PID RESTART MEM_RAW MEM_MB ETIME DAYS VERSION
+  PID="$(lsof -iTCP:"$PORT" -sTCP:LISTEN -t 2>/dev/null | head -1)"
+  RESTART=""
+  if [ -z "$PID" ]; then
+    RESTART="not running"
+  else
+    # top MEM = resident+compressed, the honest footprint (ps rss lies once
+    # the compressor kicks in). Value like "489M" / "7820M" / "1G".
+    MEM_RAW="$(top -l 1 -pid "$PID" -stats mem 2>/dev/null | tail -1 | tr -d ' ')"
+    MEM_MB=0
+    case "$MEM_RAW" in
+      *G) MEM_MB=$(( ${MEM_RAW%G} * 1024 )) ;;
+      *M) MEM_MB=${MEM_RAW%M} ;;
+      *K) MEM_MB=1 ;;
+    esac
+    ETIME="$(ps -o etime= -p "$PID" | tr -d ' ')"
+    DAYS=0
+    case "$ETIME" in *-*) DAYS=${ETIME%%-*} ;; esac
+    echo "$LABEL pid=$PID mem=${MEM_MB}M uptime_days=$DAYS"
+    if [ "$MEM_MB" -gt "$MEM_LIMIT_MB" ]; then RESTART="mem ${MEM_MB}M > ${MEM_LIMIT_MB}M"; fi
+    if [ "$DAYS" -ge "$MAX_UPTIME_DAYS" ]; then RESTART="${RESTART:+$RESTART, }uptime ${DAYS}d >= ${MAX_UPTIME_DAYS}d"; fi
   fi
-  pkill -9 -f 'vault --port 17373' 2>/dev/null
-  sleep 5
-  screen -wipe >/dev/null 2>&1
-  screen -dmS sidetrack-companion-main zsh "$LAUNCHER"
-  sleep 15
-  VERSION="$(curl -s -m 10 http://127.0.0.1:17373/v1/version)"
-  case "$VERSION" in
-    *buildSha*) echo "restart OK: $(echo "$VERSION" | head -c 240)" ;;
-    *) echo "RESTART FAILED — no /v1/version response; check /tmp/sidetrack-daily-companion.log" ;;
-  esac
-else
-  echo "no restart needed"
-fi
+
+  if [ -n "$RESTART" ]; then
+    echo "restarting $LABEL companion: $RESTART"
+    screen -S "$SCREEN_NAME" -X quit 2>/dev/null
+    if [ -n "$PID" ]; then
+      pkill -9 -P "$PID" 2>/dev/null
+      kill -9 "$PID" 2>/dev/null
+    fi
+    pkill -9 -f "vault --port $PORT" 2>/dev/null
+    sleep 5
+    screen -wipe >/dev/null 2>&1
+    screen -dmS "$SCREEN_NAME" zsh "$LAUNCHER_PATH"
+    sleep 15
+    VERSION="$(curl -s -m 10 "http://127.0.0.1:$PORT/v1/version")"
+    case "$VERSION" in
+      *buildSha*) echo "restart OK: $(echo "$VERSION" | head -c 240)" ;;
+      *) echo "RESTART FAILED ($LABEL) — no /v1/version response; check $LOG_PATH" ;;
+    esac
+  else
+    echo "no restart needed ($LABEL)"
+  fi
+}
+
+check_and_restart_companion daily 17373 sidetrack-companion-main \
+  "$HOME/.sidetrack-daily-companion-launcher.sh" /tmp/sidetrack-daily-companion.log
+check_and_restart_companion test 17374 sidetrack-companion-test \
+  "$HOME/.sidetrack-test-companion-launcher.sh" /tmp/sidetrack-test-companion.log
 
 # --- 2. Proof-gated storage-retirement GC ----------------------------------
 for VAULT in "$HOME/.sidetrack-vault" "$HOME/.sidetrack-vault-test"; do

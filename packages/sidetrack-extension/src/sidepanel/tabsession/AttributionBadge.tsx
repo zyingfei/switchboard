@@ -110,9 +110,17 @@ export interface AttributionBadgeProps {
   readonly record?: TabSessionRecord;
   readonly suggestion?: TabSessionResolutionResult;
   readonly workstreams: readonly TabSessionWorkstreamOption[];
+  // Multi-membership removal (docs/plans/2026-08-16-category-flexibility-
+  // hyde.md §9 addendum) — the primary is the ONE membership this badge
+  // shows, so its own "×" lives here rather than duplicating the name as a
+  // separate chip. Rendered ONLY for a real, non-empty, non-ignored
+  // attribution (a suggestion/weak-guess/lane-fallback is not yet a
+  // membership — nothing to remove). Omitted -> no "×" (existing callers,
+  // e.g. InboxCard, are unaffected).
+  readonly onRemove?: (workstreamId: string) => void;
 }
 
-export function AttributionBadge({ record, suggestion, workstreams }: AttributionBadgeProps) {
+export function AttributionBadge({ record, suggestion, workstreams, onRemove }: AttributionBadgeProps) {
   const attribution = record?.currentAttribution;
   const ignored = record?.currentIgnored;
   // The resolver's guess lives in decision.workstreamId ONLY when the policy
@@ -153,6 +161,13 @@ export function AttributionBadge({ record, suggestion, workstreams }: Attributio
   // guessed name still lives in the tooltip (titleFor uses `namedLabel`) and
   // in SuggestionStats' "Below confidence bar — possibilities" list.
   const label = variant === 'weak-guess' && laneFallback ? 'No good guess yet' : namedLabel;
+  // Removable iff there's a REAL membership behind this badge — a real
+  // attribution with a non-null workstream (any source: user-asserted,
+  // inferred, or thread-derived). A suggestion the user hasn't confirmed
+  // yet is not a membership; there is nothing to remove.
+  const removableWorkstreamId =
+    attribution !== undefined && attribution.workstreamId !== null ? attribution.workstreamId : null;
+  const removableLabel = removableWorkstreamId === null ? null : workstreamLabel(removableWorkstreamId, workstreams);
   return (
     <span
       className={`tab-session-badge is-${variant}`}
@@ -165,6 +180,23 @@ export function AttributionBadge({ record, suggestion, workstreams }: Attributio
         </span>
       ) : null}
       <span className="tab-session-badge-label">{label}</span>
+      {removableWorkstreamId !== null && onRemove !== undefined ? (
+        <button
+          type="button"
+          className="tab-session-badge-remove"
+          onClick={(event) => {
+            // The badge itself carries no click handler today, but stop
+            // propagation defensively so a future click-to-edit affordance
+            // on the badge never fires alongside a remove.
+            event.stopPropagation();
+            onRemove(removableWorkstreamId);
+          }}
+          title={`Remove from ${removableLabel ?? ''}`}
+          aria-label={`Remove from ${removableLabel ?? ''}`}
+        >
+          ×
+        </button>
+      ) : null}
     </span>
   );
 }

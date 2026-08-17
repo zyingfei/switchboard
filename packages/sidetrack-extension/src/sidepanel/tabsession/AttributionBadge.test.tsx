@@ -1,5 +1,5 @@
-import { render } from '@testing-library/react';
-import { describe, expect, it } from 'vitest';
+import { fireEvent, render, screen } from '@testing-library/react';
+import { describe, expect, it, vi } from 'vitest';
 
 import { AttributionBadge } from './AttributionBadge';
 import { LANE_FALLBACK_WHY_PREFIX } from './laneFallbackPick';
@@ -105,5 +105,55 @@ describe('AttributionBadge honesty variant', () => {
       />,
     );
     expect(container.querySelector('[data-attribution-variant="empty"]')).not.toBeNull();
+  });
+});
+
+// Primary-membership removal (docs/plans/2026-08-16-category-flexibility-
+// hyde.md §9 addendum, scope 4) — the "×" lives on the badge itself so the
+// primary name is never duplicated as a separate chip.
+describe('AttributionBadge primary removal', () => {
+  const attributedRecord = (): TabSessionRecord =>
+    record({
+      currentAttribution: {
+        workstreamId: 'ws-1',
+        source: 'user_asserted',
+        observedAt: '2026-08-16T00:00:00.000Z',
+        clientEventId: 'evt-1',
+      },
+    });
+
+  it('renders a "×" worded "Remove from <name>" for a real attribution when onRemove is wired', () => {
+    const onRemove = vi.fn();
+    render(
+      <AttributionBadge record={attributedRecord()} workstreams={workstreams} onRemove={onRemove} />,
+    );
+    const removeButton = screen.getByRole('button', { name: 'Remove from Research' });
+    expect(removeButton).toBeInTheDocument();
+    fireEvent.click(removeButton);
+    expect(onRemove).toHaveBeenCalledWith('ws-1');
+  });
+
+  it('renders no "×" when onRemove is omitted', () => {
+    render(<AttributionBadge record={attributedRecord()} workstreams={workstreams} />);
+    expect(screen.queryByRole('button', { name: /Remove from/ })).not.toBeInTheDocument();
+  });
+
+  it('renders no "×" for an empty (unfiled) badge even when onRemove is wired', () => {
+    const onRemove = vi.fn();
+    render(<AttributionBadge record={record()} workstreams={workstreams} onRemove={onRemove} />);
+    expect(screen.queryByRole('button', { name: /Remove from/ })).not.toBeInTheDocument();
+  });
+
+  it('renders no "×" for a weak-guess/suggested badge — nothing filed yet to remove', () => {
+    const onRemove = vi.fn();
+    render(
+      <AttributionBadge
+        record={record()}
+        suggestion={resolution({ action: 'inbox', margin: -0.62 }, [candidate()])}
+        workstreams={workstreams}
+        onRemove={onRemove}
+      />,
+    );
+    expect(screen.queryByRole('button', { name: /Remove from/ })).not.toBeInTheDocument();
   });
 });

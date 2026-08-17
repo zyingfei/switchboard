@@ -36,11 +36,17 @@ const group = (prefix: string, count: number, conceptId: string): SuggestionEvid
     keywords: [conceptId.replace('concept-', '')],
   }));
 
+// NOTE (2026-08-17): stabilityMinConsecutive is pinned to 3 explicitly here
+// — the engine's DEFAULT is now liberal (1, see splitSuggestionEngine.ts),
+// but every test in this file is specifically ABOUT the 3-consecutive-round
+// stability mechanism, so it opts back into the old cadence rather than
+// relying on a default that no longer matches the scenario under test.
 const NEW_TOPIC_OPTIONS = {
   cosineThreshold: 0.5,
   minSamples: 2,
   minClusterMembers: 3,
   minEvidenceToAttempt: 5,
+  stabilityMinConsecutive: 3,
 } as const;
 
 describe('recomputeSuggestionCandidates — new-topic suggestions from unfiled pages', () => {

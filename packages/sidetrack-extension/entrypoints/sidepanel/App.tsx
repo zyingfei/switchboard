@@ -160,6 +160,7 @@ import { useReplicaAliasMap } from '../../src/sidepanel/entityDisplay/replicaAli
 import { useSnippetPreviewMap } from '../../src/sidepanel/entityDisplay/snippetPreview';
 import { AttributionBadge } from '../../src/sidepanel/tabsession/AttributionBadge';
 import { AttributionProvenance } from '../../src/sidepanel/tabsession/AttributionProvenance';
+import { FocusedMemberships } from '../../src/sidepanel/tabsession/FocusedMemberships';
 import {
   findSessionRestoreMatch,
   type ClosedSession,
@@ -185,8 +186,10 @@ import {
   TAB_SESSION_DRAG_MIME,
   parseGuessGate,
   parseGuessLanes,
+  parseNewLabelHint,
   type GuessGate,
   type GuessLaneResult,
+  type NewLabelHint,
   type ResolveOutcomeError,
   type TabSessionInboxData,
   type TabSessionPageEvidenceSummary,
@@ -326,6 +329,8 @@ export const tabSessionResolutionFromUrl = (
   // Guess-lanes pass through verbatim (already lenient-parsed by the guard)
   // so the tab-session-shaped SuggestionStats can render the lane breakdown.
   ...(result.lanes === undefined ? {} : { lanes: result.lanes }),
+  // New-label hint — same verbatim passthrough (already lenient-parsed).
+  ...(result.newLabelHint === undefined ? {} : { newLabelHint: result.newLabelHint }),
 });
 
 const tabSessionIdFromDragEvent = (event: DragEvent<HTMLElement>): string | null => {
@@ -447,6 +452,14 @@ const normalizeResolutionLanes = (value: Record<string, unknown>): void => {
     } else {
       decision['gate'] = gate;
     }
+  }
+  // New-label hint (docs/plans/2026-08-16-category-flexibility-hyde.md §9
+  // addendum) — same additive, lenient-or-absent contract as lanes/gate.
+  const newLabelHint = parseNewLabelHint(value['newLabelHint']);
+  if (newLabelHint === undefined) {
+    delete value['newLabelHint'];
+  } else {
+    value['newLabelHint'] = newLabelHint;
   }
 };
 
@@ -973,6 +986,11 @@ const App = () => {
   // above does the replace). Independent state so the two pickers never
   // fight over which action a selection means.
   const [membershipAddTargetId, setMembershipAddTargetId] = useState<string | null>(null);
+  // New-label hint accept (§9 addendum) — in flight while creating the
+  // suggested workstream + filing this page to it. Single page at a time
+  // (the hint only ever renders on the focused-page card), so a plain
+  // boolean is enough — no per-fingerprint Set needed.
+  const [acceptingNewLabelHint, setAcceptingNewLabelHint] = useState(false);
   // Stage 5 polish — debug panel-state dump. Tracks the latest dump
   // result so the icon button can flash a success/error chip with the
   // file path the user can hand to an assistant.
@@ -1218,6 +1236,15 @@ const App = () => {
   // peers that haven't been updated yet.
   const [urlInbox, setUrlInbox] = useState<UrlInboxData>(EMPTY_URL_INBOX);
   const [urlProjection, setUrlProjection] = useState<UrlProjection | null>(null);
+  // WHY-VISIBILITY (main-card membership chips, docs/plans/2026-08-16-
+  // category-flexibility-hyde.md §9 addendum) — the batched `memberships`
+  // overlay rides on THIS fetch. The wire contract omits `memberships`
+  // entirely when a URL has zero rows, so a per-record read can't tell
+  // "genuinely no memberships" from "the overlay never arrived". Track the
+  // fetch's own success/failure here so the Now card can render an honest
+  // "—" instead of a silent, possibly-misleading empty chip row when we've
+  // never once loaded a projection successfully.
+  const [urlProjectionFetchFailed, setUrlProjectionFetchFailed] = useState(false);
   const [urlSuggestions, setUrlSuggestions] = useState<Record<string, UrlResolutionResult>>({});
   // Split / new-category suggestion candidates (docs/plans/2026-08-16-
   // category-flexibility-hyde.md, UI-visibility phase) — surfaced inline
@@ -2263,6 +2290,10 @@ const App = () => {
         setTabSessionInbox(EMPTY_TAB_SESSION_INBOX);
         setTabSessionSuggestions({});
         setUrlProjection(null);
+        // Not configured (no companion port/key yet) is a deliberate empty
+        // state, not a fetch failure — the Now card should stay silent, not
+        // show the error fallback.
+        setUrlProjectionFetchFailed(false);
         setUrlInbox(EMPTY_URL_INBOX);
         setUrlSuggestions({});
         setUrlSuggestionErrors({});
@@ -2280,6 +2311,7 @@ const App = () => {
           ]);
           if (isUrlProjection(urlProj) && isUrlInboxData(urlInboxResp)) {
             setUrlProjection(urlProj);
+            setUrlProjectionFetchFailed(false);
             setUrlInbox(urlInboxResp);
             // Include the currently-focused tab's URL in the suggestion
             // fetch even when it's not in the inbox top page — otherwise
@@ -2351,10 +2383,18 @@ const App = () => {
           } else {
             // eslint-disable-next-line no-console
             console.warn('[sidetrack:panel] loadTabSessions — invalid /v1/visits payload');
+            // eslint-disable-next-line no-console
+            console.debug(
+              '[sidetrack:panel] memberships overlay unavailable — invalid /v1/visits/projection payload',
+            );
+            setUrlProjectionFetchFailed(true);
           }
         } catch (err) {
           // eslint-disable-next-line no-console
           console.warn('[sidetrack:panel] loadTabSessions — /v1/visits fetch failed', err);
+          // eslint-disable-next-line no-console
+          console.debug('[sidetrack:panel] memberships overlay fetch failed', err);
+          setUrlProjectionFetchFailed(true);
         }
       };
       void loadUrlState();
@@ -3894,6 +3934,46 @@ const App = () => {
     void runAction(() => removeMembershipFromUrl(canonicalUrl, workstreamId));
   };
 
+  // Primary-membership removal (docs/plans/2026-08-16-category-flexibility-
+  // hyde.md §9 addendum, scope 4) — removing every OTHER membership row is
+  // additive-only (handleRemoveMembership above), but the PRIMARY is also
+  // mirrored into the independently-folded scalar `currentAttribution`
+  // (types.ts's UrlMembershipRow doc: the two are separate event streams
+  // until a one-time backfill runs). The remove-membership ROUTE itself
+  // already accepts removing a primary-role row with no special casing
+  // (membershipEvents.test.ts's "removing the primary leaves zero
+  // primaries, not a silent promotion" pins the fold-level invariant) — the
+  // gap is purely that `currentAttribution` would otherwise keep pointing
+  // at a workstream whose only membership row was just deleted. Composing
+  // the SAME two existing routes closes that gap with no companion change:
+  // drop the row, then clear the scalar the same way "Not in any stream"
+  // does (attributeUrlToWorkstream(canonicalUrl, null)). No auto-promotion
+  // — a surviving secondary stays secondary; the user promotes explicitly.
+  // When it was the page's LAST membership, clearing currentAttribution is
+  // exactly what flips focusedAlreadyMemberWorkstreamIds back to undefined
+  // — the card returns to unfiled mode (lanes + new-label hint) for free.
+  const removePrimaryMembership = async (
+    canonicalUrl: string,
+    workstreamId: string,
+  ): Promise<WorkboardState> => {
+    if (port.length === 0 || bridgeKey.length === 0) {
+      throw new Error('Companion is not configured.');
+    }
+    const portNumber = Number(port);
+    if (!Number.isFinite(portNumber) || portNumber <= 0) {
+      throw new Error('Companion is not configured.');
+    }
+    await createCategoryFlexibilityClient({ port: portNumber, bridgeKey }).removeMembership(
+      canonicalUrl,
+      workstreamId,
+    );
+    return await attributeUrlToWorkstream(canonicalUrl, null);
+  };
+
+  const handleRemovePrimaryMembership = (canonicalUrl: string, workstreamId: string) => {
+    void runAction(() => removePrimaryMembership(canonicalUrl, workstreamId));
+  };
+
   // Split / new-category suggestion accept+decline (design doc §4's
   // accept flow: "not a new mechanism — POST /v1/workstreams create + a
   // batch of WORKSTREAM_MEMBERSHIP_SET{provenance:'ai-suggested-accepted'}
@@ -3958,6 +4038,47 @@ const App = () => {
       .catch(() => undefined);
     await loadTabSessions({ background: true });
     return await sendRequest({ type: messageTypes.getWorkboardState });
+  };
+
+  // New-label hint accept (docs/plans/2026-08-16-category-flexibility-hyde.md
+  // §9 addendum) — "not a new mechanism": the SAME create-then-file flow
+  // acceptSuggestionCandidate uses above, just for a single page instead of a
+  // sub-cluster. role:'primary' — the hint only ever fires when the resolver
+  // found NO confident existing match, so this page's home genuinely is the
+  // new workstream (matches the existing suggestion-card accept semantics).
+  const acceptNewLabelHint = async (
+    canonicalUrl: string,
+    hint: NewLabelHint,
+  ): Promise<WorkboardState> => {
+    if (port.length === 0 || bridgeKey.length === 0) {
+      throw new Error('Companion is not configured.');
+    }
+    const portNumber = Number(port);
+    if (!Number.isFinite(portNumber) || portNumber <= 0) {
+      throw new Error('Companion is not configured.');
+    }
+    const client = createCategoryFlexibilityClient({ port: portNumber, bridgeKey });
+    const beforeIds = new Set(state.workstreams.map((workstream) => workstream.bac_id));
+    const created = await sendRequest({
+      type: messageTypes.createWorkstream,
+      workstream: { title: hint.name },
+    });
+    const newWorkstream =
+      created.workstreams.find((workstream) => !beforeIds.has(workstream.bac_id)) ??
+      [...created.workstreams].reverse().find((workstream) => workstream.title === hint.name);
+    if (newWorkstream === undefined) {
+      throw new Error('Created workstream could not be found in the refreshed workboard state.');
+    }
+    await client.addMembership(canonicalUrl, newWorkstream.bac_id, { role: 'primary' });
+    await loadTabSessions({ background: true });
+    return await sendRequest({ type: messageTypes.getWorkboardState });
+  };
+
+  const handleAcceptNewLabelHint = (canonicalUrl: string, hint: NewLabelHint) => {
+    setAcceptingNewLabelHint(true);
+    void runAction(() => acceptNewLabelHint(canonicalUrl, hint)).finally(() => {
+      setAcceptingNewLabelHint(false);
+    });
   };
 
   const declineSuggestionCandidateAction = async (
@@ -5695,6 +5816,26 @@ const App = () => {
   // browser tab changes underneath them.
   const focusedAttributedWorkstreamId =
     focusedRecordEffective?.currentAttribution?.workstreamId ?? null;
+  // WHY-VISIBILITY — the Now card's membership-chips row shows the honest
+  // "—" fallback only when we've NEVER once loaded a projection (urlProjection
+  // is still null) and the most recent load attempt errored. Once any load
+  // has succeeded, stale-but-real chip data renders instead of blanking on a
+  // transient background-poll hiccup (same "stale beats blank" rule the rest
+  // of this file follows for tabSessionError).
+  const focusedMembershipsFetchFailed = urlProjection === null && urlProjectionFetchFailed;
+  // Filed-lanes mode discriminant (§9 addendum) — undefined for an unfiled
+  // page (SuggestionStats keeps its original unfiled behavior); the page's
+  // current primary + every secondary workstream id once a primary exists,
+  // so a lane guess for a workstream the page is ALREADY in renders as inert
+  // rather than actionable.
+  const focusedAlreadyMemberWorkstreamIds = useMemo(() => {
+    if (focusedTabSession === undefined) return undefined;
+    const primaryId = focusedTabSession.currentAttribution?.workstreamId;
+    if (primaryId === null || primaryId === undefined) return undefined;
+    const ids = new Set<string>([primaryId]);
+    for (const membership of focusedTabSession.memberships ?? []) ids.add(membership.workstreamId);
+    return ids;
+  }, [focusedTabSession]);
   const focusedUrl = focusedTabSession?.latestUrl ?? liveActiveTabUrl;
   const focusedIsKnownThread = useMemo(() => {
     if (focusedUrl === undefined || focusedUrl.length === 0) return false;
@@ -8944,7 +9085,45 @@ const App = () => {
                             : tabSessionResolutionFromUrl(focusedTabSuggestion)
                         }
                         workstreams={tabSessionWorkstreams}
+                        // Primary removal (§9 addendum scope 4) — × on the
+                        // primary itself, worded the same as a secondary
+                        // chip's remove ("Remove from <name>"). No modal:
+                        // re-adding is one tap (liberal-with-cheap-undo).
+                        {...(focusedDisplayUrlRecord === undefined
+                          ? {}
+                          : {
+                              onRemove: (workstreamId: string) => {
+                                handleRemovePrimaryMembership(
+                                  focusedDisplayUrlRecord.canonicalUrl,
+                                  workstreamId,
+                                );
+                              },
+                            })}
                       />
+                      {/* Membership chips + always-visible "+" add affordance
+                          — PR #384 wired MembershipChips into Inbox/timeline
+                          cards + pickers but missed this, the primary
+                          focused-page card (docs/plans/2026-08-16-category-
+                          flexibility-hyde.md §9 addendum). Reuses the SAME
+                          batched overlay (`focusedTabSession.memberships`,
+                          off `/v1/visits/projection`) and the SAME
+                          add/remove wiring InboxCard uses — the "+" opens
+                          the shared WorkstreamPicker via
+                          membershipAddTargetId, "×" calls
+                          handleRemoveMembership directly. Both routes
+                          always add/remove a SECONDARY row (never touch
+                          primary), matching the existing #384 contract. */}
+                      {focusedTabSession !== undefined ? (
+                        <FocusedMemberships
+                          record={focusedTabSession}
+                          workstreams={tabSessionWorkstreams}
+                          fetchFailed={focusedMembershipsFetchFailed}
+                          onAdd={(canonicalUrl) => {
+                            setMembershipAddTargetId(canonicalUrl);
+                          }}
+                          onRemove={handleRemoveMembership}
+                        />
+                      ) : null}
                     </>
                   ) : null}
                   {/* Auto-file / attribution provenance line. The badge above
@@ -8969,13 +9148,20 @@ const App = () => {
                       workstreams={tabSessionWorkstreams}
                     />
                   ) : null}
-                  {/* Suggestion stats: bucket label + ⓘ tooltip + alternatives.
-              Renders for any unattributed/un-ignored focused URL — when
-              the resolver has no candidates we still draw the empty
-              placeholder so the user sees why the badge is "?". */}
+                  {/* Suggestion stats: bucket label + ⓘ tooltip + alternatives
+              for an unattributed/un-ignored focused URL (when the resolver
+              has no candidates we still draw the empty placeholder so the
+              user sees why the badge is "?"). ALSO renders — in "filed"
+              mode, via alreadyFiledWorkstreamIds — for an already-filed
+              page: the lane disclosure used to disappear entirely once a
+              primary was set (a one-label-world assumption); with multi-
+              membership the lanes are the natural source of "also add
+              this?" candidates, so they must stay reachable (docs/plans/
+              2026-08-16-category-flexibility-hyde.md §9 addendum). Only an
+              IGNORED URL hides this row entirely — nothing to suggest for
+              a page the user dismissed. */}
                   {focusedPageKind !== 'unknown' &&
                   focusedRecordEffective !== undefined &&
-                  focusedRecordEffective.currentAttribution === undefined &&
                   focusedRecordEffective.currentIgnored === undefined ? (
                     <SuggestionStats
                       suggestion={
@@ -9029,6 +9215,42 @@ const App = () => {
                             },
                           })}
                       prototypeStatusByWorkstream={prototypeStatusByWorkstream}
+                      // Filed mode (§9 addendum) — undefined for an unfiled
+                      // page (SuggestionStats behaves exactly as before);
+                      // the page's current primary + secondary workstream
+                      // ids for a filed page, switching every lane guess to
+                      // "also add as secondary" instead of a re-file.
+                      {...(focusedAlreadyMemberWorkstreamIds === undefined
+                        ? {}
+                        : { alreadyFiledWorkstreamIds: focusedAlreadyMemberWorkstreamIds })}
+                      // Reuses the EXACT SAME membership route the main
+                      // card's "+" chip affordance uses (handleAddMembership
+                      // — always adds a SECONDARY row, never touches the
+                      // primary).
+                      {...(focusedDisplayUrlRecord === undefined
+                        ? {}
+                        : {
+                            onAddSecondaryFromLane: (workstreamId: string) => {
+                              handleAddMembership(
+                                focusedDisplayUrlRecord.canonicalUrl,
+                                workstreamId,
+                              );
+                            },
+                          })}
+                      // New-workstream hint accept (§9 addendum) — create +
+                      // file-primary, same create-then-file mechanics as the
+                      // split/new-category suggestion cards' accept flow.
+                      {...(focusedDisplayUrlRecord === undefined
+                        ? {}
+                        : {
+                            onAcceptNewLabelHint: (hint: NewLabelHint) => {
+                              handleAcceptNewLabelHint(
+                                focusedDisplayUrlRecord.canonicalUrl,
+                                hint,
+                              );
+                            },
+                          })}
+                      acceptingNewLabelHint={acceptingNewLabelHint}
                     />
                   ) : null}
                   {/* On-device AI row (feat/enrich-visibility) — sits HERE, in

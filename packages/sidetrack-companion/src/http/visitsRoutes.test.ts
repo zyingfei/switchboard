@@ -1,4 +1,4 @@
-import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -14,6 +14,9 @@ import {
   resetLanePrequentialMemoForTest,
 } from '../tabsession/lanePrequential.js';
 import { URL_ATTRIBUTION_INFERRED } from '../urls/events.js';
+import { USER_ORGANIZED_ITEM } from '../feedback/events.js';
+import { createKeywordIndexStore } from '../search-index/keywordIndexStore.js';
+import { NEW_LABEL_HINT_ENV } from '../tabsession/newLabelHint.js';
 import { createVaultWriter } from '../vault/writer.js';
 import { createIdempotencyStore } from './idempotency.js';
 import { __resetResolverCacheDeferQueue, flushResolverCacheWrites } from './resolverCacheDefer.js';
@@ -283,6 +286,61 @@ describe('per-URL HTTP routes', () => {
       workstreamId: 'ws_gone',
       reason: 'user-removed',
     });
+  });
+
+  // Panel scope 4 (docs/plans/2026-08-16-category-flexibility-hyde.md §9
+  // addendum) — the main-card AttributionBadge's "×" removes the PRIMARY
+  // membership row, not just secondaries. The route applies NO role-based
+  // validation (unlike a SET, which validates role/provenance/etc.) — this
+  // pins that a primary-role row is accepted for removal exactly like a
+  // secondary one, and that the fold (membershipEvents.test.ts's own
+  // "removing the primary leaves zero primaries" pins the invariant at the
+  // fold level) reflects zero primaries afterward via the read-back route.
+  it('POST .../memberships/{workstreamId}/remove accepts removing a PRIMARY-role row (no role-based rejection)', async () => {
+    const canonicalUrl = 'https://github.com/zyingfei/switchboard/primary-remove';
+    await appendObservation({ seq: 1, url: canonicalUrl, tabSessionId: 'tses_membership_primary' });
+
+    const setResponse = await fetch(
+      `${serverUrl}/v1/visits/${encodeURIComponent(canonicalUrl)}/memberships`,
+      {
+        method: 'POST',
+        headers: headers('idem-primary-set'),
+        body: JSON.stringify({ workstreamId: 'ws_primary', role: 'primary' }),
+      },
+    );
+    expect(setResponse.status).toBe(201);
+
+    const removeResponse = await fetch(
+      `${serverUrl}/v1/visits/${encodeURIComponent(canonicalUrl)}/memberships/ws_primary/remove`,
+      {
+        method: 'POST',
+        headers: headers('idem-primary-remove'),
+        body: JSON.stringify({}),
+      },
+    );
+    // The route does not reject a primary-role removal — same 201 contract
+    // as removing a secondary.
+    expect(removeResponse.status).toBe(201);
+    const body = (await removeResponse.json()) as {
+      data: { accepted: { type: string; payload: Record<string, unknown> } };
+    };
+    expect(body.data.accepted.type).toBe('workstream.membership.removed');
+    expect(body.data.accepted.payload).toMatchObject({
+      subjectId: canonicalUrl,
+      workstreamId: 'ws_primary',
+    });
+
+    // Read-back: zero active rows — not demoted to secondary, not silently
+    // re-promoted from anywhere.
+    const readBack = await fetch(
+      `${serverUrl}/v1/visits/${encodeURIComponent(canonicalUrl)}/memberships`,
+      { headers: headers() },
+    );
+    expect(readBack.status).toBe(200);
+    const readBody = (await readBack.json()) as {
+      data: { memberships: readonly { workstreamId: string; role: string }[] };
+    };
+    expect(readBody.data.memberships).toEqual([]);
   });
 
   it('POST /v1/visits/{url}/suggestions/decline writes a decline with no membership row', async () => {
@@ -1000,6 +1058,10 @@ describe('per-URL HTTP routes — resolver cache and batch resolve', () => {
     // it is later flushed and its mock call recorded.
     __resetResolverCacheDeferQueue();
     vaultRoot = await mkdtemp(join(tmpdir(), 'sidetrack-visits-resolver-cache-'));
+    // newLabelHint's keyword-index seeding (below) opens a bun:sqlite handle
+    // directly and needs the parent dir to already exist — same convention
+    // keywordIngest.test.ts's beforeEach follows.
+    await mkdir(join(vaultRoot, '_BAC', 'connections'), { recursive: true });
     const replica = await loadOrCreateReplica(vaultRoot);
     eventLog = createEventLog(vaultRoot, replica);
     connectionsStore = createResolverCacheStore();
@@ -1176,6 +1238,178 @@ describe('per-URL HTTP routes — resolver cache and batch resolve', () => {
     expect(readResolverSubgraphForUrls).toHaveBeenCalledWith(urls);
     expect(readCurrent).not.toHaveBeenCalled();
     expect(readMerged).toHaveBeenCalledTimes(1);
+  });
+
+  describe('POST /v1/visits/batch-resolve — newLabelHint (SIDETRACK_NEW_LABEL_HINT)', () => {
+    interface HintResult {
+      readonly fusedCandidates: readonly unknown[];
+      readonly decision: { readonly gate?: { readonly reason?: string } };
+      readonly newLabelHint?: { readonly name: string; readonly keywords: readonly string[] };
+    }
+    interface HintResponse {
+      readonly data: { readonly results: Record<string, HintResult> };
+    }
+
+    const seedKeywords = async (
+      canonicalUrl: string,
+      keywords: readonly string[],
+    ): Promise<void> => {
+      const index = await createKeywordIndexStore(vaultRoot);
+      try {
+        index.upsertPageKeywords(`url:${canonicalUrl}`, keywords, 'deterministic', Date.now());
+      } finally {
+        index.close();
+      }
+    };
+
+    const declineUrl = async (canonicalUrl: string): Promise<void> => {
+      await eventLog.appendClient({
+        clientEventId: `decline-${canonicalUrl}`,
+        aggregateId: canonicalUrl,
+        type: USER_ORGANIZED_ITEM,
+        payload: {
+          payloadVersion: 1,
+          itemKind: 'canonical-url',
+          itemId: canonicalUrl,
+          action: 'move',
+          toContainer: null,
+        },
+        baseVector: {},
+      });
+    };
+
+    const postBatchResolve = async (urls: readonly string[]): Promise<HintResponse> => {
+      const response = await fetch(`${serverUrl}/v1/visits/batch-resolve`, {
+        method: 'POST',
+        headers: reqHeaders(),
+        body: JSON.stringify({ canonicalUrls: urls }),
+      });
+      expect(response.status).toBe(200);
+      return (await response.json()) as HintResponse;
+    };
+
+    it('weak lanes (no confident pick) + >=2 keywords -> newLabelHint present', async () => {
+      const canonicalUrl = 'https://hint.test/weak-with-keywords';
+      // Edgeless — no graph path to any workstream, the same fixture shape
+      // resolveSwrRoutes.test.ts's freeze-guard test proves settles with
+      // gate 'no-candidates'.
+      await connectionsStore.putCurrent(snapshotForUrls([canonicalUrl], 'rev-hint-weak'));
+      await seedKeywords(canonicalUrl, ['rust', 'ownership', 'systems']);
+
+      const body = await postBatchResolve([canonicalUrl]);
+      const result = body.data.results[canonicalUrl]!;
+      expect(result.decision.gate?.reason).toBe('no-candidates');
+      expect(result.fusedCandidates.length).toBe(0);
+      expect(result.newLabelHint).toEqual({
+        name: 'rust ownership systems',
+        keywords: ['rust', 'ownership', 'systems'],
+      });
+    });
+
+    it('a strong existing-workstream match -> newLabelHint absent (even with keywords present)', async () => {
+      const canonicalUrl = 'https://hint.test/strong-match';
+      const anchorUrl = 'https://hint.test/strong-match-anchor';
+      await connectionsStore.putCurrent({
+        scope: {},
+        nodes: [
+          {
+            id: `timeline-visit:${canonicalUrl}`,
+            kind: 'timeline-visit',
+            label: 'Target URL',
+            originReplicaIds: [],
+            metadata: { canonicalUrl },
+          },
+          {
+            id: 'workstream:ws_hint_security',
+            kind: 'workstream',
+            label: 'Security workstream',
+            originReplicaIds: [],
+            metadata: {},
+          },
+          {
+            id: `timeline-visit:${anchorUrl}`,
+            kind: 'timeline-visit',
+            label: 'Anchor URL',
+            originReplicaIds: [],
+            metadata: { canonicalUrl: anchorUrl },
+          },
+        ],
+        edges: [
+          {
+            id: 'edge:target-anchor-hint',
+            kind: 'closest_visit',
+            fromNodeId: `timeline-visit:${canonicalUrl}`,
+            toNodeId: `timeline-visit:${anchorUrl}`,
+            observedAt: '2026-05-07T10:00:00.000Z',
+            producedBy: { source: 'ranker', revisionId: 'ranker-test' },
+            confidence: 'inferred',
+          },
+          {
+            id: 'edge:anchor-workstream-hint',
+            kind: 'visit_in_workstream',
+            fromNodeId: `timeline-visit:${anchorUrl}`,
+            toNodeId: 'workstream:ws_hint_security',
+            observedAt: '2026-05-07T10:00:00.000Z',
+            producedBy: { source: 'event-log' },
+            confidence: 'asserted',
+          },
+        ],
+        updatedAt: '2026-05-07T10:00:00.000Z',
+        nodeCount: 3,
+        edgeCount: 2,
+        snapshotRevision: 'rev-hint-strong',
+      });
+      // Keywords ARE present here too — isolates that the absence below is
+      // caused by the strong match, not by a missing keyword lookup.
+      await seedKeywords(canonicalUrl, ['rust', 'ownership', 'systems']);
+
+      const body = await postBatchResolve([canonicalUrl]);
+      const result = body.data.results[canonicalUrl]!;
+      expect(result.fusedCandidates.length).toBeGreaterThan(0);
+      expect(result.newLabelHint).toBeUndefined();
+    });
+
+    it('no keywords indexed -> newLabelHint absent, even with a weak/no-confident-pick lane state', async () => {
+      const canonicalUrl = 'https://hint.test/weak-no-keywords';
+      await connectionsStore.putCurrent(snapshotForUrls([canonicalUrl], 'rev-hint-nokw'));
+      // No seedKeywords call — page was never keyword-indexed.
+
+      const body = await postBatchResolve([canonicalUrl]);
+      const result = body.data.results[canonicalUrl]!;
+      expect(result.decision.gate?.reason).toBe('no-candidates');
+      expect(result.newLabelHint).toBeUndefined();
+    });
+
+    it(
+      'a page the user explicitly declined ("not in any stream") -> newLabelHint absent even ' +
+        'with weak lanes + keywords (re-prompting a declined page would read the decline as an invitation)',
+      async () => {
+        const canonicalUrl = 'https://hint.test/declined';
+        await connectionsStore.putCurrent(snapshotForUrls([canonicalUrl], 'rev-hint-declined'));
+        await seedKeywords(canonicalUrl, ['rust', 'ownership', 'systems']);
+        await declineUrl(canonicalUrl);
+
+        const body = await postBatchResolve([canonicalUrl]);
+        const result = body.data.results[canonicalUrl]!;
+        expect(result.newLabelHint).toBeUndefined();
+      },
+    );
+
+    it('SIDETRACK_NEW_LABEL_HINT=0 disables the hint even for an otherwise-qualifying page', async () => {
+      const prevFlag = process.env[NEW_LABEL_HINT_ENV];
+      process.env[NEW_LABEL_HINT_ENV] = '0';
+      try {
+        const canonicalUrl = 'https://hint.test/flag-disabled';
+        await connectionsStore.putCurrent(snapshotForUrls([canonicalUrl], 'rev-hint-flag'));
+        await seedKeywords(canonicalUrl, ['rust', 'ownership', 'systems']);
+
+        const body = await postBatchResolve([canonicalUrl]);
+        expect(body.data.results[canonicalUrl]!.newLabelHint).toBeUndefined();
+      } finally {
+        if (prevFlag === undefined) delete process.env[NEW_LABEL_HINT_ENV];
+        else process.env[NEW_LABEL_HINT_ENV] = prevFlag;
+      }
+    });
   });
 
   it('POST /v1/visits/batch-resolve can expand focused URL event candidates', async () => {

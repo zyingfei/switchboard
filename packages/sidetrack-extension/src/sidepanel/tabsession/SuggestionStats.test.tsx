@@ -274,3 +274,117 @@ describe('SuggestionStats — lane-fallback pick (unconfirmed, page-content only
     expect(screen.queryByTestId('lane-fallback-pick')).toBeNull();
   });
 });
+
+// New-workstream hint (docs/plans/2026-08-16-category-flexibility-hyde.md §9
+// addendum) — additive `newLabelHint` field on the resolve result, present
+// only when the companion decided no existing workstream is a confident
+// match. Absent/malformed must render nothing (additive-contract parity
+// with lanes/gate); present renders a lightweight create-option that fires
+// the SAME create-then-file accept flow the suggestion cards use.
+describe('SuggestionStats — new-label hint', () => {
+  it('renders "New: <name>" alongside an empty (no-candidates) resolve when the hint is present', () => {
+    render(
+      <SuggestionStats
+        suggestion={{
+          ...resolution({ action: 'inbox', margin: 0 }, []),
+          newLabelHint: { name: 'Quantum computing', keywords: ['qubit', 'superposition'] },
+        }}
+        workstreams={workstreams}
+        showEmptyPlaceholder
+      />,
+    );
+    expect(screen.getByTestId('new-label-hint')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'New: Quantum computing' })).toBeInTheDocument();
+  });
+
+  it('renders nothing when newLabelHint is absent', () => {
+    render(
+      <SuggestionStats
+        suggestion={resolution({ action: 'inbox', margin: 0 }, [])}
+        workstreams={workstreams}
+        showEmptyPlaceholder
+      />,
+    );
+    expect(screen.queryByTestId('new-label-hint')).toBeNull();
+  });
+
+  it('accept flow: clicking "New: <name>" fires onAcceptNewLabelHint with the hint', () => {
+    const onAcceptNewLabelHint = vi.fn();
+    const hint = { name: 'Quantum computing', keywords: ['qubit'] };
+    render(
+      <SuggestionStats
+        suggestion={{ ...resolution({ action: 'inbox', margin: 0 }, []), newLabelHint: hint }}
+        workstreams={workstreams}
+        showEmptyPlaceholder
+        onAcceptNewLabelHint={onAcceptNewLabelHint}
+      />,
+    );
+    fireEvent.click(screen.getByRole('button', { name: 'New: Quantum computing' }));
+    expect(onAcceptNewLabelHint).toHaveBeenCalledWith(hint);
+  });
+
+  it('the accept button is disabled while accepting is pending', () => {
+    render(
+      <SuggestionStats
+        suggestion={{
+          ...resolution({ action: 'inbox', margin: 0 }, []),
+          newLabelHint: { name: 'Quantum computing', keywords: [] },
+        }}
+        workstreams={workstreams}
+        showEmptyPlaceholder
+        onAcceptNewLabelHint={vi.fn()}
+        acceptingNewLabelHint
+      />,
+    );
+    expect(screen.getByRole('button', { name: 'New: Quantum computing' })).toBeDisabled();
+  });
+
+  it('dismiss hides the hint locally without calling onAcceptNewLabelHint', () => {
+    const onAcceptNewLabelHint = vi.fn();
+    render(
+      <SuggestionStats
+        suggestion={{
+          ...resolution({ action: 'inbox', margin: 0 }, []),
+          newLabelHint: { name: 'Quantum computing', keywords: [] },
+        }}
+        workstreams={workstreams}
+        showEmptyPlaceholder
+        onAcceptNewLabelHint={onAcceptNewLabelHint}
+      />,
+    );
+    fireEvent.click(screen.getByRole('button', { name: 'Dismiss new-workstream suggestion' }));
+    expect(screen.queryByTestId('new-label-hint')).toBeNull();
+    expect(onAcceptNewLabelHint).not.toHaveBeenCalled();
+  });
+
+  it('renders the hint alongside a POPULATED (weak-guess) resolve too', () => {
+    render(
+      <SuggestionStats
+        suggestion={{
+          ...resolution({ action: 'inbox', margin: -0.4 }, [
+            candidate({ workstreamId: 'ws-1', rawFusionLogit: 0.6 }),
+          ]),
+          newLabelHint: { name: 'Quantum computing', keywords: [] },
+        }}
+        workstreams={workstreams}
+        showEmptyPlaceholder
+      />,
+    );
+    expect(screen.getByText('weak guess — filed to inbox')).toBeDefined();
+    expect(screen.getByRole('button', { name: 'New: Quantum computing' })).toBeInTheDocument();
+  });
+
+  it('does NOT render in filed mode (alreadyFiledWorkstreamIds set) even when the hint is present', () => {
+    render(
+      <SuggestionStats
+        suggestion={{
+          ...resolution({ action: 'inbox', margin: 0 }, []),
+          newLabelHint: { name: 'Quantum computing', keywords: [] },
+        }}
+        workstreams={workstreams}
+        alreadyFiledWorkstreamIds={new Set(['ws-1'])}
+      />,
+    );
+    expect(screen.queryByTestId('new-label-hint')).toBeNull();
+  });
+});

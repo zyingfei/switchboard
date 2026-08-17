@@ -9,6 +9,7 @@ import { createEventLog, type EventLog } from '../sync/eventLog.js';
 import { loadOrCreateReplica } from '../sync/replicaId.js';
 import { createVaultWriter } from '../vault/writer.js';
 import { createSuggestionCandidateStore } from '../workstreams/suggestionCandidateStore.js';
+import { recomputeSuggestionCandidates } from '../workstreams/splitSuggestionEngine.js';
 import { createIdempotencyStore } from './idempotency.js';
 import { createCompanionHttpServer, startHttpServer } from './server.js';
 
@@ -253,6 +254,54 @@ describe('workstreams routes — UI-visibility phase', () => {
       const body = (await response.json()) as { data: { candidates: { fingerprint: string }[] } };
       expect(body.data.candidates.map((c) => c.fingerprint)).toEqual(['x y z']);
     });
+
+    it(
+      'a candidate the engine emits on its liberal-default FIRST computation is immediately ' +
+        'visible via GET — no hidden second gate beyond emitted && !dismissed',
+      async () => {
+        // Real engine call (not a hand-built store row like the tests
+        // above) — proves the route's `emitted && !dismissed` filter is the
+        // ONLY gate between "the engine decided to surface this" and "the
+        // panel can see it." No options.stabilityMinConsecutive passed, so
+        // this exercises the actual production default
+        // (resolveSuggestionStabilityMinConsecutive() = 1).
+        const basis = (index: number, dims = 8): Float32Array => {
+          const v = new Float32Array(dims);
+          v[index] = 1;
+          return v;
+        };
+        const store = await createSuggestionCandidateStore(vaultRoot);
+        try {
+          const groupA = Array.from({ length: 4 }, (_, i) => ({
+            id: `liberal-a-${i}`,
+            embedding: basis(0),
+            title: `alpha evidence ${i}`,
+          }));
+          const groupB = Array.from({ length: 4 }, (_, i) => ({
+            id: `liberal-b-${i}`,
+            embedding: basis(1),
+            title: `beta evidence ${i}`,
+          }));
+          const result = recomputeSuggestionCandidates(store, {
+            scopeId: 'ws_liberal',
+            kind: 'split',
+            evidence: [...groupA, ...groupB],
+            revisionId: 'rev-1',
+          });
+          expect(result.newlyEmitted.length).toBe(2);
+        } finally {
+          store.close();
+        }
+
+        const response = await fetch(
+          `${serverUrl}/v1/workstreams/suggestions?kind=split&workstreamId=ws_liberal`,
+          { headers: headers() },
+        );
+        expect(response.status).toBe(200);
+        const body = (await response.json()) as { data: { candidates: { fingerprint: string }[] } };
+        expect(body.data.candidates.length).toBe(2);
+      },
+    );
 
     it('decline marks a candidate dismissed, and it stops appearing in the read surface', async () => {
       const store = await createSuggestionCandidateStore(vaultRoot);

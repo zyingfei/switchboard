@@ -92,13 +92,68 @@ export const DEFAULT_SPLIT_COSINE_THRESHOLD = DEFAULT_TOPIC_COSINE_THRESHOLD;
 export const DEFAULT_SPLIT_MIN_SAMPLES = HDBSCAN_TOPIC_MIN_SAMPLES;
 // "each above a minimum member count (tune against the golden set, starting
 // above HDBSCAN_TOPIC_MIN_SAMPLES=3 since 'worth splitting' is a higher bar
-// than 'is a cluster')" — design §4.
+// than 'is a cluster')" — design §4. ENV-TUNABLE (2026-08-17,
+// SIDETRACK_SUGGESTION_MIN_MEMBERS — see resolveSuggestionMinClusterMembers
+// below) but the DEFAULT is unchanged: unlike the stability gate below, a
+// structurally-too-small cluster is still noise no matter how cheap
+// dismissal is, so only "how many times has this looked the same" loosens
+// by default, not "how big must it be."
 export const DEFAULT_MIN_CLUSTER_MEMBERS = HDBSCAN_TOPIC_MIN_SAMPLES + 1;
-// Conservative judgment call (not specified numerically by the design):
-// three consecutive stable computations before a suggestion is allowed to
-// surface at all — "conservative defaults (no suggestion fires below
-// stability threshold)".
-export const DEFAULT_STABILITY_MIN_CONSECUTIVE = 3;
+
+// ---- stability gate — LIBERAL BY DEFAULT (2026-08-17 scope decision) -----
+//
+// WAS a conservative judgment call: three consecutive stable computations
+// before a suggestion is allowed to surface at all — "conservative defaults
+// (no suggestion fires below stability threshold)" (original §4 design).
+//
+// NOW default 1 (surfaces on a candidate's FIRST qualifying computation).
+// Rationale: per-workstream/population decline memory (isSuppressedByDecline
+// below, backed by suggestionCandidateStore.ts's declineCandidate +
+// declinedConceptSets) makes a WRONG suggestion nearly free to dismiss — one
+// click, and that concept-set never resurfaces for this scope+kind again.
+// Heavy stability gating was withholding value (every genuinely-good split/
+// new-category candidate waited N-1 extra recompute cycles — at this
+// engine's suggestionRecomputeLane.ts cadence, minutes) to guard against a
+// cost — an unwanted suggestion visible for one cycle — that the decline UI
+// already makes cheaper than the gate itself. Declined signatures stay
+// suppressed exactly as before; only the FIRST-time-surfacing bar moved.
+// Tunable back up via SIDETRACK_SUGGESTION_STABILITY for anyone who wants
+// the old conservative cadence (or a stricter one).
+export const SUGGESTION_STABILITY_ENV = 'SIDETRACK_SUGGESTION_STABILITY';
+export const DEFAULT_STABILITY_MIN_CONSECUTIVE = 1;
+
+/** Parse SIDETRACK_SUGGESTION_STABILITY — a >=1 integer count of consecutive
+ *  stable computations required before a candidate is allowed to emit.
+ *  Absent/garbage/<1 all fall back to the liberal default (1), same
+ *  silent-fallback idiom as resolveKeywordClusterWeight. */
+export const resolveSuggestionStabilityMinConsecutive = (): number => {
+  const raw = process.env[SUGGESTION_STABILITY_ENV];
+  if (raw === undefined || raw === '') return DEFAULT_STABILITY_MIN_CONSECUTIVE;
+  const parsed = Number.parseInt(raw, 10);
+  if (!Number.isFinite(parsed) || parsed < 1) return DEFAULT_STABILITY_MIN_CONSECUTIVE;
+  return parsed;
+};
+
+// Floor for SIDETRACK_SUGGESTION_MIN_MEMBERS below — never below the density
+// primitive's own min-samples (HDBSCAN_TOPIC_MIN_SAMPLES): a cluster smaller
+// than that isn't a cluster by the clustering primitive's own definition,
+// regardless of operator intent.
+export const SUGGESTION_MIN_MEMBERS_ENV = 'SIDETRACK_SUGGESTION_MIN_MEMBERS';
+export const SUGGESTION_MIN_MEMBERS_FLOOR = HDBSCAN_TOPIC_MIN_SAMPLES;
+
+/** Parse SIDETRACK_SUGGESTION_MIN_MEMBERS. Absent/garbage/below-floor all
+ *  fall back to DEFAULT_MIN_CLUSTER_MEMBERS (unchanged from the original
+ *  design) — this knob only ever WIDENS the floor above the default's own
+ *  conservative value, it does not narrow it below SUGGESTION_MIN_MEMBERS_FLOOR. */
+export const resolveSuggestionMinClusterMembers = (): number => {
+  const raw = process.env[SUGGESTION_MIN_MEMBERS_ENV];
+  if (raw === undefined || raw === '') return DEFAULT_MIN_CLUSTER_MEMBERS;
+  const parsed = Number.parseInt(raw, 10);
+  if (!Number.isFinite(parsed) || parsed < SUGGESTION_MIN_MEMBERS_FLOOR) {
+    return DEFAULT_MIN_CLUSTER_MEMBERS;
+  }
+  return parsed;
+};
 // How much member-set overlap counts as "the same emerging cluster" across
 // rounds despite a little membership drift.
 export const DEFAULT_MATCH_OVERLAP_MIN_JACCARD = 0.75;
@@ -332,9 +387,10 @@ export const recomputeSuggestionCandidates = (
 
   const cosineThreshold = input.options?.cosineThreshold ?? DEFAULT_SPLIT_COSINE_THRESHOLD;
   const minSamples = input.options?.minSamples ?? DEFAULT_SPLIT_MIN_SAMPLES;
-  const minClusterMembers = input.options?.minClusterMembers ?? DEFAULT_MIN_CLUSTER_MEMBERS;
+  const minClusterMembers =
+    input.options?.minClusterMembers ?? resolveSuggestionMinClusterMembers();
   const stabilityMinConsecutive =
-    input.options?.stabilityMinConsecutive ?? DEFAULT_STABILITY_MIN_CONSECUTIVE;
+    input.options?.stabilityMinConsecutive ?? resolveSuggestionStabilityMinConsecutive();
   const matchOverlapMinJaccard =
     input.options?.matchOverlapMinJaccard ?? DEFAULT_MATCH_OVERLAP_MIN_JACCARD;
   const minEvidenceToAttempt = input.options?.minEvidenceToAttempt ?? DEFAULT_MIN_EVIDENCE_TO_ATTEMPT;
