@@ -302,10 +302,18 @@ describe('connections materializer — instant boot (B5 acceptance)', () => {
     // fail loudly instead of silently weakening this delta-size guard.
     expect(resumeLines.some((l) => /\bevents=1\b/.test(l))).toBe(true);
 
-    // B5(c) — boot to healthy-serving bounded at fixture scale.
-    expect(bootMs).toBeLessThan(5_000);
+    // B5(c) — boot to healthy-serving bounded at fixture scale. The real
+    // regression this guards against (an accidental full-log seed instead of
+    // a resume-fold) is already pinned above by the seedLines/resumeLines
+    // phase-log assertions — at this 6-event fixture scale it would blow
+    // past this bound by orders of magnitude, not by a factor of 2-3x. The
+    // literal wall-clock number is therefore CI-noise budget, not the load-
+    // bearing check: raise it generously (measured ~0.1-0.2s locally,
+    // unloaded) rather than leave a tight bound that flakes under a
+    // contended shared runner without adding any real regression coverage.
+    expect(bootMs).toBeLessThan(15_000);
     expect(m.health().status).toBe('healthy');
-  });
+  }, 20_000);
 
   // B5(b) — reboot after a torn drain. Instance A imports events but its drain
   // is never run (a kill-9 mid-drain leaves the persisted progress behind the

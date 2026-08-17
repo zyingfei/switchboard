@@ -626,6 +626,15 @@ const delay = async (ms: number): Promise<void> => {
   });
 };
 
+// CI budget: these tests seed 40k-350k real event lines to disk (seedShards)
+// and then walk them (prewarmAppendIndexes — sometimes twice, plus an oracle
+// cold rebuild) to make the timing/ordering assertions meaningful at real
+// scale. Locally that's well under 2s, but bun:test's 5000ms DEFAULT has
+// been observed failing on the shared, contended CI runner — parsing/
+// folding hundreds of thousands of lines is genuinely CPU-bound work whose
+// wall-clock cost scales with runner contention, not a hang. Give each an
+// explicit budget (same pattern as ae4a8d5a) instead of letting loaded-
+// runner slowness block unrelated merges.
 describe('append-index prewarm holds the append mutex only for bounded segments', () => {
   let vaultRoot: string;
   let replica: ReplicaContext;
@@ -696,7 +705,7 @@ describe('append-index prewarm holds the append mutex only for bounded segments'
     // while still failing loudly if an append ever goes back to waiting
     // for the whole pass (ratio ~1.0).
     expect(appendMs).toBeLessThan(warmMs / 2);
-  });
+  }, 30_000);
 
   it('builds the same index a cold rebuild would, after a chunked warm with interleaved appends', async () => {
     await seedShards(vaultRoot, 'replica-seed', 40_000);
@@ -764,7 +773,7 @@ describe('append-index prewarm holds the append mutex only for bounded segments'
     });
     expect(serverObserved.deps).toEqual(expectedDeps);
     expect(expectedDeps).not.toEqual({});
-  });
+  }, 30_000);
 
   it('catches a foreign shard written between warm segments via the signature guard', async () => {
     await seedShards(vaultRoot, 'replica-seed', 40_000);
@@ -821,5 +830,5 @@ describe('append-index prewarm holds the append mutex only for bounded segments'
       baseVector: {},
     });
     expect(dedupedAgain.dot).toEqual({ replicaId: 'replica-ext', seq: 7 });
-  });
+  }, 30_000);
 });
