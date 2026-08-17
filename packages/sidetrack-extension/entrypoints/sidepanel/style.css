@@ -1606,6 +1606,25 @@ button:disabled {
   text-overflow: ellipsis;
 }
 
+/* Primary-membership remove (§9 addendum scope 4) — same quiet idiom as
+   .membership-chip-remove so the primary's "×" doesn't out-shout the
+   badge it lives on. */
+.tab-session-badge-remove {
+  flex: 0 0 auto;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  opacity: 0.6;
+  font-size: 11px;
+  line-height: 1;
+  margin-left: 4px;
+  padding: 0 1px;
+  cursor: pointer;
+}
+.tab-session-badge-remove:hover {
+  opacity: 1;
+}
+
 /* Backwards-compat: keep `.is-asserted` styled like user-asserted in
    case any code still emits it. */
 .tab-session-badge.is-asserted {
@@ -1682,6 +1701,14 @@ button:disabled {
 .membership-chip-add:disabled {
   opacity: 0.4;
   cursor: default;
+}
+/* Honest fallback when the batched memberships overlay has never loaded —
+   see FocusedMemberships.tsx's WHY-VISIBILITY note. Muted like every other
+   "unknown" marker on the card (AttributionBadge's empty dash), never
+   invisible. */
+.membership-chips-fallback {
+  flex: 0 0 auto;
+  font-size: 10px;
 }
 
 .tab-session-capture-badge {

@@ -20,6 +20,7 @@ import {
   type GuessGate,
   type GuessLaneResult,
   guessLaneSignalCount,
+  type NewLabelHint,
   parseGuessGate,
   type ResolveOutcomeError,
   type TabSessionResolutionResult,
@@ -38,16 +39,27 @@ function LanePipeline({
   gate,
   fusedCount,
   onFileHere,
+  alreadyMemberWorkstreamIds,
+  onAddSecondary,
   prototypeStatusByWorkstream,
+  defaultOpen = false,
 }: {
   readonly lanes: readonly GuessLaneResult[];
   readonly workstreams: readonly TabSessionWorkstreamOption[];
   readonly gate?: GuessGate;
   readonly fusedCount: number;
   readonly onFileHere?: (workstreamId: string) => void;
+  // See GuessLanesProps — multi-membership "filed" mode. Passed straight
+  // through to GuessLanes; onFileHere is ignored there when this is set.
+  readonly alreadyMemberWorkstreamIds?: ReadonlySet<string>;
+  readonly onAddSecondary?: (workstreamId: string) => void;
   readonly prototypeStatusByWorkstream?: ReadonlyMap<string, WorkstreamPrototypeStatus>;
+  // Filed-lanes-only mode starts collapsed (the card is dominated by the
+  // AttributionBadge + provenance line already) but MUST stay reachable —
+  // this only changes the initial state, never hides the toggle.
+  readonly defaultOpen?: boolean;
 }) {
-  const [open, setOpen] = useState(false);
+  const [open, setOpen] = useState(defaultOpen);
   return (
     <>
       <PipelineStrip
@@ -66,11 +78,61 @@ function LanePipeline({
         open={open}
         onToggle={setOpen}
         {...(onFileHere === undefined ? {} : { onFileHere })}
+        {...(alreadyMemberWorkstreamIds === undefined
+          ? {}
+          : { alreadyMemberWorkstreamIds })}
+        {...(onAddSecondary === undefined ? {} : { onAddSecondary })}
         {...(prototypeStatusByWorkstream === undefined
           ? {}
           : { prototypeStatusByWorkstream })}
       />
     </>
+  );
+}
+
+// New-workstream hint (§9 addendum) — a lightweight create-option alongside
+// the existing workstream guesses, shown ONLY when the companion itself
+// decided no existing workstream is a confident match (an additive,
+// possibly-absent field on the resolve result — see NewLabelHint). Dismiss
+// is local-only: nothing is persisted, so the hint simply recomputes on the
+// next resolve (matches "it recomputes per page").
+function NewLabelHintRow({
+  hint,
+  onAccept,
+  pending = false,
+}: {
+  readonly hint: NewLabelHint;
+  readonly onAccept?: (hint: NewLabelHint) => void;
+  readonly pending?: boolean;
+}) {
+  const [dismissed, setDismissed] = useState(false);
+  if (dismissed) return null;
+  return (
+    <div className="new-label-hint" data-testid="new-label-hint">
+      <span className="new-label-hint-label subtle">No confident match —</span>
+      <button
+        type="button"
+        className="btn-link new-label-hint-accept"
+        disabled={onAccept === undefined || pending}
+        onClick={() => {
+          onAccept?.(hint);
+        }}
+        title={`Create a new workstream "${hint.name}" and file this page there`}
+      >
+        New: {hint.name}
+      </button>
+      <button
+        type="button"
+        className="new-label-hint-dismiss"
+        onClick={() => {
+          setDismissed(true);
+        }}
+        aria-label="Dismiss new-workstream suggestion"
+        title="Dismiss — nothing is saved, so this may reappear next time this page is checked"
+      >
+        ×
+      </button>
+    </div>
   );
 }
 
@@ -244,6 +306,29 @@ export interface SuggestionStatsProps {
   // threaded down to the guess-lanes disclosure's prototype row. Omitted
   // -> that row renders exactly as before (no extra status line).
   readonly prototypeStatusByWorkstream?: ReadonlyMap<string, WorkstreamPrototypeStatus>;
+  // Multi-membership "filed" mode (docs/plans/2026-08-16-category-
+  // flexibility-hyde.md §9 addendum). When the focused page already has a
+  // primary workstream, the unfiled headline/possibilities make no sense
+  // (AttributionBadge + AttributionProvenance already say what's filed) —
+  // pass the page's CURRENT primary + secondary workstream ids here to
+  // switch SuggestionStats into filed mode: it renders ONLY the lane
+  // pipeline (strip + a collapsed-by-default but always-reachable
+  // disclosure), and every lane guess becomes an "also add as secondary"
+  // action (via `onAddSecondaryFromLane`) instead of a re-file. `undefined`
+  // (the default) keeps the existing unfiled behavior exactly as before.
+  readonly alreadyFiledWorkstreamIds?: ReadonlySet<string>;
+  // Used INSTEAD of `onFileHere` when `alreadyFiledWorkstreamIds` is set —
+  // adds a SECONDARY membership (the same route the main card's "+" chip
+  // uses), never re-files the primary.
+  readonly onAddSecondaryFromLane?: (workstreamId: string) => void;
+  // New-workstream hint accept (§9 addendum) — fires create-workstream +
+  // file-primary for `suggestion.newLabelHint`. Omitted -> the "New: <name>"
+  // chip still renders (when the hint is present) but its button is
+  // disabled, matching every other optional action in this file.
+  readonly onAcceptNewLabelHint?: (hint: NewLabelHint) => void;
+  // True while a new-label-hint accept is in flight — dims the "New: <name>"
+  // button so a double-click can't fire two creates.
+  readonly acceptingNewLabelHint?: boolean;
 }
 
 export function SuggestionStats({
@@ -258,7 +343,35 @@ export function SuggestionStats({
   error,
   onFileHere,
   prototypeStatusByWorkstream,
+  alreadyFiledWorkstreamIds,
+  onAddSecondaryFromLane,
+  onAcceptNewLabelHint,
+  acceptingNewLabelHint = false,
 }: SuggestionStatsProps) {
+  // Filed mode (§9 addendum) — short-circuits everything below. The page
+  // already has a primary workstream, so the unfiled headline/possibilities
+  // machinery doesn't apply; the only thing left worth showing is the lane
+  // disclosure, reachable (collapsed by default) rather than absent, with
+  // every guess re-scoped to "add as secondary". Nothing to disclose (no
+  // suggestion yet, or an old companion with no lanes) renders nothing —
+  // there's no headline to fall back to in this mode.
+  if (alreadyFiledWorkstreamIds !== undefined) {
+    if (suggestion?.lanes === undefined || suggestion.lanes.length === 0) return null;
+    const filedGate = parseGuessGate(suggestion.decision.gate);
+    return (
+      <div className="suggestion-stats is-filed-lanes" data-testid="suggestion-stats-filed-lanes">
+        <LanePipeline
+          lanes={suggestion.lanes}
+          workstreams={workstreams}
+          {...(filedGate === undefined ? {} : { gate: filedGate })}
+          fusedCount={suggestion.fusedCandidates.length}
+          alreadyMemberWorkstreamIds={alreadyFiledWorkstreamIds}
+          {...(onAddSecondaryFromLane === undefined ? {} : { onAddSecondary: onAddSecondaryFromLane })}
+          {...(prototypeStatusByWorkstream === undefined ? {} : { prototypeStatusByWorkstream })}
+        />
+      </div>
+    );
+  }
   // error !== empty !== pending !== populated — the discriminant that
   // keeps a failed resolve from masquerading as a confident empty card.
   const state = suggestionStateFrom({
@@ -418,6 +531,13 @@ export function SuggestionStats({
               ? {}
               : { prototypeStatusByWorkstream })}
           />
+          {suggestion.newLabelHint !== undefined ? (
+            <NewLabelHintRow
+              hint={suggestion.newLabelHint}
+              {...(onAcceptNewLabelHint === undefined ? {} : { onAccept: onAcceptNewLabelHint })}
+              pending={acceptingNewLabelHint}
+            />
+          ) : null}
         </div>
       );
     }
@@ -462,6 +582,13 @@ export function SuggestionStats({
             {...(prototypeStatusByWorkstream === undefined
               ? {}
               : { prototypeStatusByWorkstream })}
+          />
+        ) : null}
+        {suggestion.newLabelHint !== undefined ? (
+          <NewLabelHintRow
+            hint={suggestion.newLabelHint}
+            {...(onAcceptNewLabelHint === undefined ? {} : { onAccept: onAcceptNewLabelHint })}
+            pending={acceptingNewLabelHint}
           />
         ) : null}
       </div>
@@ -648,6 +775,13 @@ export function SuggestionStats({
           fusedCount={suggestion.fusedCandidates.length}
           {...(onFileHere === undefined ? {} : { onFileHere })}
           {...(prototypeStatusByWorkstream === undefined ? {} : { prototypeStatusByWorkstream })}
+        />
+      ) : null}
+      {suggestion.newLabelHint !== undefined ? (
+        <NewLabelHintRow
+          hint={suggestion.newLabelHint}
+          {...(onAcceptNewLabelHint === undefined ? {} : { onAccept: onAcceptNewLabelHint })}
+          pending={acceptingNewLabelHint}
         />
       ) : null}
     </div>

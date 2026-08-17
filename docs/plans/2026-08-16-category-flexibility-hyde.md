@@ -734,6 +734,162 @@ run) — unrelated file, not caused by this phase's changes. Bun itself
 own summary prints "0 fail" — an engine-level crash ("this indicates a
 bug in Bun, not your code"), not a test failure.
 
+### §9 addendum — main-card visibility gap closed, lane-tap add-secondary, primary removal (2026-08-17/18)
+
+**The gap.** §9's A.1 wired `MembershipChips` into `InboxCard.tsx`,
+`WorkstreamPicker` rows, and `WorkstreamDetailPanel` — but never the
+primary focused-page ("Now") card, which is where the user actually looks
+first. Verified live (build 4f27316b) against a real page with a
+backfilled `role:'primary'` membership row
+(`https://duckdb.org/2026/05/12/quack-remote-protocol`,
+`GET /v1/visits/{url}/memberships` confirmed real data): the Now card's
+"In workstream: —" row rendered no chips and no add affordance at all.
+
+**Fix — `FocusedMemberships.tsx`** (new, `src/sidepanel/tabsession/`),
+mounted immediately under the existing `AttributionBadge` at the "In
+workstream:" row in `App.tsx`. Thin wrapper around the EXISTING
+`MembershipChips` (no new component logic for chip rendering itself) that
+adds exactly one thing `MembershipChips` doesn't know about:
+WHY-VISIBILITY when the batched overlay (`/v1/visits/projection`'s
+`memberships` field) has never loaded. The wire contract omits
+`memberships` on zero rows, so a per-record read can't distinguish
+"genuinely empty" from "overlay never arrived" — a new `urlProjection ===
+null && urlProjectionFetchFailed` App-level discriminant (the latter a new
+state flag set in `loadTabSessions`'s existing catch/invalid-payload
+branches) renders a muted "—" fallback instead, with `console.debug`
+audibility. Add/remove reuse the SAME `handleAddMembership`/
+`handleRemoveMembership` (canonicalUrl, workstreamId) handlers InboxCard
+already uses — no new companion route, no new semantics (add always
+defaults `role:'secondary'` per #384's existing contract).
+
+**Scope creep, all mid-task, same surfaces — taken on rather than
+deferred:**
+
+1. **New-workstream hint.** `TabSessionResolutionResult`/
+   `UrlResolutionResult` gain an additive, lenient-parsed
+   `newLabelHint?: { name, keywords }` (same absent-or-malformed → absent
+   contract as `lanes`/`gate` — `parseNewLabelHint` in `types.ts`,
+   normalized in `App.tsx`'s existing `normalizeResolutionLanes` choke
+   point). `SuggestionStats.tsx` renders a `NewLabelHintRow` — "New:
+   `<name>`" + a plain "×" dismiss (local-only React state, nothing
+   persisted, so it simply recomputes next resolve) — alongside the
+   existing possibilities/lane rows whenever the field is present. Accept
+   reuses the EXACT create-then-file mechanics
+   `acceptSuggestionCandidate` (§9's A.2) already established:
+   `POST /v1/workstreams` create, then
+   `POST .../memberships {role:'primary'}` for this one page. The
+   companion side of this field (when/why the resolver attaches it) is a
+   PARALLEL, separately-landing change — this PR is the panel's
+   additive-contract half only; absent field renders nothing today until
+   that lands.
+
+2. **Lane disclosure reachable on a filed page.** Before this PR,
+   `SuggestionStats` (and the guess-lane disclosure it owns) rendered
+   ONLY for an unattributed URL — a one-label-world assumption. With
+   multi-membership, the lanes are the natural source of "also add this?"
+   candidates even after a primary is set, so hiding them was a
+   regression the moment §1/§9 shipped multiple memberships. New
+   `alreadyFiledWorkstreamIds` prop switches `SuggestionStats` into a
+   short-circuited "filed" mode: skips the unfiled headline/possibilities
+   machinery entirely, renders ONLY the pipeline-strip + a
+   collapsed-by-default (native `<details>`, same idiom as unfiled mode)
+   but always-reachable lane disclosure. `GuessLanes`/`LaneRow` gained
+   `alreadyMemberWorkstreamIds` + `onAddSecondary`: a guess for a
+   workstream the page is NOT yet in renders an "Also add" button (title
+   `Also add to <name>?`) that POSTs a SECONDARY membership via the same
+   route the main card's "+" uses — never a re-file; a guess for a
+   workstream the page IS already in renders inert (`✓ already in`, no
+   button). `onFileHere` is never called in this mode even if both
+   callbacks are wired.
+
+3. **Primary removal.** The "×" now lives directly on `AttributionBadge`
+   (not a duplicate primary chip — the badge IS the primary's one visual
+   representation) for any REAL attribution (any source), worded "Remove
+   from `<name>`" like every other remove affordance, no modal (liberal-
+   with-cheap-undo: re-adding is one tap). **Companion finding:** the
+   `POST .../memberships/:id/remove` route already accepts removing a
+   primary-role row with zero role-based validation — confirmed by
+   reading the handler (it never even looks up the row's role) and by the
+   ALREADY-EXISTING `membershipEvents.test.ts` case "removing the primary
+   leaves zero primaries, not a silent promotion" (pins
+   `foldWorkstreamMembership`'s cross-pair invariant at the fold level:
+   `currentPrimary` only tracks live `SET` events, so a `REMOVED` winner
+   never re-elects anything). Added one route-level HTTP test
+   (`visitsRoutes.test.ts`) pinning the SAME thing through the wire:
+   POST-201, GET-back-empty. **No companion source change was needed** —
+   the gap was purely panel-side: `currentAttribution` (the pre-multi-
+   membership scalar `AttributionBadge` reads, per §9's A.1 finding) is
+   an INDEPENDENT fold from the membership store, so removing the primary
+   membership row alone would leave the badge still showing the old name.
+   Closed by composing the SAME two existing routes
+   (`removePrimaryMembership` in `App.tsx`): drop the row, then
+   `attributeUrlToWorkstream(canonicalUrl, null)` — the identical call
+   "Not in any stream" already makes. No auto-promotion: a surviving
+   secondary stays secondary, full stop; removing the page's LAST
+   membership clears `currentAttribution` to empty, which — for free,
+   since `alreadyFiledWorkstreamIds` derives from it — flips the card back
+   to unfiled mode (lanes + new-label hint reachable again) with no
+   additional code.
+
+**Tests.** Extension: `FocusedMemberships.test.tsx` (6, unfiled/primary-
+only/primary+secondaries/add/remove/fetch-error), `AttributionBadge.test.tsx`
++4 (remove button present/absent/empty-badge/weak-guess-badge),
+`SuggestionStats.test.tsx` +7 (new-label-hint present/absent/accept/
+pending/dismiss/populated-branch/suppressed-in-filed-mode),
+`guessLanes.test.tsx` +5 (filed-mode reachable-collapsed/empty-renders-
+nothing/add-secondary-not-refile/already-in-inert), `app.test.tsx` +9
+across two describes: 4 main-card membership-chip integration tests
+(render/add/remove/fetch-error-fallback, CDP-verified against the live
+gap) + 5 lane-disclosure/primary-removal integration tests against a
+small stateful fake companion (filed page exposes lanes with an
+already-member guess inert; tapping a not-yet-member guess POSTs a
+secondary add, never `/attribute`; removing the primary with a secondary
+present clears the badge but the secondary chip survives — asserted no
+`/attribute` call ever names the secondary; removing the LAST membership
+round-trips back to an ordinary actionable "File here" lane guess;
+new-label-hint accept fires `createWorkstream` then
+`POST .../memberships {role:'primary'}`). Companion:
+`visitsRoutes.test.ts` +1 (primary-removal route-level, above);
+`membershipEvents.test.ts`'s pre-existing zero-primary case re-verified,
+untouched. `bun test` (companion, targeted: `visitsRoutes.test.ts`,
+`membershipEvents.test.ts`, `workstreamMembershipStore.test.ts`) and
+`vitest run tests/unit` (extension, full: 162 files / 1461 tests) both
+green; `tsc --noEmit` clean in both packages; `bun run build` (extension)
+clean.
+
+**Live verification (CDP, build rebuilt + rsynced over the loaded unpacked
+path, deploy checkout `git status --porcelain` empty throughout).**
+Against the SAME real filed page cited above (primary = "big data / db",
+zero secondaries): the "In workstream:" row now renders `big data / db ×`
+(the new remove button, `title="Remove from big data / db"`) plus the
+membership-chips "+" add affordance immediately after — both absent
+before this PR. The lane disclosure — previously entirely absent once a
+page had a primary — renders "Guess lanes · 6 of 9 with signal" on this
+filed page; opening it live-showed Graph/Similar-pages/Content-match all
+marked `✓ already in` (their guess is the current primary) alongside
+Title-match/Recently-active/Prototype-match each rendering a real "Also
+add" button with the exact `Also add to <name>?` title. Primary removal
+and the "Also add" click were verified mechanically (full automated round
+trip, including the companion-side fold) rather than clicked live against
+the user's real daily vault: adding is low-risk/reversible and was
+click-verified live in the original (pre-scope-creep) pass of this task;
+removing a real page's real primary classification is a more consequential,
+harder-to-casually-undo mutation to the user's actual data, so that path
+relies on the CDP-confirmed button wiring above plus the 5 App-level +
+2 companion-level automated tests exercising the exact same click → POST →
+re-render sequence.
+
+**Deviations, stated plainly:** (1) `newLabelHint` render/accept is
+panel-only; nothing renders against the live companion today because no
+companion build yet emits the field (parallel in-flight change). (2) No
+InboxCard/InboxView changes for filed-mode lanes or primary removal —
+scoped to the main card only, matching this PR's own surface; `InboxCard`
+never showed lanes for a filed row before either (filed rows don't reach
+the Inbox list), so there's no regression there to fix. (3) Live-click
+verification of primary removal was intentionally skipped against the
+daily companion for the reason above — mechanism is otherwise identically
+covered to every other flow in this addendum.
+
 ## 10. Landing note — gist keywords as sparse-data clustering features + new-topic suggestions (2026-08-17)
 
 Shipped in one PR on `feat/gist-keywords-clustering`, branched from this

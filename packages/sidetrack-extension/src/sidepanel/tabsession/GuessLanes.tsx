@@ -73,7 +73,21 @@ export interface GuessLanesProps {
   // The EXISTING pick/move flow (handleUrlAttribute on the Current Tab card).
   // When omitted the lane rows render read-only (no "File here" button), so
   // the surface degrades cleanly for callers that don't wire filing.
+  // IGNORED when `alreadyMemberWorkstreamIds` is provided — see below.
   readonly onFileHere?: (workstreamId: string) => void;
+  // Multi-membership (docs/plans/2026-08-16-category-flexibility-hyde.md §9
+  // addendum) — when the focused page already HAS a primary workstream, a
+  // lane guess can no longer mean "file here" (that would silently replace
+  // the primary). Passing the page's current primary + secondary workstream
+  // ids switches every lane row's action to "add as a secondary membership"
+  // instead: `onAddSecondary` fires (never `onFileHere`, even if both are
+  // passed), and a guess for a workstream already in this set renders as an
+  // inert "already in" marker rather than a button.
+  readonly alreadyMemberWorkstreamIds?: ReadonlySet<string>;
+  // Used INSTEAD of `onFileHere` when `alreadyMemberWorkstreamIds` is set —
+  // adds a SECONDARY membership (the same route the main card's "+" chip
+  // affordance uses), never re-files the primary.
+  readonly onAddSecondary?: (workstreamId: string) => void;
   // Pipeline-strip control (feat/pipeline-strip). When BOTH are provided the
   // disclosure becomes CONTROLLED — its open state is driven by the strip's
   // dots-row button (controls co-located with state) rather than the native
@@ -96,11 +110,15 @@ function LaneRow({
   lane,
   workstreams,
   onFileHere,
+  alreadyMemberWorkstreamIds,
+  onAddSecondary,
   prototypeStatusByWorkstream,
 }: {
   readonly lane: GuessLaneResult;
   readonly workstreams: readonly TabSessionWorkstreamOption[];
   readonly onFileHere?: (workstreamId: string) => void;
+  readonly alreadyMemberWorkstreamIds?: ReadonlySet<string>;
+  readonly onAddSecondary?: (workstreamId: string) => void;
   readonly prototypeStatusByWorkstream?: ReadonlyMap<string, WorkstreamPrototypeStatus>;
 }) {
   const label = LANE_LABEL[lane.lane];
@@ -118,6 +136,12 @@ function LaneRow({
     );
   }
   const topName = workstreamLabel(top.workstreamId, workstreams);
+  // Multi-membership mode (alreadyMemberWorkstreamIds provided): a guess
+  // never re-files the primary. Three states instead of the plain
+  // file-or-not-wired binary above: already a member (inert marker),
+  // actionable add-secondary (button), or read-only (no callback wired).
+  const filedMode = alreadyMemberWorkstreamIds !== undefined;
+  const alreadyMember = filedMode && alreadyMemberWorkstreamIds.has(top.workstreamId);
   return (
     <li className="guess-lane">
       <span className="guess-lane-head">
@@ -130,7 +154,28 @@ function LaneRow({
             honest evidence is the why line (match count + named documents);
             runner-up rows keep their percents, which ARE informative because
             they are relative to this top. */}
-        {onFileHere !== undefined ? (
+        {alreadyMember ? (
+          <span
+            className="guess-lane-already-in mono subtle"
+            title={`Already in ${topName}`}
+            data-testid="guess-lane-already-in"
+          >
+            ✓ already in
+          </span>
+        ) : filedMode ? (
+          onAddSecondary !== undefined ? (
+            <button
+              type="button"
+              className="btn-link guess-lane-file"
+              onClick={() => {
+                onAddSecondary(top.workstreamId);
+              }}
+              title={`Also add to ${topName}?`}
+            >
+              Also add
+            </button>
+          ) : null
+        ) : onFileHere !== undefined ? (
           <button
             type="button"
             className="btn-link guess-lane-file"
@@ -200,6 +245,8 @@ export function GuessLanes({
   lanes,
   workstreams,
   onFileHere,
+  alreadyMemberWorkstreamIds,
+  onAddSecondary,
   open,
   onToggle,
   prototypeStatusByWorkstream,
@@ -232,6 +279,10 @@ export function GuessLanes({
             lane={lane}
             workstreams={workstreams}
             {...(onFileHere === undefined ? {} : { onFileHere })}
+            {...(alreadyMemberWorkstreamIds === undefined
+              ? {}
+              : { alreadyMemberWorkstreamIds })}
+            {...(onAddSecondary === undefined ? {} : { onAddSecondary })}
             {...(prototypeStatusByWorkstream === undefined
               ? {}
               : { prototypeStatusByWorkstream })}
