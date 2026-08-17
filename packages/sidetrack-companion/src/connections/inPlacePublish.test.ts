@@ -1056,8 +1056,18 @@ describe('in-place scoped publish (2026-08-16)', () => {
         const marks = warn.mock.calls.map((args) => String(args[0]));
         warn.mockRestore();
         writer.close();
-        expect(marks.some((line) => /^\[publish\.in-place\] channel=child bytes=\d+$/.test(line)))
-          .toBe(true);
+        // Diff-aware writes (2026-08-17 disk-wear fix) — putCurrent/
+        // writeSnapshotAndProgress always measure rowsChanged/rowsUnchanged
+        // (see #writeCurrentRows), so THIS call site's mark always carries
+        // the suffix — unlike replaceScopeRows' mark below, which doesn't
+        // track per-row diffs and so omits it.
+        expect(
+          marks.some((line) =>
+            /^\[publish\.in-place\] channel=child bytes=\d+ rowsChanged=\d+ rowsUnchanged=\d+$/.test(
+              line,
+            ),
+          ),
+        ).toBe(true);
       },
     );
 

@@ -1926,3 +1926,146 @@ binding constraint.
 
 PR: perf(recall): O(delta) embed-cache writes + batched embed lane +
 test-companion maintenance (branch `perf/embed-cache-write-amp`).
+
+**2026-08-17 — disk-wear addendum, part 2: diff-aware putCurrent — O(changed-
+rows) WAL writes per connections publish (perf/diff-aware-putcurrent).** Not
+an F1–F7 item; same disk-wear theme, third chokepoint in this addendum
+series (after F1's log compaction and the embed-cache entry above) — this
+one is the DOMINANT live write channel on the test companion.
+
+*Traced evidence (user, repeated fs trace, 2026-08-16/17).* Test companion
+writing ~506MB/min, dominated by `connections/current*.db-wal`. Cause
+chain, confirmed by reading the code rather than guessing: the reconcile
+child's post-catch-up thread-membership reconcile
+(`connectionsMaterializer.ts`'s `forceFullRebuildForThreadReconcile`) ends
+essentially EVERY real catch-up/drain with a call to
+`writeSnapshotAndProgress` carrying `dirtyScopes === undefined` — a full
+content-replace of the ~18k-node/107k-edge snapshot. The "storage-tier
+in-place publish" work (PRs #381/#386, the two entries directly above) made
+these writes land in place (WAL) instead of 437MB `copyFileSync` clones —
+a real fix for the CLONE-vs-in-place routing — but explicitly left
+`#writeCurrentRows`'s own row-level write shape untouched ("no changes to
+the mutation logic itself were needed, only to which handle it's applied
+against" — see the 2026-08-16 entry above). That mutation logic itself was
+still O(snapshot) per publish: unconditional
+`upsertMetadata.run('node_order', …)` /
+`upsertMetadata.run('edge_order', …)` rewriting the FULL id array every
+time regardless of whether any node/edge actually changed, and — the
+dominant term — `connections_scope_nodes`/`connections_scope_edges`
+handled via a blind `DELETE FROM connections_scope_nodes` /
+`DELETE FROM connections_scope_edges` (delete-ALL) followed by reinserting
+EVERY node's/edge's scope membership from scratch, every time
+`dirtyScopes` was `undefined` (i.e. every full-rebuild reconcile). Nodes
+and edges themselves were ALREADY correctly guarded (a JS `Map` diff
+compares each row's serialized body before calling `upsertNode.run`/
+`upsertEdge.run` — unchanged rows never touched `.run()` at all) — the gap
+was specifically the scope-membership tables and the two order arrays.
+
+*Fix (`src/connections/snapshot.ts`, `#writeCurrentRows` only —
+`generationBuffer.ts` inspected and left untouched: it owns generation
+lifecycle/pointer/checkpoint-policy plumbing, no row-level writes at all,
+nothing to fix there).*
+1. **Scope-membership anti-join delete.** Replaced the delete-all + reinsert-
+   all shape with the SAME anti-join temp-table technique
+   `replaceScopeRows` already uses (and the SQL-budget/query-plan-lint
+   guardrails from the 2026-08-16 `#378` incident already cover the bug
+   class for): populate `temp_writecur_scope_nodes`/`temp_writecur_
+   scope_edges` with the incoming (post-dirty-scope-filter) membership set,
+   `INSERT OR IGNORE` each pair into the real table (measured: a fully-
+   redundant `INSERT OR IGNORE` pass against an already-present PK writes
+   **zero** WAL bytes — see the probe below), then a single
+   `DELETE ... WHERE NOT EXISTS (temp table match)` (or, for the scoped-
+   write case, additionally `WHERE EXISTS (temp_writecur_dirty_scopes …)`)
+   removes exactly the rows absent from the incoming set. Registered in
+   `queryPlanLint.test.ts`'s `HOT_STATEMENTS` so a future missing-index
+   regression on these tables alarms in CI the same way `#378` now would.
+2. **Guarded node_order/edge_order/metadata.current.** Each is now a
+   compare-then-write: read the existing stored JSON string, compute the
+   new one (`metadataForSnapshotWrite`/nodeIds/edge-id-array are pure
+   functions of snapshot content, no wall-clock — a string compare is a
+   correct no-op detector), only call `upsertMetadata.run` when they
+   actually differ.
+3. **write_seq / resolver-cache invalidation gating.** `#bumpWriteSeq` and
+   `#dropCachedSnapshot()` now fire only when something `readCurrent`
+   actually consumes changed (nodes/edges/metadata.current/node_order/
+   edge_order — per `#bumpWriteSeq`'s own pre-existing doc comment,
+   `connections_scope_nodes`/`_edges` are NOT among them, so a scope-only
+   delta correctly still skips the bump). A publish that reaches
+   `#writeCurrentRows` and finds nothing in that set changed no longer
+   bumps the commit token or busts the `readCurrent` memo — verified via
+   reference equality on `readCurrent()`'s return value in
+   `putCurrentDiffAware.test.ts` (impossible unless the memo survived).
+4. **Audibility.** `[publish.in-place]` now carries
+   `rowsChanged=N rowsUnchanged=M` (threaded through
+   `#acquireInPlaceWriteHandle`/`#acquireGraphWriteHandle`'s `finalize`
+   signature as an optional `PublishRowDiagnostics` argument — omitted,
+   never fabricated as `0/0`, for publishers that don't track per-row
+   diffs today, i.e. `applyProjectionEventOverlay`'s single-row fold and
+   `replaceScopeRows`' already-O(delta) rewrite).
+
+*Deliberate deviation from the task's suggested design:* no `content_hash`
+column / schema migration. The task's own "SQLite gives this nearly free"
+framing was aimed at wide/JSON-valued rows where comparing full blobs is
+expensive — but nodes/edges already read their full current row content
+into JS to build the diff `Map` (pre-existing code, unchanged), so
+extending the SAME string-compare idiom to node_order/edge_order/
+metadata.current adds no new O(state) cost beyond what the file already
+paid every publish. For the scope tables, a hash column doesn't apply at
+all (the "content" of a membership row IS its existence, not a value to
+hash) — the anti-join temp-table technique is the direct SQL-native
+analog, and it was ALREADY the established, incident-hardened pattern in
+this exact file (`replaceScopeRows`), so reusing it kept the diff smaller
+and lower-risk than introducing a new migration idiom.
+
+*Measured (fixture: 10,000 nodes / 50,000 edges,
+`putCurrentDiffAware.perf.test.ts`).* Fixture on-disk size: 78,184,448
+bytes (~74.6MB). First (cold) `putCurrent`: full write, as expected —
+this is the "naive-equivalent" volume the OLD unconditional-rewrite shape
+would have written on EVERY publish, changed or not (confirmed against
+this file's shape: node_order + edge_order arrays alone for this fixture
+run into the low megabytes, and the scope-table delete-all/reinsert-all
+touches ~110,000 rows). Second `putCurrent`, 10 node labels changed and
+NOTHING else (same 50,000 edges, same scope memberships, same order):
+**32,992 bytes written** — 0.042% of the fixture size, `rowsChanged=11`
+(10 nodes + `metadata.current`) `rowsUnchanged=59,992` (9,990 nodes +
+50,000 edges + scope-membership rows already matching). Comfortably under
+the task's 1MB bar and roughly 2,371× smaller than the naive-equivalent
+full rewrite. Guarded-compare overhead (the "content-hash computation
+cost" the task asked to check): the second publish completed in line with
+one JSON-serialization pass over the fixture's own node/edge bodies —
+string comparison is strictly cheaper than the serialization the pre-
+existing code already paid, so this is not a new bottleneck.
+
+*WAL checkpoint policy (task's item 4 — reported, not tuned).*
+`inPlaceCheckpointIdleMs`/`inPlaceCheckpointEveryN`
+(`generationBuffer.ts`) are COUNT/idle-triggered (30s idle, or every 50
+in-place publishes, forces one `PRAGMA wal_checkpoint(TRUNCATE)`) — not
+size-triggered — so this fix doesn't change checkpoint CADENCE. It only
+shrinks how much WAL has accumulated by the time each periodic checkpoint
+fires (previously ~50 × tens-of-MB; now ~50 × tens-of-KB for a steady
+membership-stable vault), so TRUNCATE cost should only go down. No
+`wal_autocheckpoint` PRAGMA is set anywhere in this store (SQLite's own
+1000-page/~4MB default applies as a backstop); with per-publish WAL now
+O(changed) it will fire far less often in wall-clock terms than before.
+No tuning applied — nothing measured to need it.
+
+*Verification.* `putCurrentDiffAware.perf.test.ts` (WAL-bytes measurement
+above), `putCurrentDiffAware.test.ts` (no-op write_seq/cache-invalidation
+skip via reference equality + a mixed add/remove/change delta spanning
+nodes/edges/scopes reads back exactly right), `queryPlanLint.test.ts`
+extended with the 4 new anti-join statements (all resolve to SEARCH, never
+an unexpected SCAN — the suite's own #378-regression proof still passes
+unmodified), `inPlacePublish.test.ts`'s existing crash-kill suite
+(`SIGKILL at a randomized point mid in-place FULL-REBUILD publish`, N=20,
+reused unmodified — it already exercises `writeSnapshotAndProgress` →
+`#writeCurrentRows`, so it now covers the diff-aware path for free; still
+0 failures, fully-old-or-fully-new held) and its (6) audible-marks case
+updated for the new `rowsChanged=`/`rowsUnchanged=` suffix. Full
+`connections/` (546 tests) and `sync/contract/` (278 tests) suites pass
+unmodified. `src/sync/contract/connectionsMaterializer.ts` untouched, per
+this task's binding constraint; `generationBuffer.ts` inspected, no
+changes needed (pointer/GC/checkpoint-cadence plumbing only, no row
+writes).
+
+PR: perf(store): diff-aware putCurrent — O(changed-rows) WAL writes per
+publish (branch `perf/diff-aware-putcurrent`).
