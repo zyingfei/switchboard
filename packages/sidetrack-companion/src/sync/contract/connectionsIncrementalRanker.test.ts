@@ -21,6 +21,7 @@ import {
   createTopicRevisionId,
   createTopicRevisionStore,
 } from '../../producers/topic-revision.js';
+import { RECALL_MODEL } from '../../recall/modelManifest.js';
 import type { RankerContributions } from '../../ranker/predict.js';
 import { createEmptyTabSessionProjection } from '../../tabsession/projection.js';
 import { BROWSER_TIMELINE_OBSERVED } from '../../timeline/events.js';
@@ -199,6 +200,21 @@ const inputFor = (events: readonly AcceptedEvent[]): ConnectionsInput => ({
   tabSessionProjection: createEmptyTabSessionProjection(),
 });
 
+// Full RECALL_MODEL-dimension stub embedder (see the identical pattern in
+// connectionsMaterializer.renderedSimilarityFloor.test.ts): a low-dim vector
+// (e.g. [1, 0]) trips the vector store's dimension guard and silently drops
+// candidate generation, which is a different bug than the one being fixed
+// here. This keeps closest-visit candidate generation genuinely working
+// while staying fast/deterministic (no real model load).
+const embedFullDim: VisitSimilarityEmbedder = (texts) =>
+  Promise.resolve(
+    texts.map(() => {
+      const vector = new Float32Array(RECALL_MODEL.embeddingDim);
+      vector[0] = 1;
+      return vector;
+    }),
+  );
+
 const contributions = (): RankerContributions => ({
   schemaVersion: 0,
   same_workstream: 0,
@@ -371,6 +387,18 @@ describe('connections incremental ranker frontier', () => {
   });
 
   it('forces a full ranker augmentation when the producer revision changes', async () => {
+    // CI flake root cause: this test stubs closestVisitRankerLoader (so the
+    // real LightGBM ranker never loads) but historically left `embed`
+    // unset, so createConnectionsMaterializer fell back to defaultEmbed and
+    // loaded the real Xenova/multilingual-e5-small model on every drain
+    // (~1.8s cold locally; measured well past bun:test's 5000ms default
+    // under contended CI). The assertions only care which visits the
+    // (stubbed) ranker was asked to score, not real similarity vectors, so
+    // stub the embedder (embedFullDim — a real, dimension-matched vector
+    // store write; the naive 2-dim [1,0] alternative trips the vector
+    // store's dimension guard and silently drops candidate generation)
+    // instead of a wider timeout papering over a real per-drain model load.
+    const embed = embedFullDim;
     const replica = await loadOrCreateReplica(vaultRoot);
     const eventLog = createEventLog(vaultRoot, replica);
     const timelineStore = createTimelineStore(vaultRoot);
@@ -383,6 +411,7 @@ describe('connections incremental ranker frontier', () => {
       eventLog,
       timelineStore,
       store,
+      embed,
       rankerRetrainer: () =>
         Promise.resolve({ status: 'skipped', reason: 'no-labels', newLabelCount: 0 }),
       closestVisitRankerLoader: () =>
@@ -402,6 +431,7 @@ describe('connections incremental ranker frontier', () => {
       eventLog,
       timelineStore,
       store,
+      embed,
       rankerRetrainer: () =>
         Promise.resolve({ status: 'skipped', reason: 'no-labels', newLabelCount: 0 }),
       closestVisitRankerLoader: () =>
@@ -443,6 +473,14 @@ describe('connections incremental ranker frontier', () => {
           ranker: ranker('ranker-rev-1'),
           model: { dispose: () => undefined } as never,
         });
+      // Same root cause as the sibling 'forces a full ranker augmentation'
+      // test above: without a stub, catchUp falls back to defaultEmbed and
+      // pays a real model load. This test asserts on ranker-produced
+      // closest_visit edges, not on real similarity vectors, so
+      // embedFullDim (dimension-matched, see comment on its definition)
+      // keeps closest-visit candidate generation working while removing the
+      // per-drain model-load flake risk (x2 drains x2 roots here).
+      const embed = embedFullDim;
       // Drain 1 (full): establish a snapshot with two visits.
       for (const accepted of [event(1, 'alpha', 'tab-1'), event(2, 'bravo', 'tab-1')]) {
         await eventLog.importPeerEvent(accepted);
@@ -452,6 +490,7 @@ describe('connections incremental ranker frontier', () => {
         eventLog,
         timelineStore,
         store,
+        embed,
         rankerRetrainer: noRetrain,
         closestVisitRankerLoader: readyLoader,
       }).catchUp(eventLog);
@@ -462,6 +501,7 @@ describe('connections incremental ranker frontier', () => {
         eventLog,
         timelineStore,
         store,
+        embed,
         rankerRetrainer: noRetrain,
         closestVisitRankerLoader: readyLoader,
       }).catchUp(eventLog);

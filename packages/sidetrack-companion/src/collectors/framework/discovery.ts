@@ -250,7 +250,14 @@ export const startDiscovery = async (opts: DiscoveryOpts): Promise<DiscoveryHand
 
   try {
     watcher = watch(collectorsRoot, { recursive: true }, (_event, filename) => {
-      if (filename === null) return;
+      // Node's WatchListener type only documents `filename: string | null`,
+      // but on Linux inotify recursive watches have been observed invoking
+      // this callback with `filename === undefined` (a runtime deviation
+      // from the typings) — an unguarded path.join then throws mid-test
+      // ("paths[1] property must be of type string, got undefined"),
+      // surfacing as an unhandled rejection between unrelated tests in CI.
+      // Narrow to string explicitly rather than special-casing undefined.
+      if (typeof filename !== 'string') return;
       // normalize to forward-slash-relative path under collectorsRoot
       const rel = relative(collectorsRoot, join(collectorsRoot, filename));
       handleChange(rel);

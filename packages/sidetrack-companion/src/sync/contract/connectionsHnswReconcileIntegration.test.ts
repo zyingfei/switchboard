@@ -176,6 +176,21 @@ const expectFile = async (path: string): Promise<void> => {
   expect(info.size).toBeGreaterThan(0);
 };
 
+// CI budget: every test in this describe spawns at least one real reconcile
+// child process (runReconcileInChild forks a bun process, which reloads the
+// compiled dist module graph, opens the vault, and does real drain work over
+// IPC). Locally each test finishes in well under 2s, but bun:test's 5000ms
+// DEFAULT has repeatedly been hit on the shared, contended CI runner — the
+// spawn+module-load overhead multiplies under load, and (unlike the
+// embedding-model-load flake in connectionsIncrementalRanker.test.ts) there
+// is no dependency here to stub: the real child process IS what's under
+// test, so mocking it away would defeat the point of an "integration" suite.
+// bun:test does not honor a describe-level timeout (verified empirically:
+// neither a numeric nor an { timeout } third arg to describe() changes
+// per-test behavior), so give each test its own explicit budget instead —
+// same pattern as ae4a8d5a (connectionsMaterializer.contentLane.test.ts).
+// The two heaviest tests (100+ visits, full-vs-incremental comparisons)
+// already carry their own larger explicit budgets (90_000 / 30_000).
 describe('HNSW reconcile child integration', () => {
   let vaultRoot: string;
   let previousEnv: Record<(typeof envKeys)[number], string | undefined>;
@@ -272,7 +287,7 @@ describe('HNSW reconcile child integration', () => {
       'pageEvidence.ensure records=1 ensured=1 full=false bounded=true',
     );
     expect(phaseOutput).toContain('buildVisitSimilarityHnsw full=false touched=0');
-  });
+  }, 20_000);
 
   it('does not full-rebuild HNSW in a child pass when no visits changed', async () => {
     process.env['SIDETRACK_CONNECTIONS_PHASE_LOG'] = '1';
@@ -306,7 +321,7 @@ describe('HNSW reconcile child integration', () => {
     // line at all). The invariant is simply that it NEVER triggers a full
     // HNSW rebuild when no visits changed.
     expect(output.join('')).not.toContain('buildVisitSimilarityHnsw full=true');
-  });
+  }, 20_000);
 
   it('incrementally inserts new visits without full-rebuilding the child HNSW store', async () => {
     process.env['SIDETRACK_CONNECTIONS_PHASE_LOG'] = '1';
@@ -537,7 +552,7 @@ describe('HNSW reconcile child integration', () => {
     }
 
     expect(output.join('')).toContain('buildVisitSimilarityHnsw full=false touched=3');
-  });
+  }, 20_000);
 
   it('requalifies an old visit into the reconcile set when late engagement crosses the gate', async () => {
     // Regression for the engagement-regression starvation: a visit
@@ -603,7 +618,7 @@ describe('HNSW reconcile child integration', () => {
       rowTouchesVisit(row, new Set([targetVisitKey])),
     );
     expect(afterTargetRows.length).toBeGreaterThan(0);
-  });
+  }, 20_000);
 
   it('requalifies a late-engagement visit via the typed event-store corpus (no full-log rebuild)', async () => {
     // Fix regression: a late-engagement visit that has left the drain window
@@ -685,7 +700,7 @@ describe('HNSW reconcile child integration', () => {
     expect(
       similarityRows(after).filter((row) => rowTouchesVisit(row, new Set([targetVisitKey]))).length,
     ).toBeGreaterThan(0);
-  });
+  }, 20_000);
 
   it('does not requalify a late-engagement visit when the kill-switch is set', async () => {
     process.env['SIDETRACK_CONNECTIONS_PHASE_LOG'] = '1';
@@ -720,7 +735,7 @@ describe('HNSW reconcile child integration', () => {
     }
     // Kill-switch: the requalify resolver must be inert (requalified=0).
     expect(output.join('')).toContain('requalified=0');
-  });
+  }, 20_000);
 
   it('marks parent health successful when a runner drain completes in a child process', async () => {
     process.env['SIDETRACK_CONNECTIONS_CHILD'] = '1';
@@ -750,7 +765,7 @@ describe('HNSW reconcile child integration', () => {
     expect(health?.pending).toBe(false);
     expect(health?.lastSuccessAt).not.toBeNull();
     expect(Date.parse(health!.lastSuccessAt!)).toBeGreaterThanOrEqual(before - 5_000);
-  });
+  }, 20_000);
 
   it('recovers from a partial published pair on restart', async () => {
     const replica = await loadOrCreateReplica(vaultRoot);
@@ -772,7 +787,7 @@ describe('HNSW reconcile child integration', () => {
 
     expect(await runReconcileInChild({ vaultRoot, seq: 2 })).toMatchObject({ seq: 2, ok: true });
     await expectCurrentHnswFiles(vaultRoot);
-  });
+  }, 20_000);
 
   it('reconciles deleted and changed visit embeddings in the child HNSW path', async () => {
     const replica = await loadOrCreateReplica(vaultRoot);
@@ -808,7 +823,7 @@ describe('HNSW reconcile child integration', () => {
 
     expect(afterRows).not.toEqual(beforeRows);
     expect(afterRows.length).toBeLessThan(beforeRows.length);
-  });
+  }, 20_000);
 
   it('matches pairwise similarity rows through the actual reconcile child', async () => {
     const pairwiseRoot = await mkdtemp(join(tmpdir(), 'sidetrack-hnsw-child-pairwise-'));
@@ -841,7 +856,7 @@ describe('HNSW reconcile child integration', () => {
     } finally {
       await rm(pairwiseRoot, { recursive: true, force: true });
     }
-  });
+  }, 20_000);
 
   // D4 (M4) — boot persisted-revision reuse. After a drain persists a
   // similarity revision, a SUBSEQUENT drain over the SAME similarity corpus
@@ -909,5 +924,5 @@ describe('HNSW reconcile child integration', () => {
     // reuse produced the same revision, so Pass-7 rendered the same edges.
     const servedAfter = similarityRows((await createConnectionsStore(vaultRoot).readCurrent())!);
     expect(servedAfter).toEqual(servedBefore);
-  });
+  }, 20_000);
 });

@@ -123,7 +123,13 @@ export const createVaultWatcher = (
     join(vaultRoot, '_BAC'),
     { recursive: true },
     (_event, filename) => {
-      if (filename === null) {
+      // Node's WatchListener type only documents `filename: string | Buffer
+      // | null`, but on Linux inotify recursive watches have been observed
+      // invoking this callback with `filename === undefined` (a runtime
+      // deviation from the typings) — the old Buffer-only fallback below
+      // would then crash calling .toString() on undefined. Bail on
+      // anything that isn't a string or Buffer, same as the null case.
+      if (filename === null || filename === undefined) {
         return;
       }
       const filenameText = typeof filename === 'string' ? filename : filename.toString('utf8');

@@ -2,9 +2,24 @@ import { describe, expect, it, vi } from 'vitest';
 
 import { attachCopyPasteLineage } from '../../../../src/content/engagement/copy-paste';
 
-const flush = async (): Promise<void> => {
-  await new Promise((resolve) => setTimeout(resolve, 0));
-  await Promise.resolve();
+// attachCopyPasteLineage hashes the selection via crypto.subtle.digest — a
+// real (not synchronously-resolved) WebCrypto call, so how many event-loop
+// ticks it takes to settle is not fixed. A bounded FLUSH-COUNT loop (the
+// prior approach: 5x setTimeout(0)+microtask) flaked on CI once because it
+// bounds elapsed *ticks*, not elapsed *time* — under a contended runner each
+// tick can itself take longer than the digest needs, so 5 ticks stop being
+// "plenty of margin". Poll on a wall-clock deadline instead: deterministic
+// intent (stop as soon as both messages land) with a generous real-time
+// budget as the honest upper bound, not a papered-over retry.
+const waitUntil = async (
+  predicate: () => boolean,
+  { timeoutMs = 2_000, intervalMs = 5 }: { timeoutMs?: number; intervalMs?: number } = {},
+): Promise<void> => {
+  const deadline = Date.now() + timeoutMs;
+  while (!predicate()) {
+    if (Date.now() >= deadline) return;
+    await new Promise((resolve) => setTimeout(resolve, intervalMs));
+  }
 };
 
 describe('copy/paste lineage content helper', () => {
@@ -31,7 +46,7 @@ describe('copy/paste lineage content helper', () => {
       configurable: true,
     });
     document.dispatchEvent(paste);
-    for (let i = 0; i < 5 && sent.length < 2; i += 1) await flush();
+    await waitUntil(() => sent.length >= 2);
 
     const [copy, pasted] = sent as Array<{
       readonly type: string;

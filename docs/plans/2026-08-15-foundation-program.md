@@ -1927,6 +1927,114 @@ binding constraint.
 PR: perf(recall): O(delta) embed-cache writes + batched embed lane +
 test-companion maintenance (branch `perf/embed-cache-write-amp`).
 
+**2026-08-17 — kill ambient test flakiness; blocking suite deterministic
+(test/flaky-quarantine).** Not an F1–F7 item; filed here per task #30, an
+accepted review finding: "full suite red, isolated green" had become
+normalized, which lets real regressions hide behind ambient flakiness.
+Verified each of the four named offenders against real CI history
+(`gh run view --log-failed` on the last several main-branch failures) rather
+than trusting the description alone, and found one additional live flake
+plus one already-resolved one along the way.
+
+*1. `connections incremental ranker frontier > forces a full ranker
+augmentation when the producer revision changes`.* Confirmed via CI log
+(`this test timed out after 5000ms` at exactly 5045ms, run 31912141879,
+2026-08-15) — not a guess. Root cause: the test stubs
+`closestVisitRankerLoader` (so the real LightGBM ranker never loads) but
+left `embed` unset, so `createConnectionsMaterializer` fell back to
+`defaultEmbed` and loaded the real Xenova/multilingual-e5-small model on
+every drain (~1.8s cold). Real fix: stub the embedder, same pattern the
+file's own "skips a similarity-changing topic recompute" test already used.
+First attempt used a 2-dim `[1, 0]` vector (matching that sibling test) and
+broke two assertions — turned out a low-dim vector trips the vector store's
+dimension guard and silently drops candidate generation, a different latent
+bug. Fixed by using a full `RECALL_MODEL.embeddingDim`-dimension stub
+(`embedFullDim`, mirroring `connectionsMaterializer.renderedSimilarityFloor
+.test.ts`'s existing convention) instead. Applied the same fix to the
+sibling "runs the ranker on a scoped-delta drain" test, which had the
+identical unstubbed-embed shape (2 drains × 2 roots) and was one real-model
+load away from the same flake, just not yet caught in CI.
+
+*2. `connectionsHnswReconcileIntegration.test.ts`.* Spawn-heavy by design —
+every one of its 13 tests forks a real reconcile child process
+(`runReconcileInChild`), which is the actual thing under test, so mocking
+it away would defeat the suite's purpose. Confirmed empirically that
+bun:test does not honor a describe-level timeout (neither a bare number nor
+an `{ timeout }` object as the third arg to `describe()` changed per-test
+behavior in a throwaway probe file) — the only honored mechanism is a
+per-`it()` third-arg override. Added explicit budgets to all 11 tests that
+didn't already have one (20_000ms; the two heaviest — 100+ visit corpora,
+full-vs-incremental comparisons — already carried their own 90_000/30_000
+overrides), with a shared rationale comment, same pattern as `ae4a8d5a`.
+
+*3. eventLog append-index prewarm + connections boot-catchup timing.*
+`eventLog.test.ts`'s three prewarm tests seed 40k–350k real event lines and
+walk them (sometimes twice, plus an oracle cold rebuild) — genuinely
+CPU-bound work with no dependency to stub; added explicit 30_000ms budgets
+with a shared comment. Separately,
+`connectionsMaterializer.instantBoot.test.ts`'s B5(a) asserts
+`bootMs < 5_000` on a real `performance.now()` delta for a 6-event fixture;
+the regression it actually guards against (a full-log seed instead of a
+resume-fold) is already pinned by phase-log assertions earlier in the same
+test, so the literal wall-clock bound is CI-noise budget, not load-bearing
+coverage — raised to 15_000ms with a comment explaining why, plus a 20_000ms
+`it()` budget.
+
+*4. `packages/sidetrack-extension/tests/unit/content/engagement
+/copyPaste.test.ts`.* The old wait was 5 fixed ticks of
+`setTimeout(0)+Promise.resolve()` before checking that both lineage
+messages arrived — bounding elapsed *ticks*, not elapsed *time*.
+`attachCopyPasteLineage` hashes via `crypto.subtle.digest`, a real async
+WebCrypto call whose settle time isn't fixed; under a contended runner each
+tick can itself take longer than 5 ticks' worth of margin. Replaced with a
+`waitUntil(predicate, { timeoutMs, intervalMs })` helper that polls a real
+wall-clock deadline (2s budget) and returns as soon as both messages land —
+deterministic intent, honest upper bound instead of a papered-over retry.
+
+*Found via CI history, not on the named list.* (a) `discovery.ts`'s
+`fs.watch` listener only guarded `filename === null`; Linux inotify
+recursive watches have been observed invoking the callback with
+`filename === undefined` (a runtime deviation from the documented `string |
+null` type), which threw inside `path.join` and surfaced as "Unhandled
+error between tests" in CI (3 occurrences in one run alone, confirmed via
+log). Same defect existed in `vault/watcher.ts` (its Buffer-fallback branch
+would call `.toString()` on `undefined` and crash) but not in
+`collectors/framework/tail.ts` (its `String(filename)` call degrades
+harmlessly on `undefined`, so left as-is). Fixed both real bugs: narrowed
+to `typeof filename !== 'string'` / added an explicit `undefined` guard.
+(b) `buildVisitSimilarity > does not emit a candidate below the top-K
+cutoff even when it clears threshold` flaked twice more on main
+(2026-08-14, 2026-08-15) with contradictory assertion directions
+(`toBeUndefined()` vs `toBeDefined()` failing on alternate runs) despite an
+earlier fix (0745556f, 2026-07-12) that added deterministic score/id
+tie-breaks throughout the hybrid fusion path. Root cause was upstream of
+all of that: `buildAnnIndex` called usearch's HNSW `add()`/`search()` with
+`threads=0`, which resolves to `hardware_concurrency()` — multi-threaded
+graph construction with library-documented non-deterministic insertion
+order, so the CANDIDATE SET was unstable before any tie-break sort ever
+ran. Already fixed on this branch's base by `faf08269` (same day, later
+that evening) pinning `HNSW_INDEX_THREADS = 1`; verified fixed rather than
+assumed — 3 consecutive local runs of `visitSimilarity.test.ts` green, no
+action needed here.
+
+*Quarantine.* Not used — every offender got a real, root-caused fix; none
+needed the `SIDETRACK_CI_STRICT` / `*.flaky.test.ts` non-blocking-lane
+convention the task offered as a fallback, so no `QUARANTINE.md` and no
+`.github/workflows/ci.yml` change (the blocking-lane philosophy is
+unchanged).
+
+*Verification.* Full suite run 3× back-to-back on a loaded machine (typecheck
+already-running plus this session's own prior work in the same tree):
+companion (`bun test`) 3,625 pass / 0 fail / 8 skip across all three runs
+(165,155 / 165,272 / 165,380 `expect()` calls; 164–166s each); golden
+resolve referee 38/38 pass; extension (`vitest run`) 1,795/1,795 pass across
+all three runs; MCP (`vitest run`) 94/94 pass across all three runs.
+`tsc -p tsconfig.build.json` (companion), `tsc --noEmit` (extension, MCP)
+all clean. `bun run build` clean across all three packages.
+
+PR: test: fix or quarantine ambient flaky tests — blocking suite
+deterministic (branch `test/flaky-quarantine`).
+
 **2026-08-17 — disk-wear addendum, part 2: diff-aware putCurrent — O(changed-
 rows) WAL writes per connections publish (perf/diff-aware-putcurrent).** Not
 an F1–F7 item; same disk-wear theme, third chokepoint in this addendum
