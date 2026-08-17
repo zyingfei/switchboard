@@ -121,6 +121,7 @@ import {
   composeGenId,
   createShadowGeneration,
   discardShadowGeneration,
+  generationByteFootprint,
   generationDbPath,
   generationExists,
   inPlaceCheckpointEveryN,
@@ -4833,7 +4834,7 @@ export class SqliteConnectionsStore implements ConnectionsStore {
       // the downgrade serves the current graph, not an arbitrarily-old snapshot.
       // Only for the real current.db path (not :memory: / explicit test dbs).
       if (this.#databasePath === join(this.#root, 'current.db')) {
-        reconcileLegacyToPublished(this.#root);
+        reconcileLegacyToPublished(this.#root, (path) => this.#openReadwriteLike(sqlite, path));
       }
       this.#db = new sqlite.Database(this.#databasePath, { create: true, readwrite: true });
       this.#openGenId = null;
@@ -6392,7 +6393,14 @@ export class SqliteConnectionsStore implements ConnectionsStore {
       this.#recordUnchangedPublishSkip();
       return;
     }
-    const { db, finalize } = await this.#acquireGraphWriteHandle();
+    // In-place publish (2026-08-16, widened to full content-replace writes):
+    // apply this full row diff/upsert directly to the published generation
+    // file instead of cloning it first — see #acquireInPlaceWriteHandle's
+    // doc comment and the design note's 2026-08-16 addendum. Falls back to
+    // the clone+CAS-flip path (byte-for-byte unchanged) when in-place isn't
+    // applicable right now (fresh vault, kill switch, or a TOCTOU race).
+    const inPlace = await this.#acquireInPlaceWriteHandle();
+    const { db, finalize } = inPlace ?? (await this.#acquireGraphWriteHandle());
     try {
       this.#writeCurrentRows(db, snapshot, null);
       finalize(true);
@@ -6419,7 +6427,17 @@ export class SqliteConnectionsStore implements ConnectionsStore {
         return;
       }
     }
-    const { db, finalize } = await this.#acquireGraphWriteHandle();
+    // In-place publish (2026-08-16, widened to full content-replace writes):
+    // see putCurrent's identical comment above — this is the SAME store
+    // method the reconcile child's routine "post-catch-up thread-membership
+    // reconcile" full rebuild calls on essentially every real catch-up
+    // (connectionsMaterializer.ts's forceFullRebuildForThreadReconcile), so
+    // leaving it clone-only (PR #381's original scope) left the dominant
+    // write channel uncovered. #writeCurrentRows below runs the identical
+    // BEGIN IMMEDIATE-wrapped row diff/upsert whether `db` is a clone or the
+    // live published file.
+    const inPlace = await this.#acquireInPlaceWriteHandle();
+    const { db, finalize } = inPlace ?? (await this.#acquireGraphWriteHandle());
     try {
       const shouldBootstrapScopeMembership = this.#writeCurrentRows(
         db,
@@ -6698,9 +6716,29 @@ export class SqliteConnectionsStore implements ConnectionsStore {
     }
   }
 
+  /** `'child'` for the fork-per-drain reconcile child, `'parent'` for every
+   *  other role (`parent-reader`, `single-buffer`, `legacy`) — the long-
+   *  running companion process. Used ONLY to label the audible
+   *  `[publish.in-place]`/`[publish.clone]` marks (see #6 of the "in-place
+   *  child-drain channel" task); never affects publish behavior itself. */
+  #publishChannel(): 'child' | 'parent' {
+    return this.#role === 'child-writer' ? 'child' : 'parent';
+  }
+
+  /** Audible mark for a publish that took the clone+CAS-flip path instead of
+   *  in-place — logged exactly once per such publish, at the point the
+   *  decision is made (inside `#acquireInPlaceWriteHandle`, the sole gate
+   *  every clone-eligible writer now passes through first). Its absence is
+   *  exactly how the original parent-only in-place gap (PR #381) shipped
+   *  undetected — see the "Storage-tier incremental publish" design note's
+   *  2026-08-16 addendum. */
+  #logClonePublish(reason: string): void {
+    console.warn(`[publish.clone] channel=${this.#publishChannel()} reason=${reason}`);
+  }
+
   /**
-   * In-place scoped/overlay publish (2026-08-16). See the "Storage-tier
-   * incremental publish" design note in
+   * In-place publish (2026-08-16, widened 2026-08-16 to full content-replace
+   * writes). See the "Storage-tier incremental publish" design note in
    * docs/plans/2026-08-15-foundation-program.md for the full investigation
    * and empirical WAL-isolation verification this rests on.
    *
@@ -6708,19 +6746,30 @@ export class SqliteConnectionsStore implements ConnectionsStore {
    * `copyFileSync`, no new generation id, no pointer flip — under the
    * cross-process publish lock, and hands it back with NO transaction open
    * (same contract as `#acquireGraphWriteHandle`): the caller's own existing
-   * `BEGIN IMMEDIATE`/`COMMIT`/`ROLLBACK` block is the atomic unit for this
-   * publish, completely unchanged. Readers (this store's own `#db`, and
-   * every other process's readonly handle) need no coordination beyond what
-   * WAL already provides: a plain autocommit SELECT (the store's existing
-   * H6 read pattern) sees a consistent pre- or post-publish snapshot,
-   * never torn, and is never blocked by this writer — verified empirically
-   * (`/tmp/wal-spike/spike.mjs`, `spike2.mjs`), not assumed.
+   * `BEGIN IMMEDIATE`/`COMMIT`/`ROLLBACK` block(s) are the atomic unit(s) for
+   * this publish, completely unchanged — a caller may run more than one such
+   * block on the returned handle before calling `finalize` (e.g.
+   * `writeSnapshotAndProgress` following `#writeCurrentRows` with a nested
+   * `#bootstrapScopeMembershipOn` transaction), exactly as it already does on
+   * a clone. Readers (this store's own `#db`, and every other process's
+   * readonly handle) need no coordination beyond what WAL already provides:
+   * a plain autocommit SELECT (the store's existing H6 read pattern) sees a
+   * consistent pre- or post-publish snapshot, never torn, and is never
+   * blocked by this writer — verified empirically
+   * (`/tmp/wal-spike/spike.mjs`, `spike2.mjs`), not assumed. This holds
+   * regardless of how many rows the caller's transaction touches — a scoped
+   * delta and a full content-replace both run the same `BEGIN IMMEDIATE`-
+   * wrapped upsert/diff shape, just over more rows in the full case.
    *
    * Returns `null` when in-place publish isn't applicable — disabled via
    * `SIDETRACK_INPLACE_PUBLISH=0`, `:memory:`/legacy (no generations exist),
    * or no generation published yet (fresh vault, nothing to write into in
    * place) — and the caller falls back to `#acquireGraphWriteHandle`'s
-   * clone+CAS-flip path, byte-for-byte unchanged.
+   * clone+CAS-flip path, byte-for-byte unchanged. Every such fallback logs
+   * an audible `[publish.clone] reason=...` mark right here — the ONE place
+   * every clone-eligible write method (`putCurrent`, `writeSnapshotAndProgress`,
+   * `writeMaterializerProgress`'s fresh-vault fallback, `replaceScopeRows`,
+   * `applyProjectionEventOverlay`) now routes through first.
    *
    * The returned connection is fresh per call (opened here, closed by
    * `finalize`) rather than a persistent cached writer handle: this store
@@ -6734,7 +6783,14 @@ export class SqliteConnectionsStore implements ConnectionsStore {
     readonly db: SqliteDatabase;
     readonly finalize: (committed: boolean) => void;
   } | null> {
-    if (!this.#doubleBuffer || !inPlacePublishEnabled()) return null;
+    if (!this.#doubleBuffer) {
+      this.#logClonePublish('legacy');
+      return null;
+    }
+    if (!inPlacePublishEnabled()) {
+      this.#logClonePublish('kill-switch');
+      return null;
+    }
     const sqlite = await loadSqlite();
     const lock = acquirePublishLock(this.#root);
     // Re-read the pointer INSIDE the lock — the same discipline casPublish
@@ -6745,6 +6801,7 @@ export class SqliteConnectionsStore implements ConnectionsStore {
     if (genId === null || !generationExists(this.#root, genId)) {
       releasePublishLock(this.#root, lock);
       this.#inPlacePublishFallbackCount += 1;
+      this.#logClonePublish('no-generation-yet');
       return null;
     }
     let db: SqliteDatabase;
@@ -6758,11 +6815,16 @@ export class SqliteConnectionsStore implements ConnectionsStore {
       // documents and recovers from. Fall back rather than fail the write.
       releasePublishLock(this.#root, lock);
       this.#inPlacePublishFallbackCount += 1;
+      this.#logClonePublish('race-vanished');
       return null;
     }
     // Self-healing schema (WAL pragma, the 2026-08-16 edges_index(src, dst)
     // fix, etc.) — idempotent, a no-op on an already-current generation.
     this.#initSchemaOn(db);
+    // Baseline byte footprint (main db + -wal) for the audible bytes-written
+    // mark — best-effort, diagnostic only, never load-bearing (see
+    // generationByteFootprint's doc comment).
+    const bytesBefore = generationByteFootprint(this.#root, genId);
     let finalized = false;
     return {
       db,
@@ -6777,17 +6839,26 @@ export class SqliteConnectionsStore implements ConnectionsStore {
         } finally {
           releasePublishLock(this.#root, lock);
         }
-        if (committed) this.#recordInPlacePublish(genId);
+        if (committed) {
+          const bytesAfter = generationByteFootprint(this.#root, genId);
+          this.#recordInPlacePublish(genId, Math.max(0, bytesAfter - bytesBefore));
+        }
       },
     };
   }
 
   /** Bookkeeping + WAL checkpoint policy after a successful in-place
-   *  publish. See the design note's "WAL checkpoint policy" section for the
-   *  measurement behind the defaults. */
-  #recordInPlacePublish(genId: string): void {
+   *  publish, plus the audible `[publish.in-place]` mark (task #6 — its
+   *  absence on the child-writer channel is exactly how the original
+   *  parent-only gap shipped undetected). See the design note's "WAL
+   *  checkpoint policy" section for the measurement behind the checkpoint
+   *  defaults. */
+  #recordInPlacePublish(genId: string, walDeltaBytes: number): void {
     this.#inPlacePublishCount += 1;
     this.#lastInPlacePublishAtMs = Date.now();
+    console.warn(
+      `[publish.in-place] channel=${this.#publishChannel()} bytes=${String(walDeltaBytes)}`,
+    );
     const everyN = inPlaceCheckpointEveryN();
     if (everyN > 0 && this.#inPlacePublishCount % everyN === 0) {
       this.#cancelInPlaceCheckpointTimer();
@@ -6862,18 +6933,23 @@ export class SqliteConnectionsStore implements ConnectionsStore {
   }
 
   /**
-   * Acquire a WRITABLE graph handle + its publish finalizer.
+   * Acquire a WRITABLE graph handle + its publish finalizer — the CLONE+CAS-
+   * FLIP path. Every clone-eligible write method (`putCurrent`,
+   * `writeSnapshotAndProgress`, `writeMaterializerProgress`'s fresh-vault
+   * fallback, `replaceScopeRows`) now tries `#acquireInPlaceWriteHandle`
+   * FIRST and only falls back to this method when that returns `null`
+   * (fresh vault, kill switch, or a TOCTOU race — see its doc comment); this
+   * method itself does not know or care why it was reached.
    *
    * For legacy / child-writer / single-buffer roles the open handle is already
    * writable: return it with `#publishGeneration` as the finalizer.
    *
    * For the parent-reader (whose graph handle is READONLY under double-buffer)
-   * a graph write — a foreground-nav scoped delta (`replaceScopeRows`) or a
-   * progress-only advance (`writeMaterializerProgress`) — is applied to a
-   * PRIVATE shadow generation cloned from the published gen and published via
-   * checkpoint + pointer-flip, so the served file is never written by the
-   * parent (D3 "no writer on the read path" holds for parent-side writes too).
-   * The shadow handle is closed by the finalizer.
+   * a graph write is applied to a PRIVATE shadow generation cloned from the
+   * published gen and published via checkpoint + pointer-flip, so the served
+   * file is never written by the parent (D3 "no writer on the read path"
+   * holds for parent-side writes too). The shadow handle is closed by the
+   * finalizer.
    *
    * `finalize(committed)` publishes the shadow when committed, or discards it
    * (no pointer flip) on rollback.
@@ -7136,9 +7212,13 @@ export class SqliteConnectionsStore implements ConnectionsStore {
         return;
       }
     }
-    // Fresh vault / legacy fallback: no published generation exists to bind a
-    // checkpoint to, so retain the original transactional generation write.
-    const { db, finalize } = await this.#acquireGraphWriteHandle();
+    // Fresh vault / legacy / degraded-checkpoint fallback: try in-place
+    // first (it naturally falls back to null on a genuinely fresh vault —
+    // no generation exists yet to open in place — so this is a no-op
+    // widening of the same fallback, not new behavior for the common
+    // fresh-vault case), then the original transactional clone write.
+    const inPlace = await this.#acquireInPlaceWriteHandle();
+    const { db, finalize } = inPlace ?? (await this.#acquireGraphWriteHandle());
     db.exec('BEGIN IMMEDIATE');
     try {
       this.#writeProgressRows(db, progress);
@@ -8178,7 +8258,34 @@ export class SqliteConnectionsStore implements ConnectionsStore {
     const db = await this.#database();
     const metadata = await this.#readMetadata(db);
     if (metadata === null) return null;
-    const revisionKey = metadata.snapshotRevision ?? '';
+    // H6: capture write_seq BEFORE any paged read (also doubles as the
+    // cache key below). We compare the post-read value with this to detect
+    // a writer that committed between our reads. write_seq is bumped by
+    // #bumpWriteSeq from every transaction that mutates readCurrent's
+    // inputs (#writeCurrentRows, replaceScopeRows,
+    // applyProjectionEventOverlay) and is the strict commit token.
+    // (node_order/edge_order are no longer among those inputs — order is
+    // derived below from the paged nodes/edges themselves.)
+    const preWriteSeq = this.#readWriteSeq(db);
+    // 2026-08-16 (in-place child-drain channel widening) — the cache key
+    // MUST be write_seq, not metadata.snapshotRevision. snapshotRevision is
+    // a content-hash of metadata-only fields (updatedAt/counts/etc), and a
+    // caller is free to supply the SAME weak snapshotRevision string across
+    // a run of writes whose row-level content genuinely differs (this
+    // store's own #matchingPublishedContentSignature STRONG-signature
+    // mechanism exists precisely to still detect and publish those —
+    // "unchanged ticks skip full publish; one real content delta publishes
+    // once" in doubleBuffer.acceptance.test.ts is exactly this shape).
+    // Under the pre-widening clone+CAS-flip-only world this collision was
+    // masked for free: a content-changing write ALWAYS minted a new
+    // generation, so #reopenIfPointerChanged's unconditional
+    // #dropCachedSnapshot() on ANY pointer change busted this cache
+    // regardless of what key it used. In-place publish can leave the SAME
+    // generation (and thus no pointer-change signal at all) serving
+    // genuinely new row content, so the cache key itself must be precise —
+    // write_seq, like #cachedDerivedProjections already uses for exactly
+    // this reason, cannot collide this way.
+    const revisionKey = preWriteSeq;
     if (this.#cachedSnapshot !== null && this.#cachedSnapshot.revision === revisionKey) {
       this.#cachedSnapshotLastAccessMs = Date.now();
       return this.#cachedSnapshot.value;
@@ -8190,21 +8297,6 @@ export class SqliteConnectionsStore implements ConnectionsStore {
       // reuse those freed pages instead of growing for old + new graphs.
       this.#dropCachedSnapshot();
     }
-    // H6: capture write_seq BEFORE any paged read. We compare the
-    // post-read value with this to detect a writer that committed
-    // between our reads. snapshotRevision alone isn't sufficient —
-    // it's a content-hash of metadata-only fields, so two distinct
-    // commits could produce the same revision. write_seq is bumped
-    // by #bumpWriteSeq from every transaction that mutates
-    // readCurrent inputs (#writeCurrentRows, replaceScopeRows,
-    // applyProjectionEventOverlay) and is the strict commit token.
-    // (node_order/edge_order are no longer among those inputs — order is
-    // derived below from the paged nodes/edges themselves.)
-    const preSeqRow = db.query('SELECT data FROM metadata WHERE key = ?').get('write_seq');
-    const preWriteSeq =
-      preSeqRow === null || preSeqRow === undefined
-        ? 0
-        : Number.parseInt(textField(preSeqRow, 'data'), 10) || 0;
     // Edge rows store JSON ARRAYS (one row contains many edges), so a
     // page size that's OK for nodes can be expensive in edge parsing.
     // Use a smaller page for edges; both are well under the runtime's
@@ -8248,11 +8340,7 @@ export class SqliteConnectionsStore implements ConnectionsStore {
     const nodeOrderRow = db.query('SELECT data FROM metadata WHERE key = ?').get('node_order');
     const edgeOrderRow = db.query('SELECT data FROM metadata WHERE key = ?').get('edge_order');
     if (!acceptStale) {
-      const postSeqRow = db.query('SELECT data FROM metadata WHERE key = ?').get('write_seq');
-      const postWriteSeq =
-        postSeqRow === null || postSeqRow === undefined
-          ? 0
-          : Number.parseInt(textField(postSeqRow, 'data'), 10) || 0;
+      const postWriteSeq = this.#readWriteSeq(db);
       if (postWriteSeq !== preWriteSeq) return 'stale';
     }
     // F4 (blob diet) — #writeCurrentRows (full write: putCurrent /

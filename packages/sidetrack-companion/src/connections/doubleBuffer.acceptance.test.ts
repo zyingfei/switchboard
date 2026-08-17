@@ -82,6 +82,7 @@ describe('M4 double-buffer acceptance', () => {
   });
   afterEach(async () => {
     delete process.env['SIDETRACK_CONNECTIONS_DOUBLE_BUFFER'];
+    delete process.env['SIDETRACK_INPLACE_PUBLISH'];
     if (vaultRoot !== null) {
       await rm(vaultRoot, { recursive: true, force: true });
       vaultRoot = null;
@@ -159,7 +160,14 @@ describe('M4 double-buffer acceptance', () => {
       expect((await parent.readCurrent())?.nodes).toHaveLength(24);
 
       // Same weak revision/counts/freshness, one changed served row. The strong
-      // signature must detect it and publish one new, fully-built generation.
+      // signature must detect it and publish once, atomically.
+      //
+      // 2026-08-16 (in-place child-drain channel widening): a full
+      // content-replace write now applies IN PLACE once a generation
+      // already exists (exactly like a scoped delta always has) — no new
+      // generation, no pointer flip, no swap. The published content is
+      // still correctly and atomically updated (asserted below via the
+      // parent's readCurrent, not via generation identity).
       const changedBase = buildGraph(24, 'rev-stable');
       const changed: ConnectionsSnapshot = {
         ...changedBase,
@@ -169,8 +177,9 @@ describe('M4 double-buffer acceptance', () => {
       };
       await writer.writeSnapshotAndProgress(changed, progressThrough(6));
       const changedGeneration = readPointer(connectionsDir());
-      expect(changedGeneration).not.toBe(firstGeneration);
-      expect(writer.doubleBufferDiagnostics().swapCount).toBe(swapsAfterInitialPublish + 1);
+      expect(changedGeneration).toBe(firstGeneration);
+      expect(writer.doubleBufferDiagnostics().swapCount).toBe(swapsAfterInitialPublish);
+      expect(writer.doubleBufferDiagnostics().inPlacePublishCount).toBeGreaterThan(0);
 
       // The parent's next request observes one complete generation: all rows
       // plus the mutation, never a partial/torn SQLite copy.
@@ -234,7 +243,16 @@ describe('M4 double-buffer acceptance', () => {
   // answer (old OR new generation), never torn. The parent reopens onto the
   // new generation on its NEXT request; an in-flight read on the old gen
   // completes against the intact old file.
+  //
+  // 2026-08-16 (in-place child-drain channel widening): a second full write
+  // against an EXISTING generation now applies in place by default (no
+  // swap at all — see the widened "(5) generation GC" / "unchanged ticks"
+  // coverage for that behavior). This test's OWN subject is the pointer-
+  // swap + reader-reopen mechanism itself, which is retained (first-boot,
+  // kill switch, any future structural migration) and must still work —
+  // force the clone+CAS-flip path to genuinely exercise it.
   sqliteIt('reader gets a consistent (old-or-new) answer across a publish swap', async () => {
+    process.env['SIDETRACK_INPLACE_PUBLISH'] = '0';
     const child = new SqliteConnectionsStore(vaultRoot!, { role: 'child-writer' });
     const parent = new SqliteConnectionsStore(vaultRoot!, { role: 'parent-reader' });
     await child.writeSnapshotAndProgress(buildGraph(10, 'rev-1'), progressFor('rev-1'));
@@ -586,7 +604,13 @@ describe('M4 double-buffer acceptance', () => {
   // pins that by rotating both the generation AND the store object between the
   // enqueue and the flush.
   // -------------------------------------------------------------------------
+  // 2026-08-16 (in-place child-drain channel widening): this test's subject
+  // is resolver-cache independence across a GENUINE generation swap (D3) —
+  // force the clone+CAS-flip path so child2's publish actually swaps rather
+  // than applying in place against the existing generation (its default
+  // behavior now, covered elsewhere).
   sqliteIt('a deferred resolver-cache write flushed after a generation publish lands via the CURRENT store', async () => {
+    process.env['SIDETRACK_INPLACE_PUBLISH'] = '0';
     __resetResolverCacheDeferQueue();
     const child = new SqliteConnectionsStore(vaultRoot!, { role: 'child-writer' });
     await child.writeSnapshotAndProgress(buildGraph(6, 'rev-1'), progressFor('rev-1'));
