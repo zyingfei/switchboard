@@ -1,3 +1,5 @@
+import { ATTRIBUTION_LANES } from './laneRegistry';
+
 export const TAB_SESSION_DRAG_MIME = 'application/x-sidetrack-tab-session-id';
 
 export interface TabSessionAttribution {
@@ -133,20 +135,13 @@ export interface AttributionAnchor {
 // and is ABSENT on older ones, so like the whole `lanes` field it is additive
 // on the wire: a reader that renders lanes in array order picks it up
 // automatically, and one that doesn't send it stays at six.
-export type GuessLane =
-  | 'graph'
-  | 'similarity'
-  | 'topic'
-  | 'title'
-  | 'domain'
-  | 'recency'
-  | 'content'
-  // Lane 8 — the AI lane: the same query-time retrieval as 'content', asked
-  // with the on-device gist ALONE. Present only when a gist exists.
-  | 'ai'
-  // Lane 9 — the prototype lane: cosine match against offline-generated
-  // workstream prototypes (Apple FM, PR #377). Observe-only disclosure.
-  | 'prototype';
+//
+// DERIVED from laneRegistry.ts (task #29) — the union is `keyof typeof
+// ATTRIBUTION_LANES`, never hand-listed. Adding a lane means adding one entry
+// to laneRegistry.ts (mirrored from the companion's copy); this type, the
+// VALID_LANES parse whitelist below, and every render-order/label map in
+// PipelineStrip.tsx / GuessLanes.tsx update automatically.
+export type GuessLane = keyof typeof ATTRIBUTION_LANES;
 
 export interface GuessLaneCandidate {
   readonly workstreamId: string;
@@ -349,27 +344,18 @@ export interface UrlResolutionResult {
 // non-array `lanes` (or every entry malformed → nothing to show) collapses
 // to undefined.
 
-const VALID_LANES: ReadonlySet<GuessLane> = new Set<GuessLane>([
-  'graph',
-  'similarity',
-  'topic',
-  'title',
-  'domain',
-  'recency',
-  'content',
-  // Lane 8 — 'ai'. This set is the parse WHITELIST: parseGuessLaneResult drops
-  // any lane whose name is not in it, before any renderer ever sees the entry.
-  // Omitting 'ai' here is what made a live 8-lane payload render as seven dots
-  // — the companion sent the lane, the client silently deleted it, and both the
-  // strip and the array-order disclosure were handed a 7-lane array with no
-  // trace of the loss. Every lane added to the GuessLane union MUST be added
-  // here in the same change.
-  'ai',
-  // Lane 9 — 'prototype' (PR #377). The companion disclosed this lane for a
-  // build before it was added here, and the panel silently dropped it —
-  // the exact 'ai'-lane failure mode the comment above documents.
-  'prototype',
-]);
+// This set is the parse WHITELIST: parseGuessLaneResult drops any lane whose
+// name is not in it, before any renderer ever sees the entry. DERIVED from
+// laneRegistry.ts (task #29) as Object.keys(ATTRIBUTION_LANES) — no longer
+// hand-listed. The pre-fix history: omitting 'ai' from a hand-maintained copy
+// of this set is what made a live 8-lane payload render as seven dots — the
+// companion sent the lane, the client silently deleted it, and both the strip
+// and the array-order disclosure were handed a 7-lane array with no trace of
+// the loss. 'prototype' (PR #377) repeated the exact same failure mode a day
+// later. A lane registered in laneRegistry.ts now appears here automatically.
+const VALID_LANES: ReadonlySet<GuessLane> = new Set<GuessLane>(
+  Object.keys(ATTRIBUTION_LANES) as GuessLane[],
+);
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === 'object' && value !== null && !Array.isArray(value);
