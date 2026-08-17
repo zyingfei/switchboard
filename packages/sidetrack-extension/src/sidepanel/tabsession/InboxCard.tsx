@@ -7,6 +7,7 @@ import type { EntityDisplayCtx } from '../entityDisplay/format';
 import { AttributionBadge } from './AttributionBadge';
 import { AttributionProvenance } from './AttributionProvenance';
 import { tabSessionDisplayTitle } from './displayTitle';
+import { MembershipChips } from './MembershipChips';
 import { PageEvidenceBadge } from './PageEvidenceBadge';
 import { endorsementFor } from './suggestionEndorsement';
 import {
@@ -64,6 +65,13 @@ export interface InboxCardProps {
   // only" just because page-text auto-extract is off (the two
   // pipelines are separate). Caller computes from state.threads.
   readonly chatThreadCaptured?: boolean;
+  // Multi-membership UI-visibility phase — opens the "add to workstream"
+  // picker (parent owns the modal, same pattern as onPickAnother). When
+  // omitted, the chip row's "+" affordance renders disabled.
+  readonly onAddMembership?: (tabSessionId: string) => void;
+  // Drops ONE secondary membership row (a chip's "×"). When omitted,
+  // existing chips render without a remove button.
+  readonly onRemoveMembership?: (tabSessionId: string, workstreamId: string) => void;
 }
 
 export function InboxCard({
@@ -80,6 +88,8 @@ export function InboxCard({
   onRefreshSuggestion,
   refreshingSuggestion = false,
   chatThreadCaptured = false,
+  onAddMembership,
+  onRemoveMembership,
 }: InboxCardProps) {
   const host = hostFor(record);
   const title = tabSessionDisplayTitle(record);
@@ -122,6 +132,12 @@ export function InboxCard({
             {title}
           </span>
           <AttributionBadge record={record} suggestion={suggestion} workstreams={workstreams} />
+          <MembershipChips
+            record={record}
+            workstreams={workstreams}
+            {...(onAddMembership === undefined ? {} : { onAdd: onAddMembership })}
+            {...(onRemoveMembership === undefined ? {} : { onRemove: onRemoveMembership })}
+          />
           <PageEvidenceBadge
             pageEvidence={record.pageEvidence}
             chatThreadCaptured={chatThreadCaptured}

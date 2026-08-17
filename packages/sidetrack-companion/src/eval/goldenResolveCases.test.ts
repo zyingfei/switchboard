@@ -501,7 +501,7 @@ describe('golden case 5 — prototype-disclosure-never-decides (a plausible-but-
       {
         workstreamId: 'ws-private-codename',
         score: 0.97,
-        why: 'closest of 4 matching generated prototypes, similarity 0.97',
+        why: 'close to 4 examples generated for this workstream (0.97)',
       },
     ],
   };

@@ -20,7 +20,9 @@
 // — no new backend. Renders inside SuggestionStats (Now/Inbox card) and the
 // NeedsOrganizeSuggestion thread card, sharing one disclosure idiom.
 
+import type { WorkstreamPrototypeStatus } from '../../companion/categoryFlexibilityClient';
 import { GIST_LANE_MARKER, GIST_LANE_MARKER_TITLE, whyUsedGist } from './gistProvenance';
+import { prototypeStatusLine } from './prototypeStatusText';
 import type { GuessLaneResult, TabSessionWorkstreamOption } from './types';
 
 // Human labels for the six lanes — the resolver's arm names are jargon
@@ -79,6 +81,13 @@ export interface GuessLanesProps {
   // click-the-summary behavior), so existing callers are unchanged.
   readonly open?: boolean;
   readonly onToggle?: (open: boolean) => void;
+  // Prototype-lane visibility (docs/plans/2026-08-16-category-flexibility-
+  // hyde.md, UI-visibility phase — "very little visibility about how hyDE
+  // works"). Per-workstream standing prototype status, keyed by
+  // workstreamId. Consulted ONLY for the `lane.lane === 'prototype'` row's
+  // top candidate — every other lane is unaffected. Omitted -> the row
+  // renders exactly as before (no extra line).
+  readonly prototypeStatusByWorkstream?: ReadonlyMap<string, WorkstreamPrototypeStatus>;
 }
 
 // One lane's row: label · (top candidate | empty reason). The additional
@@ -87,10 +96,12 @@ function LaneRow({
   lane,
   workstreams,
   onFileHere,
+  prototypeStatusByWorkstream,
 }: {
   readonly lane: GuessLaneResult;
   readonly workstreams: readonly TabSessionWorkstreamOption[];
   readonly onFileHere?: (workstreamId: string) => void;
+  readonly prototypeStatusByWorkstream?: ReadonlyMap<string, WorkstreamPrototypeStatus>;
 }) {
   const label = LANE_LABEL[lane.lane];
   const [top, ...rest] = lane.candidates;
@@ -135,6 +146,21 @@ function LaneRow({
       {/* The lane's raw `why`, verbatim — free text from the companion, never
           parsed for display. */}
       <span className="guess-lane-why subtle">{top.why}</span>
+      {/* Prototype-lane visibility — the matched workstream's STANDING
+          status (count/updated/evidence, or the honest why-not), distinct
+          from `why` above (which describes THIS match, not the
+          workstream's overall prototype state). Only ever rendered for
+          the prototype lane's own row. */}
+      {lane.lane === 'prototype' && prototypeStatusByWorkstream !== undefined ? (
+        (() => {
+          const status = prototypeStatusByWorkstream.get(top.workstreamId);
+          return status === undefined ? null : (
+            <span className="guess-lane-prototype-status mono subtle">
+              {prototypeStatusLine(status)}
+            </span>
+          );
+        })()
+      ) : null}
       {/* Provenance, guess → gist. The companion marks a content-lane `why`
           with ' · gist' when the resolved page's saved gist went into that
           lane's query text; that marker is jargon on its own, so the row says
@@ -176,6 +202,7 @@ export function GuessLanes({
   onFileHere,
   open,
   onToggle,
+  prototypeStatusByWorkstream,
 }: GuessLanesProps) {
   if (lanes.length === 0) return null;
   const withSignal = lanesWithSignal(lanes);
@@ -205,6 +232,9 @@ export function GuessLanes({
             lane={lane}
             workstreams={workstreams}
             {...(onFileHere === undefined ? {} : { onFileHere })}
+            {...(prototypeStatusByWorkstream === undefined
+              ? {}
+              : { prototypeStatusByWorkstream })}
           />
         ))}
       </ul>

@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 
+import type { SuggestionCandidateSummary } from '../../companion/categoryFlexibilityClient';
 import type { ConnectionNode } from '../connections/types';
 import type { EntityDisplayCtx } from '../entityDisplay/format';
 import { InboxCard } from './InboxCard';
@@ -10,6 +11,7 @@ import type {
   TabSessionResolutionResult,
   TabSessionWorkstreamOption,
 } from './types';
+import { WorkstreamSuggestionCard } from './WorkstreamSuggestionCard';
 
 export interface InboxViewProps {
   readonly inbox: TabSessionInboxData;
@@ -22,6 +24,8 @@ export interface InboxViewProps {
   readonly onOpenTab?: (record: TabSessionRecord) => void;
   readonly onPickAnother?: (tabSessionId: string) => void;
   readonly onIgnore?: (tabSessionId: string, reason: 'noise' | 'duplicate' | 'private') => void;
+  readonly onAddMembership?: (tabSessionId: string) => void;
+  readonly onRemoveMembership?: (tabSessionId: string, workstreamId: string) => void;
   readonly nodeById?: ReadonlyMap<string, ConnectionNode>;
   readonly displayCtx?: EntityDisplayCtx;
   readonly onOpenInConnections?: (canonicalUrl: string) => void;
@@ -56,6 +60,13 @@ export interface InboxViewProps {
    * pattern the Current-Tab card's empty placeholder already uses. */
   readonly pageAccessGranted?: boolean;
   readonly onGrantAccess?: () => void;
+  // New-category suggestion candidates from the unfiled pool — surfaced
+  // HERE, where those pages already live (docs/plans/2026-08-16-category-
+  // flexibility-hyde.md, UI-visibility phase). Omitted/empty -> no cards.
+  readonly newCategorySuggestions?: readonly SuggestionCandidateSummary[];
+  readonly suggestionActionPendingFingerprints?: ReadonlySet<string>;
+  readonly onAcceptSuggestion?: (candidate: SuggestionCandidateSummary) => void;
+  readonly onDeclineSuggestion?: (candidate: SuggestionCandidateSummary) => void;
 }
 
 // Stage 5 polish — Inbox-only search filter. Pure client-side, runs on
@@ -82,6 +93,8 @@ export function InboxView({
   onOpenTab,
   onPickAnother,
   onIgnore,
+  onAddMembership,
+  onRemoveMembership,
   nodeById,
   displayCtx,
   onOpenInConnections,
@@ -93,6 +106,10 @@ export function InboxView({
   isChatThreadCaptured,
   pageAccessGranted,
   onGrantAccess,
+  newCategorySuggestions = [],
+  suggestionActionPendingFingerprints,
+  onAcceptSuggestion,
+  onDeclineSuggestion,
 }: InboxViewProps) {
   const [query, setQuery] = useState('');
   // Cross-surface request — accept a pre-filled query exactly once,
@@ -206,6 +223,23 @@ export function InboxView({
           </div>
         </div>
       ) : null}
+      {newCategorySuggestions.map((candidate) => (
+        <WorkstreamSuggestionCard
+          key={candidate.fingerprint}
+          candidate={candidate}
+          pending={
+            suggestionActionPendingFingerprints?.has(
+              `${candidate.kind}:${candidate.scopeId}:${candidate.fingerprint}`,
+            ) === true
+          }
+          onAccept={() => {
+            onAcceptSuggestion?.(candidate);
+          }}
+          onDecline={() => {
+            onDeclineSuggestion?.(candidate);
+          }}
+        />
+      ))}
       {error !== null ? <div className="banner danger">{error}</div> : null}
       {loading ? <div className="thread-empty subtle">Loading tab sessions…</div> : null}
       {!loading && slice.visible.length === 0 ? (
@@ -245,6 +279,8 @@ export function InboxView({
             {...(onOpenTab === undefined ? {} : { onOpenTab })}
             {...(onPickAnother === undefined ? {} : { onPickAnother })}
             {...(onIgnore === undefined ? {} : { onIgnore })}
+            {...(onAddMembership === undefined ? {} : { onAddMembership })}
+            {...(onRemoveMembership === undefined ? {} : { onRemoveMembership })}
             {...(nodeById === undefined ? {} : { nodeById })}
             {...(displayCtx === undefined ? {} : { displayCtx })}
             {...(onOpenInConnections === undefined ? {} : { onOpenInConnections })}

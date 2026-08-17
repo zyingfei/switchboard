@@ -37,6 +37,16 @@ export interface SuggestionCandidateRecord {
   readonly structuralName: string | null;
   readonly createdAtMs: number;
   readonly updatedAtMs: number;
+  // UI-visibility phase (docs/plans/2026-08-16-category-flexibility-hyde.md)
+  // — the per-scope decline memory the panel's suggestion cards need: once
+  // a user declines a split/new-category suggestion, that exact cluster
+  // must never resurface, even across future recomputations. The engine
+  // (splitSuggestionEngine.ts) carries these two fields forward on its
+  // Jaccard-overlap match the same way it already carries
+  // `consecutiveStableCount`/`createdAtMs` forward — dismissing is sticky,
+  // not reset by recompute.
+  readonly dismissed: boolean;
+  readonly dismissedAtMs: number | null;
 }
 
 export interface SuggestionCandidateStore {
@@ -61,6 +71,20 @@ export interface SuggestionCandidateStore {
     revisionId: string,
     candidates: readonly SuggestionCandidateRecord[],
   ) => void;
+  /**
+   * Mark ONE candidate (matched by its exact fingerprint) dismissed —
+   * "declined, never resurface." A no-op (returns false) when no candidate
+   * with that fingerprint currently exists for (scopeId, kind); the caller
+   * decides whether that's worth surfacing as an error (it usually means
+   * the candidate was already superseded by a recompute between the read
+   * that served the suggestion and the decline click).
+   */
+  readonly dismissCandidate: (
+    scopeId: string,
+    kind: SuggestionCandidateKind,
+    fingerprint: string,
+    dismissedAtMs: number,
+  ) => boolean;
   readonly close: () => void;
 }
 
@@ -121,6 +145,8 @@ interface CandidateRow {
   readonly structural_name: string | null;
   readonly created_at_ms: number;
   readonly updated_at_ms: number;
+  readonly dismissed: number;
+  readonly dismissed_at_ms: number | null;
 }
 
 const toRecord = (
@@ -144,6 +170,8 @@ const toRecord = (
     structuralName: row.structural_name,
     createdAtMs: row.created_at_ms,
     updatedAtMs: row.updated_at_ms,
+    dismissed: row.dismissed === 1,
+    dismissedAtMs: row.dismissed_at_ms,
   };
 };
 
@@ -154,10 +182,23 @@ export const createSuggestionCandidateStore = async (
   const dbPath = join(vaultRoot, '_BAC', 'connections', 'suggestion-candidates.db');
   const db = new Database(dbPath, { create: true, readwrite: true });
   db.exec(SCHEMA);
+  // Additive migration for a vault whose suggestion-candidates.db predates
+  // the decline-memory columns — same guarded ADD COLUMN idiom
+  // sync/eventStore.ts uses for `resolver_url` (PRAGMA table_info check,
+  // one-time ALTER, no-op once the column exists).
+  const candidateColumns = db.query("PRAGMA table_info('suggestion_candidate')").all() as readonly {
+    readonly name: string;
+  }[];
+  if (!candidateColumns.some((column) => column.name === 'dismissed')) {
+    db.exec('ALTER TABLE suggestion_candidate ADD COLUMN dismissed INTEGER NOT NULL DEFAULT 0');
+  }
+  if (!candidateColumns.some((column) => column.name === 'dismissed_at_ms')) {
+    db.exec('ALTER TABLE suggestion_candidate ADD COLUMN dismissed_at_ms INTEGER');
+  }
 
   const selectCandidates = db.query(
     `SELECT fingerprint, member_ids_json, consecutive_stable_count, emitted, structural_name,
-            created_at_ms, updated_at_ms
+            created_at_ms, updated_at_ms, dismissed, dismissed_at_ms
      FROM suggestion_candidate WHERE scope_id = ? AND kind = ?
      ORDER BY fingerprint`,
   );
@@ -177,8 +218,12 @@ export const createSuggestionCandidateStore = async (
   const insertCandidate = db.query(
     `INSERT INTO suggestion_candidate
        (scope_id, kind, fingerprint, member_ids_json, consecutive_stable_count, emitted,
-        structural_name, created_at_ms, updated_at_ms)
-     VALUES (?,?,?,?,?,?,?,?,?)`,
+        structural_name, created_at_ms, updated_at_ms, dismissed, dismissed_at_ms)
+     VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
+  );
+  const updateDismissed = db.query(
+    `UPDATE suggestion_candidate SET dismissed = 1, dismissed_at_ms = ?
+     WHERE scope_id = ? AND kind = ? AND fingerprint = ?`,
   );
 
   const candidatesFor = (
@@ -219,6 +264,8 @@ export const createSuggestionCandidateStore = async (
           candidate.structuralName,
           candidate.createdAtMs,
           candidate.updatedAtMs,
+          candidate.dismissed ? 1 : 0,
+          candidate.dismissedAtMs,
         );
       }
       upsertScope.run(scopeId, kind, revisionId, Date.now());
@@ -229,10 +276,23 @@ export const createSuggestionCandidateStore = async (
     }
   };
 
+  const dismissCandidate = (
+    scopeId: string,
+    kind: SuggestionCandidateKind,
+    fingerprint: string,
+    dismissedAtMs: number,
+  ): boolean => {
+    const result = updateDismissed.run(dismissedAtMs, scopeId, kind, fingerprint) as
+      | { readonly changes?: number }
+      | undefined;
+    return (result?.changes ?? 0) > 0;
+  };
+
   return {
     candidatesFor,
     lastComputedRevision,
     replaceScope,
+    dismissCandidate,
     close: () => {
       db.close?.();
     },

@@ -1614,6 +1614,76 @@ button:disabled {
   border-color: var(--green-tint);
 }
 
+/* Multi-membership chips (docs/plans/2026-08-16-category-flexibility-hyde.md,
+   UI-visibility phase) — SECONDARY workstreams beside the primary
+   AttributionBadge. Deliberately quieter than the primary badge (no fill,
+   thin border) so the primary stays the one visually-dominant chip on the
+   row; "Also in:" + name pills read as additive context, not a second
+   decision. */
+.membership-chips {
+  display: inline-flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 4px;
+  flex: 0 0 auto;
+}
+.membership-chips-label {
+  font-size: 9px;
+}
+.membership-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  max-width: 120px;
+  padding: 1px 4px 1px 7px;
+  border: var(--hair-soft);
+  border-radius: 999px;
+  font-size: 10px;
+  background: var(--paper);
+  color: var(--ink-2);
+}
+.membership-chip-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.membership-chip-remove {
+  flex: 0 0 auto;
+  border: 0;
+  background: transparent;
+  color: var(--ink-3);
+  font-size: 11px;
+  line-height: 1;
+  padding: 0 1px;
+  cursor: pointer;
+}
+.membership-chip-remove:hover {
+  color: var(--ink-1);
+}
+.membership-chip-add {
+  flex: 0 0 auto;
+  width: 16px;
+  height: 16px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: var(--hair-soft);
+  border-radius: 999px;
+  background: var(--paper);
+  color: var(--ink-3);
+  font-size: 11px;
+  line-height: 1;
+  cursor: pointer;
+}
+.membership-chip-add:hover:enabled {
+  color: var(--ink-1);
+  border-color: var(--rule);
+}
+.membership-chip-add:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
 .tab-session-capture-badge {
   flex: 0 0 auto;
   max-width: 128px;
@@ -5048,6 +5118,21 @@ textarea.preview-body:focus {
   color: var(--ink-3);
   opacity: 0.7;
   margin-right: 2px;
+}
+/* Prototype-lane visibility (docs/plans/2026-08-16-category-flexibility-
+   hyde.md) — name + one-line status stack, sharing the row's flex space
+   with the thread-count column. */
+.ws-picker-name-col {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  min-width: 0;
+}
+.ws-picker-prototype-status {
+  font-size: 9px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 .ws-picker-create {
   display: flex;

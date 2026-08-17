@@ -1,5 +1,6 @@
 import { useState } from 'react';
 
+import type { WorkstreamPrototypeStatus } from '../../companion/categoryFlexibilityClient';
 import {
   coarseConfidenceWord,
   confidenceLevelFromProbability,
@@ -37,12 +38,14 @@ function LanePipeline({
   gate,
   fusedCount,
   onFileHere,
+  prototypeStatusByWorkstream,
 }: {
   readonly lanes: readonly GuessLaneResult[];
   readonly workstreams: readonly TabSessionWorkstreamOption[];
   readonly gate?: GuessGate;
   readonly fusedCount: number;
   readonly onFileHere?: (workstreamId: string) => void;
+  readonly prototypeStatusByWorkstream?: ReadonlyMap<string, WorkstreamPrototypeStatus>;
 }) {
   const [open, setOpen] = useState(false);
   return (
@@ -63,6 +66,9 @@ function LanePipeline({
         open={open}
         onToggle={setOpen}
         {...(onFileHere === undefined ? {} : { onFileHere })}
+        {...(prototypeStatusByWorkstream === undefined
+          ? {}
+          : { prototypeStatusByWorkstream })}
       />
     </>
   );
@@ -234,6 +240,10 @@ export interface SuggestionStatsProps {
   // cleanly for callers that don't wire filing. `undefined` on the whole
   // prop = the legacy single-suggestion card (list suppressed).
   readonly onFileHere?: (workstreamId: string) => void;
+  // Prototype-lane visibility — per-workstream standing prototype status,
+  // threaded down to the guess-lanes disclosure's prototype row. Omitted
+  // -> that row renders exactly as before (no extra status line).
+  readonly prototypeStatusByWorkstream?: ReadonlyMap<string, WorkstreamPrototypeStatus>;
 }
 
 export function SuggestionStats({
@@ -247,6 +257,7 @@ export function SuggestionStats({
   visitCount,
   error,
   onFileHere,
+  prototypeStatusByWorkstream,
 }: SuggestionStatsProps) {
   // error !== empty !== pending !== populated — the discriminant that
   // keeps a failed resolve from masquerading as a confident empty card.
@@ -403,6 +414,9 @@ export function SuggestionStats({
             {...(emptyGate === undefined ? {} : { gate: emptyGate })}
             fusedCount={suggestion.fusedCandidates.length}
             {...(onFileHere === undefined ? {} : { onFileHere })}
+            {...(prototypeStatusByWorkstream === undefined
+              ? {}
+              : { prototypeStatusByWorkstream })}
           />
         </div>
       );
@@ -445,6 +459,9 @@ export function SuggestionStats({
             {...(emptyGate === undefined ? {} : { gate: emptyGate })}
             fusedCount={suggestion.fusedCandidates.length}
             {...(onFileHere === undefined ? {} : { onFileHere })}
+            {...(prototypeStatusByWorkstream === undefined
+              ? {}
+              : { prototypeStatusByWorkstream })}
           />
         ) : null}
       </div>
@@ -630,6 +647,7 @@ export function SuggestionStats({
             : { gate: parseGuessGate(suggestion.decision.gate) })}
           fusedCount={suggestion.fusedCandidates.length}
           {...(onFileHere === undefined ? {} : { onFileHere })}
+          {...(prototypeStatusByWorkstream === undefined ? {} : { prototypeStatusByWorkstream })}
         />
       ) : null}
     </div>

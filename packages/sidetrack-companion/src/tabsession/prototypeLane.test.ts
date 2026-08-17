@@ -107,8 +107,9 @@ describe('buildPrototypeLane — pure vector match, NO LLM call at serve time', 
     expect(lane.candidates[0]?.score).toBeCloseTo(1.0, 5);
     expect(lane.candidates[1]?.score).toBeCloseTo(0.82, 2);
     expect(lane.candidates[2]?.score).toBeCloseTo(0, 5);
-    // ws-a had 2 hits; the why line should say so.
-    expect(lane.candidates[0]?.why).toContain('2 matching generated prototypes');
+    // ws-a had 2 hits; the why line should say so, in plain language (not
+    // the ML term "prototype" — see prototypeLane.ts's UI-visibility note).
+    expect(lane.candidates[0]?.why).toContain('2 examples generated for this workstream');
   });
 
   it('caps at the top 3 candidates', async () => {
