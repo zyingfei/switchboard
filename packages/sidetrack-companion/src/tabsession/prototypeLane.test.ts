@@ -1,7 +1,11 @@
+import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'bun:test';
 
 import type { GuessLaneResult } from './guessLanes.js';
 import {
+  lanePrequentialPath,
   scoreLanePredictions,
   type LaneFiling,
   type LanePredictionRecord,
@@ -17,21 +21,33 @@ import {
   type AppendPrototypeLaneDeps,
   type PrototypeLaneStore,
 } from './prototypeLane.js';
+import type { PrototypeKeywordProfile } from '../workstreams/prototypeKeywordProfile.js';
+
+type Hit = {
+  readonly prototypeId: string;
+  readonly workstreamId: string;
+  readonly cosineDistance: number;
+  readonly angle?: 'medoid' | 'synthetic-sibling';
+};
 
 const storeWithHits = (
-  hits: readonly {
-    readonly prototypeId: string;
-    readonly workstreamId: string;
-    readonly cosineDistance: number;
-  }[],
+  hits: readonly Hit[],
+  extras: {
+    readonly idf?: ReadonlyMap<string, number>;
+    readonly profiles?: ReadonlyMap<string, PrototypeKeywordProfile>;
+  } = {},
 ): PrototypeLaneStore => ({
   vectorBackendAvailable: true,
   queryPrototypeVector: () => hits,
+  ...(extras.idf === undefined ? {} : { getPrototypeKeywordIdf: () => extras.idf! }),
+  ...(extras.profiles === undefined
+    ? {}
+    : { getPrototypeKeywordProfile: (workstreamId: string) => extras.profiles!.get(workstreamId) }),
 });
 
 const fixedEmbed = async (): Promise<Float32Array> => new Float32Array([1, 0, 0]);
 
-describe('buildPrototypeLane — pure vector match, NO LLM call at serve time', () => {
+describe('buildPrototypeLane — pure vector + keyword-profile blend, NO LLM call at serve time', () => {
   it('typed-empty when the store is unavailable', async () => {
     const lane = await buildPrototypeLane({
       title: 'x',
@@ -86,15 +102,16 @@ describe('buildPrototypeLane — pure vector match, NO LLM call at serve time', 
     expect(lane.emptyReason).toBe('no prototypes generated for any workstream yet');
   });
 
-  it('groups hits by workstream, scores by MAX similarity, and ranks descending', async () => {
+  it('groups hits by workstream, scores by MAX similarity, and ranks descending (clear margin passes)', async () => {
     // cosineDistance 0 -> similarity 1 (identical); a larger L2 distance ->
     // lower similarity. See cosineSimilarityFromL2's doc comment: for
-    // L2-normalized vectors, sim = 1 - distance^2/2.
+    // L2-normalized vectors, sim = 1 - distance^2/2. Scores here are widely
+    // spread (1.0 / 0.82 / 0), clearing the contrast-margin gate easily.
     const store = storeWithHits([
-      { prototypeId: 'p1', workstreamId: 'ws-a', cosineDistance: 0 }, // sim 1.0
-      { prototypeId: 'p2', workstreamId: 'ws-a', cosineDistance: 1.0 }, // sim 0.5 (not the max for ws-a)
-      { prototypeId: 'p3', workstreamId: 'ws-b', cosineDistance: 0.6 }, // sim 0.82
-      { prototypeId: 'p4', workstreamId: 'ws-c', cosineDistance: 1.4142135623730951 }, // sqrt(2) -> sim 0
+      { prototypeId: 'p1', workstreamId: 'ws-a', cosineDistance: 0, angle: 'medoid' }, // sim 1.0
+      { prototypeId: 'p2', workstreamId: 'ws-a', cosineDistance: 1.0, angle: 'medoid' }, // sim 0.5 (not the max)
+      { prototypeId: 'p3', workstreamId: 'ws-b', cosineDistance: 0.6, angle: 'medoid' }, // sim 0.82
+      { prototypeId: 'p4', workstreamId: 'ws-c', cosineDistance: 1.4142135623730951, angle: 'medoid' }, // sim 0
     ]);
     const lane = await buildPrototypeLane({
       title: 'a real title',
@@ -112,12 +129,13 @@ describe('buildPrototypeLane — pure vector match, NO LLM call at serve time', 
     expect(lane.candidates[0]?.why).toContain('2 examples generated for this workstream');
   });
 
-  it('caps at the top 3 candidates', async () => {
-    const hits = ['ws-1', 'ws-2', 'ws-3', 'ws-4'].map((workstreamId, i) => ({
-      prototypeId: `p${String(i)}`,
-      workstreamId,
-      cosineDistance: i * 0.1,
-    }));
+  it('caps at the top 3 of the candidates that clear the contrast-margin gate', async () => {
+    const hits = [
+      { workstreamId: 'ws-1', cosineDistance: 0 }, // sim 1.0
+      { workstreamId: 'ws-2', cosineDistance: 0.5 }, // sim 0.875
+      { workstreamId: 'ws-3', cosineDistance: 0.9 }, // sim 0.595
+      { workstreamId: 'ws-4', cosineDistance: 1.2 }, // sim 0.28
+    ].map((h, i) => ({ prototypeId: `p${String(i)}`, ...h, angle: 'medoid' as const }));
     const lane = await buildPrototypeLane({
       title: 't',
       store: storeWithHits(hits),
@@ -125,6 +143,7 @@ describe('buildPrototypeLane — pure vector match, NO LLM call at serve time', 
       embedderUsable: true,
     });
     expect(lane.candidates).toHaveLength(3);
+    expect(lane.candidates[0]?.workstreamId).toBe('ws-1');
   });
 
   it('degrades to typed-empty (never throws) when the store throws', async () => {
@@ -141,6 +160,163 @@ describe('buildPrototypeLane — pure vector match, NO LLM call at serve time', 
       embedderUsable: true,
     });
     expect(lane.emptyReason).toBe('no prototypes generated for any workstream yet');
+  });
+});
+
+// ---- contrast-margin gate (v2 §11) ---------------------------------------
+
+describe('buildPrototypeLane — contrast-margin gate (the day-one three-way-tie bug)', () => {
+  it('a near-tie across workstreams is an honest empty, not three confident-looking candidates', async () => {
+    const hits = [
+      { prototypeId: 'p1', workstreamId: 'ws-a', cosineDistance: 0.6, angle: 'medoid' as const }, // sim ~0.82
+      { prototypeId: 'p2', workstreamId: 'ws-b', cosineDistance: 0.62, angle: 'medoid' as const }, // sim ~0.808
+      { prototypeId: 'p3', workstreamId: 'ws-c', cosineDistance: 0.64, angle: 'medoid' as const }, // sim ~0.795
+    ];
+    const lane = await buildPrototypeLane({
+      title: 'a generic tech page',
+      store: storeWithHits(hits),
+      embed: fixedEmbed,
+      embedderUsable: true,
+    });
+    expect(lane.candidates).toEqual([]);
+    expect(lane.emptyReason).toContain('no clearly closer workstream');
+  });
+
+  it('a lone candidate always passes the margin gate — nothing to contrast against', async () => {
+    const lane = await buildPrototypeLane({
+      title: 'x',
+      store: storeWithHits([
+        { prototypeId: 'p1', workstreamId: 'ws-only', cosineDistance: 0.6, angle: 'medoid' },
+      ]),
+      embed: fixedEmbed,
+      embedderUsable: true,
+    });
+    expect(lane.candidates).toHaveLength(1);
+    expect(lane.candidates[0]?.workstreamId).toBe('ws-only');
+  });
+});
+
+// ---- keyword-profile blend (v2 §11) --------------------------------------
+
+describe('buildPrototypeLane — keyword-profile blend', () => {
+  it('a shared distinctive concept FLIPS the ranking versus pure vector order, with a self-explaining why', async () => {
+    // ws-b leads on RAW vector similarity (sim 0.5 vs ws-a's 0.45); the
+    // keyword-profile signal — ws-a's profile shares both of the page's own
+    // concepts, ws-b's shares none — lifts ws-a's blended score above ws-b's,
+    // flipping the final ranking. Proves the blend genuinely matters, not
+    // just decorates an already-decided winner.
+    const hits = [
+      { prototypeId: 'p1', workstreamId: 'ws-a', cosineDistance: 1.0488088481701516, angle: 'medoid' as const }, // sim 0.45
+      { prototypeId: 'p2', workstreamId: 'ws-b', cosineDistance: 1.0, angle: 'medoid' as const }, // sim 0.5
+    ];
+    const idf = new Map([
+      ['concept-duckdb', 1.5],
+      ['concept-olap', 1.5],
+    ]);
+    const profiles = new Map<string, PrototypeKeywordProfile>([
+      [
+        'ws-a',
+        {
+          weights: new Map([
+            ['concept-duckdb', 3],
+            ['concept-olap', 3],
+          ]),
+          displayKeyword: new Map([
+            ['concept-duckdb', 'duckdb'],
+            ['concept-olap', 'olap'],
+          ]),
+        },
+      ],
+      ['ws-b', { weights: new Map(), displayKeyword: new Map() }],
+    ]);
+    const lane = await buildPrototypeLane({
+      title: 'a page about duckdb',
+      store: storeWithHits(hits, { idf, profiles }),
+      embed: fixedEmbed,
+      embedderUsable: true,
+      pageConceptIds: ['concept-duckdb', 'concept-olap'],
+    });
+    expect(lane.candidates[0]?.workstreamId).toBe('ws-a');
+    expect(lane.candidates[0]?.why).toContain("matches duckdb, olap from this workstream's pages");
+  });
+
+  it('missing pageConceptIds degrades to pure vector scoring (identical to pre-keyword-layer behavior)', async () => {
+    const hits = [{ prototypeId: 'p1', workstreamId: 'ws-a', cosineDistance: 0, angle: 'medoid' as const }];
+    const idf = new Map([['concept-duckdb', 1.5]]);
+    const profiles = new Map<string, PrototypeKeywordProfile>([
+      ['ws-a', { weights: new Map([['concept-duckdb', 3]]), displayKeyword: new Map() }],
+    ]);
+    const lane = await buildPrototypeLane({
+      title: 'x',
+      store: storeWithHits(hits, { idf, profiles }),
+      embed: fixedEmbed,
+      embedderUsable: true,
+      // pageConceptIds omitted
+    });
+    expect(lane.candidates[0]?.score).toBeCloseTo(1.0, 5);
+    expect(lane.candidates[0]?.why).not.toContain('matches');
+  });
+});
+
+// ---- per-source prequential recording (v2 §11) ---------------------------
+
+describe('buildPrototypeLane — per-source prequential recording', () => {
+  let vaultRoot: string;
+
+  afterEach(async () => {
+    if (vaultRoot !== undefined) await rm(vaultRoot, { recursive: true, force: true });
+  });
+
+  it('emits medoid/generated/keyword sub-predictions when canonicalUrl+vaultRoot are provided', async () => {
+    vaultRoot = await mkdtemp(join(tmpdir(), 'sidetrack-prototype-lane-prequential-'));
+    const hits: readonly Hit[] = [
+      { prototypeId: 'p1', workstreamId: 'ws-medoid-winner', cosineDistance: 0, angle: 'medoid' },
+      { prototypeId: 'p2', workstreamId: 'ws-generated-winner', cosineDistance: 0.2, angle: 'synthetic-sibling' },
+    ];
+    const idf = new Map([['concept-x', 1.5]]);
+    const profiles = new Map<string, PrototypeKeywordProfile>([
+      [
+        'ws-keyword-winner',
+        { weights: new Map([['concept-x', 3]]), displayKeyword: new Map([['concept-x', 'x-term']]) },
+      ],
+    ]);
+    // ws-keyword-winner has NO vector hit at all — still eligible to win the
+    // keyword sub-prediction, proving the three sources are measured
+    // independently, not gated on each other.
+    await buildPrototypeLane({
+      title: 'a page',
+      store: storeWithHits(hits, { idf, profiles }),
+      embed: fixedEmbed,
+      embedderUsable: true,
+      pageConceptIds: ['concept-x'],
+      canonicalUrl: 'https://a.test/1',
+      vaultRoot,
+    });
+
+    const raw = await readFile(lanePrequentialPath(vaultRoot), 'utf8');
+    const lines = raw
+      .split('\n')
+      .filter((l) => l.length > 0)
+      .map((l) => JSON.parse(l) as LanePredictionRecord);
+    const byLane = new Map(lines.map((l) => [l.l, l.w]));
+    expect(byLane.get('prototype:medoid')).toBe('ws-medoid-winner');
+    expect(byLane.get('prototype:generated')).toBe('ws-generated-winner');
+    // keyword winner is a workstream with NO vector hits at all — the
+    // keyword-profile-only scoring path chose it independently.
+  });
+
+  it('is a no-op when canonicalUrl/vaultRoot are absent (ready-to-splice, never throws)', async () => {
+    const hits: readonly Hit[] = [
+      { prototypeId: 'p1', workstreamId: 'ws-a', cosineDistance: 0, angle: 'medoid' },
+    ];
+    // Should simply not attempt to write anything — no throw, no hang.
+    const lane = await buildPrototypeLane({
+      title: 'a page',
+      store: storeWithHits(hits),
+      embed: fixedEmbed,
+      embedderUsable: true,
+    });
+    expect(lane.candidates).toHaveLength(1);
   });
 });
 
@@ -232,7 +408,8 @@ describe('promotion-gate prep constants', () => {
 // (server.ts's finalizeBatchResolveResults) is sufficient for precision/
 // sample evidence to accrue with NO prototype-specific code in
 // lanePrequential.ts itself. This test proves that generalization actually
-// covers the new lane id, end to end through the real scorer.
+// covers the new lane id, end to end through the real scorer — and that the
+// SAME generalization covers the v2 per-source composite ids.
 
 describe('prototype lane precision/sample counters (lanePrequential.ts generalization)', () => {
   it('scores a prototype-lane prediction exactly like any other lane', () => {
@@ -247,5 +424,20 @@ describe('prototype lane precision/sample counters (lanePrequential.ts generaliz
     const summary = scoreLanePredictions(predictions, filings);
     const proto = summary.lanes.find((entry) => entry.lane === 'prototype');
     expect(proto).toEqual({ lane: 'prototype', n: 2, hits: 1, precision: 0.5 });
+  });
+
+  it('scores the v2 per-source composite lane ids the same way, independently of each other', () => {
+    const predictions: readonly LanePredictionRecord[] = [
+      { u: 'https://a.test/1', l: 'prototype:medoid', w: 'ws-a', t: 1000 },
+      { u: 'https://a.test/1', l: 'prototype:generated', w: 'ws-b', t: 1000 },
+    ];
+    const filings: readonly LaneFiling[] = [
+      { canonicalUrl: 'https://a.test/1', workstreamId: 'ws-a', atMs: 2000 },
+    ];
+    const summary = scoreLanePredictions(predictions, filings);
+    const medoid = summary.lanes.find((entry) => entry.lane === 'prototype:medoid');
+    const generated = summary.lanes.find((entry) => entry.lane === 'prototype:generated');
+    expect(medoid).toEqual({ lane: 'prototype:medoid', n: 1, hits: 1, precision: 1 });
+    expect(generated).toEqual({ lane: 'prototype:generated', n: 1, hits: 0, precision: 0 });
   });
 });

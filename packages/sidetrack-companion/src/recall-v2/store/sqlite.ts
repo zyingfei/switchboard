@@ -122,6 +122,28 @@ CREATE TABLE IF NOT EXISTS prototypes (
 );
 CREATE INDEX IF NOT EXISTS prototypes_workstream ON prototypes(workstream_id);
 
+-- Prototype lane v2 keyword-profile signal (docs/plans/2026-08-16-category-
+-- flexibility-hyde.md §11). Small vocabulary (dozens to low thousands of
+-- concept ids, same scale keyword-concept-store.ts's own centroid table
+-- assumes) — a full REPLACE each generation tick is cheap, so there is no
+-- incremental-update machinery here, unlike prototypes/prototype_vec which
+-- upsert per row. idf is GLOBAL (shared across every workstream's profile);
+-- prototype_keyword_profile is the per-(workstream, concept) weight +
+-- display keyword.
+CREATE TABLE IF NOT EXISTS prototype_keyword_idf (
+  concept_id TEXT PRIMARY KEY,
+  idf        REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS prototype_keyword_profile (
+  workstream_id    TEXT NOT NULL,
+  concept_id       TEXT NOT NULL,
+  weight           REAL NOT NULL,
+  display_keyword  TEXT NOT NULL,
+  PRIMARY KEY (workstream_id, concept_id)
+);
+CREATE INDEX IF NOT EXISTS prototype_keyword_profile_workstream
+  ON prototype_keyword_profile(workstream_id);
+
 CREATE VIRTUAL TABLE IF NOT EXISTS docs_fts USING fts5(
   title, body, url_tokens, host,
   content='docs', content_rowid='rowid',
@@ -193,6 +215,25 @@ class SqliteRecallStore implements RecallStore {
     const driver = getSqliteDriver();
     this.db = driver.open(dbPath);
     this.db.exec(SCHEMA);
+    // Migration for `prototypes` rows created before prototype-lane v2
+    // (docs/plans/2026-08-16-category-flexibility-hyde.md §11): the raw
+    // SCHEMA's `CREATE TABLE IF NOT EXISTS` is a no-op against an
+    // already-present table, so `angle`/`source_member_url` are missing
+    // until this ALTER runs once — same guarded idiom sync/eventStore.ts
+    // uses for `resolver_url`. Empty-string default distinguishes
+    // "pre-v2 row, angle unknown" from a real v2 value (both `angle` and
+    // `sourceMemberUrl` are optional on the wire event too — see
+    // workstreams/events.ts's PrototypeGeneratedSnapshot).
+    const prototypesColumns = this.db.prepare("PRAGMA table_info('prototypes')").all() as {
+      readonly name: string;
+    }[];
+    const hasColumn = (name: string): boolean => prototypesColumns.some((c) => c.name === name);
+    if (!hasColumn('angle')) {
+      this.db.exec("ALTER TABLE prototypes ADD COLUMN angle TEXT NOT NULL DEFAULT ''");
+    }
+    if (!hasColumn('source_member_url')) {
+      this.db.exec("ALTER TABLE prototypes ADD COLUMN source_member_url TEXT NOT NULL DEFAULT ''");
+    }
     // sqlite-vec extension load. Requires the driver to report
     // `extensionsSupported`. For bun:sqlite that means setup-sqlite.ts
     // pointed Bun at a system libsqlite3 (Homebrew on macOS, distro
@@ -795,21 +836,29 @@ class SqliteRecallStore implements RecallStore {
       readonly method: 'generated' | 'selected';
       readonly generatedAt: number;
       readonly evidenceWatermark: string;
+      // v2 additive (docs/plans/2026-08-16-category-flexibility-hyde.md
+      // §11). Both optional — a caller that omits them (pre-v2 code path,
+      // or a test fixture) gets the same '' default the guarded migration
+      // backfills for pre-existing rows.
+      readonly angle?: 'medoid' | 'synthetic-sibling';
+      readonly sourceMemberUrl?: string;
     },
     vec: Float32Array,
   ): void {
     this.db
       .prepare(
         `INSERT INTO prototypes
-           (prototype_id, workstream_id, generated_text, generator_model_id, method, generated_at, evidence_watermark)
-         VALUES (?, ?, ?, ?, ?, ?, ?)
+           (prototype_id, workstream_id, generated_text, generator_model_id, method, generated_at, evidence_watermark, angle, source_member_url)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(prototype_id) DO UPDATE SET
            workstream_id=excluded.workstream_id,
            generated_text=excluded.generated_text,
            generator_model_id=excluded.generator_model_id,
            method=excluded.method,
            generated_at=excluded.generated_at,
-           evidence_watermark=excluded.evidence_watermark`,
+           evidence_watermark=excluded.evidence_watermark,
+           angle=excluded.angle,
+           source_member_url=excluded.source_member_url`,
       )
       .run(
         row.prototypeId,
@@ -819,6 +868,8 @@ class SqliteRecallStore implements RecallStore {
         row.method,
         row.generatedAt,
         row.evidenceWatermark,
+        row.angle ?? '',
+        row.sourceMemberUrl ?? '',
       );
     if (!this.vecAvailable) return;
     try {
@@ -858,12 +909,15 @@ class SqliteRecallStore implements RecallStore {
     readonly method: 'generated' | 'selected';
     readonly generatedAt: number;
     readonly evidenceWatermark: string;
+    readonly angle?: 'medoid' | 'synthetic-sibling';
+    readonly sourceMemberUrl?: string;
   }[] {
     const rows = this.db
       .prepare(
         `SELECT prototype_id AS prototypeId, generated_text AS generatedText,
                 generator_model_id AS generatorModelId, method AS method,
-                generated_at AS generatedAt, evidence_watermark AS evidenceWatermark
+                generated_at AS generatedAt, evidence_watermark AS evidenceWatermark,
+                angle AS angle, source_member_url AS sourceMemberUrl
          FROM prototypes WHERE workstream_id = ? ORDER BY generated_at DESC`,
       )
       .all(workstreamId) as {
@@ -873,10 +927,18 @@ class SqliteRecallStore implements RecallStore {
       method: string;
       generatedAt: number;
       evidenceWatermark: string;
+      angle: string;
+      sourceMemberUrl: string;
     }[];
     return rows.map((r) => ({
-      ...r,
+      prototypeId: r.prototypeId,
+      generatedText: r.generatedText,
+      generatorModelId: r.generatorModelId,
       method: r.method === 'selected' ? ('selected' as const) : ('generated' as const),
+      generatedAt: r.generatedAt,
+      evidenceWatermark: r.evidenceWatermark,
+      ...(r.angle === 'medoid' || r.angle === 'synthetic-sibling' ? { angle: r.angle } : {}),
+      ...(r.sourceMemberUrl.length > 0 ? { sourceMemberUrl: r.sourceMemberUrl } : {}),
     }));
   }
 
@@ -891,11 +953,17 @@ class SqliteRecallStore implements RecallStore {
 
   /** KNN over prototype_vec, joined back to its workstream. Pure vector
    *  match — no LLM call, no ranking beyond cosine distance (serve-time
-   *  contract, design doc §3). [] when vec is unavailable. */
+   *  contract, design doc §3). [] when vec is unavailable.
+   *
+   *  `angle` is returned so callers can bucket hits by SOURCE (medoid vs.
+   *  synthetic-sibling) — prototype lane v2's per-source blend/prequential
+   *  split (§11). '' (pre-v2 rows, or a caller that never set it) maps to
+   *  `undefined`, matching listPrototypesForWorkstream's same convention. */
   queryPrototypeVector(opts: { readonly vec: Float32Array; readonly limit: number }): readonly {
     readonly prototypeId: string;
     readonly workstreamId: string;
     readonly cosineDistance: number;
+    readonly angle?: 'medoid' | 'synthetic-sibling';
   }[] {
     if (!this.vecAvailable) return [];
     try {
@@ -903,7 +971,8 @@ class SqliteRecallStore implements RecallStore {
       const sql = `
         SELECT v.prototypeId AS prototypeId,
                p.workstream_id AS workstreamId,
-               v.distance AS cosineDistance
+               v.distance AS cosineDistance,
+               p.angle AS angle
         FROM (
           SELECT prototype_id AS prototypeId, distance
           FROM prototype_vec
@@ -917,12 +986,88 @@ class SqliteRecallStore implements RecallStore {
         prototypeId: string;
         workstreamId: string;
         cosineDistance: number;
+        angle: string;
       }[];
-      return rows;
+      return rows.map((r) => ({
+        prototypeId: r.prototypeId,
+        workstreamId: r.workstreamId,
+        cosineDistance: r.cosineDistance,
+        ...(r.angle === 'medoid' || r.angle === 'synthetic-sibling' ? { angle: r.angle } : {}),
+      }));
     } catch (err) {
       console.warn('[recall-v2] prototype vec query failed:', err);
       return [];
     }
+  }
+
+  // ---- prototype-lane v2 keyword-profile signal --------------------------
+  // See docs/plans/2026-08-16-category-flexibility-hyde.md §11. Populated
+  // offline (workstreams/prototypeGeneration.ts's tick), read cheaply at
+  // serve time (tabsession/prototypeLane.ts) — a full REPLACE each tick, not
+  // an incremental upsert, matching the small-vocabulary assumption
+  // keyword-concept-store.ts's own centroid table already makes.
+
+  replacePrototypeKeywordProfiles(
+    idf: ReadonlyMap<string, number>,
+    profiles: ReadonlyMap<
+      string,
+      { readonly weights: ReadonlyMap<string, number>; readonly displayKeyword: ReadonlyMap<string, string> }
+    >,
+  ): void {
+    this.db.exec('BEGIN');
+    try {
+      this.db.exec('DELETE FROM prototype_keyword_idf');
+      this.db.exec('DELETE FROM prototype_keyword_profile');
+      const insertIdf = this.db.prepare(
+        'INSERT INTO prototype_keyword_idf (concept_id, idf) VALUES (?, ?)',
+      );
+      for (const [conceptId, value] of idf) insertIdf.run(conceptId, value);
+      const insertProfile = this.db.prepare(
+        `INSERT INTO prototype_keyword_profile (workstream_id, concept_id, weight, display_keyword)
+         VALUES (?, ?, ?, ?)`,
+      );
+      for (const [workstreamId, profile] of profiles) {
+        for (const [conceptId, weight] of profile.weights) {
+          insertProfile.run(
+            workstreamId,
+            conceptId,
+            weight,
+            profile.displayKeyword.get(conceptId) ?? '',
+          );
+        }
+      }
+      this.db.exec('COMMIT');
+    } catch (err) {
+      this.db.exec('ROLLBACK');
+      console.warn('[recall-v2] prototype keyword profile replace failed:', err);
+    }
+  }
+
+  getPrototypeKeywordIdf(): ReadonlyMap<string, number> {
+    const rows = this.db.prepare('SELECT concept_id AS conceptId, idf FROM prototype_keyword_idf').all() as {
+      conceptId: string;
+      idf: number;
+    }[];
+    return new Map(rows.map((r) => [r.conceptId, r.idf]));
+  }
+
+  getPrototypeKeywordProfile(
+    workstreamId: string,
+  ): { readonly weights: ReadonlyMap<string, number>; readonly displayKeyword: ReadonlyMap<string, string> } | undefined {
+    const rows = this.db
+      .prepare(
+        `SELECT concept_id AS conceptId, weight, display_keyword AS displayKeyword
+         FROM prototype_keyword_profile WHERE workstream_id = ?`,
+      )
+      .all(workstreamId) as { conceptId: string; weight: number; displayKeyword: string }[];
+    if (rows.length === 0) return undefined;
+    const weights = new Map<string, number>();
+    const displayKeyword = new Map<string, string>();
+    for (const row of rows) {
+      weights.set(row.conceptId, row.weight);
+      if (row.displayKeyword.length > 0) displayKeyword.set(row.conceptId, row.displayKeyword);
+    }
+    return { weights, displayKeyword };
   }
 
   close(): void {

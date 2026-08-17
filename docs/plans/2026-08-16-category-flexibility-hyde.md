@@ -1461,3 +1461,345 @@ green (see PR for the exact count); the newly-touched suites
 resolver.test.ts`, `tabsession/laneFallback.test.ts`, `tabsession/
 laneCorroboration.test.ts`, `tabsession/declineMemory.test.ts`,
 `http/resolveSwrRoutes.test.ts`) reran green in isolation.
+
+## 11. Prototype lane v2 — selection anchors, generation expands (2026-08-17)
+
+**Why this landed.** Live day-one evidence from the shipped §3 lane: generated
+prototypes tied ~0.82 across *unrelated* workstreams on real pages. Three
+verified mechanisms produced it — (a) meta-register prompt angles
+(theme-description, behavioral-inference) render generic prose near every
+tech page, independent of what the workstream actually contains; (b)
+evidence noise leaked into terminology prototypes (a food page's
+"Xindongyang Pineapple Cake" landed in an ML workstream's terminology list —
+the single evidence item nearest a random prompt angle, not filtered for
+relevance to the OTHER members); (c) raw cosine has no notion of "confident
+relative to the alternatives" — a three-way near-tie renders as three
+confident 80%s, not one honest "I don't know." The research doc
+(`docs/research/2026-08-16-hyde-deep-research.md`) independently names the
+root cause of (a)/(b): ReDE-RF's core finding is that ordinary
+generation-based HyDE depends on the generator's *pretrained domain
+knowledge*, which a private, idiosyncratic workstream label structurally
+cannot supply — "a hypothetical document requires the generator to possess
+domain knowledge, whereas judging the relevance of retrieved real documents
+requires much less parametric domain knowledge" (line 100). The same doc's
+single most-replicated finding across the whole survey, though, is that
+generated and corpus-grounded evidence have *complementary*, not
+substitutable, strengths (line 649) — which is the framing this phase
+follows: **selection anchors, generation expands; per-source precision
+counters arbitrate the blend.** Not "generation demoted" — medoids anchor
+every workstream to real saved pages (never confidently wrong about what
+was actually filed), while generation is repositioned as the tier that
+covers what a medoid structurally cannot: future/unseen vocabulary for the
+same activity, most valuable exactly where a workstream is too sparse for
+medoids to have much real material to anchor on.
+
+**§1 — medoid prototypes, the generalized ReDE-RF path.**
+`workstreams/prototypeMedoids.ts` (pure math, no I/O): `identifyOutliers`
+computes each candidate member's cosine distance from the pool's own
+`meanNormalized` centroid (`suggestions/centroid.ts`, already shared with
+`keywordConcepts.ts`'s centroid folding) and excludes anything beyond the
+pool's own P90 distance — `OUTLIER_DISTANCE_PERCENTILE = 0.9`, the
+pineapple-cake guard, STRUCTURAL not domain-based, exactly as specified.
+Below `MIN_POOL_FOR_OUTLIER_DETECTION = 5` candidates nothing is excluded (a
+percentile over too few points is not a robust statistic). `selectMedoids`
+is greedy k-medoids / farthest-point diversification: the first pick is the
+member closest to the centroid (most "typical"), each subsequent pick
+maximizes its minimum cosine distance to every medoid already chosen — so a
+5th pick can never be a near-duplicate of the first four, generalizing the
+v1 zh-only fallback's plain "most recent excerpt" selection (which had no
+representativeness or diversity guarantee at all) to every workstream,
+English or not. `workstreams/prototypeGeneration.ts`'s
+`produceWorkstreamPrototypes` embeds the bounded candidate pool
+(`MEDOID_CANDIDATE_POOL_CAP = 40`, most-recent-first) ONCE via the injected
+`embed` dependency and reuses those vectors directly as the medoids'
+prototype vectors — no second embed pass, since a medoid's text IS a real
+member's excerpt verbatim. `prototypeCount()` (existing export, clamped 3-5)
+now specifically means K_medoid.
+
+**Deviation, stated plainly.** The brief asked to "reuse embeddings already
+in recall-v2 where present, embed missing ones ... bounded per cycle." This
+phase does NOT read cached embeddings back out of recall-v2's `docs_vec`
+sqlite-vec table — every existing caller in this codebase only ever reads a
+MATCH *distance* out of a vec0 virtual table, never a raw stored vector
+value back, so doing so here would be new, unverified surface area for a
+speculative optimization (and doc-vector coverage is only ~16% of pages per
+the keyword-clustering PR's own measurement, so most members would need a
+fresh embed anyway). Always (re-)embedding the bounded 40-member candidate
+pool is simpler, always correct, and still genuinely bounded per cycle
+(gated behind the SAME debounce as prototype generation, so this only fires
+on a workstream's dirty ticks, not every tick).
+
+**§2 — keyword-profile signal.** `workstreams/prototypeKeywordProfile.ts`
+(pure): `buildWorkstreamConceptProfiles` computes idf over the WORKSTREAM
+corpus — `df(concept)` = number of *workstreams* containing it (not pages) —
+smoothed `idf = ln((N+1)/(df+1))`, so a concept present in every workstream
+gets `idf === 0` EXACTLY (`ln(1) = 0`), contributing precisely zero to every
+profile weight and every page score, not merely a small number.
+`scorePageAgainstProfile` is a weighted-overlap fraction bounded [0,1]:
+`sum(idf(c) for c in page∩profile) / sum(idf(c) for c in page)`.
+`keywordMatchWhy` renders the self-explaining string
+(`"matches duckdb, olap from this workstream's pages"`) from each
+workstream's own most-frequent raw keyword per concept (`displayKeyword`,
+built as a byproduct of profile construction — no new store read).
+`blendVectorAndKeywordScore` is the SAME env-weighted idiom as
+`splitSuggestionEngine.ts`'s `resolveKeywordClusterWeight`
+(`SIDETRACK_PROTOTYPE_KEYWORD_WEIGHT`, default 0.3, range-validated,
+garbage/absent falls back silently) — a DIFFERENT, independently-tunable
+knob from `SIDETRACK_KEYWORD_CLUSTER_WEIGHT` on purpose: that one blends
+PAIRWISE page-to-page distance for clustering, this one blends one page
+against an AGGREGATED workstream profile for lane scoring.
+
+**Offline population, joining the keyword-concept layer.**
+`workstreams/prototypeKeywordProfileBuild.ts`'s
+`buildKeywordProfilesForWorkstreams` joins each workstream's evidence
+members against `enrichment/keywordIndexStore.ts` (page → raw keywords) and
+`enrichment/keywordConceptStore.ts` (keyword → concept id) — both already
+shipped, stable modules from the merged `feat/gist-keywords-clustering` PR,
+confirmed by diff to be untouched by the concurrent `fix/wire-keyword-lanes`
+branch, so reading from them here carries no merge-conflict risk. A page the
+keyword layer has not indexed yet, or a keyword with no concept assignment
+yet, contributes nothing for that member — never throws, never blocks.
+Wired into `runPrototypeGenerationTick` as an OPTIONAL `keywordLookup` dep
+(absent ⇒ the keyword blend degrades to pure vector scoring everywhere,
+same "vectors only" fallback contract `hybridSimilarity` documents);
+`schedulePrototypeGenerationLoop`'s production `runTick` opens short-lived
+`keywordIndexStore`/`keywordConceptStore` handles via dynamic `import()`
+(same pattern already used for `recall-v2/pipeline.js`/`recall/embedder.js`)
+— **zero changes to `runtime/companion.ts`**, which never needed touching
+because that scheduler already assembles all of its own deps internally.
+Persisted via two new additive tables in `recall-v2/store/sqlite.ts`
+(in-scope: "recall-v2 prototype tables") — `prototype_keyword_idf` and
+`prototype_keyword_profile` — full-REPLACE each tick (small vocabulary,
+same scale assumption `keywordConceptStore.ts`'s own centroid table makes),
+not an incremental upsert.
+
+**§3 — contrast-margin scoring.** `workstreams/prototypeContrastMargin.ts`
+(pure): `applyContrastMargin` ranks candidates by margin over the page's own
+cross-workstream MEAN score (the candidate pool's own noise floor, including
+the top score in that mean — a deliberately conservative denominator).
+Below `CONTRAST_MARGIN_MIN = 0.05`, the lane returns `candidates: []` with a
+`contrastMarginEmptyReason` string that still carries the raw top/mean/margin
+numbers for transparency, even though nothing is disclosed as confident. A
+solitary candidate (nothing to contrast against) always passes — margin
+reported as `Infinity`. **The day-one bug, reproduced and fixed**:
+`prototypeContrastMargin.test.ts`'s "day-one bug, reproduced" case feeds
+`{ws-a: 0.82, ws-b: 0.81, ws-c: 0.80}` through `applyContrastMargin` and
+asserts `kept: []` — the exact shape of the live-verified symptom, now an
+honest empty instead of three confident-looking guesses.
+
+**§4 — generation as the measured expansion tier.** ONE prompt angle
+survives (`SYNTHETIC_SIBLING_PROMPT`, `prototypeGeneration.ts`), rewritten
+for its actual edge per the follow-up directive: EXCERPT REGISTER (must read
+like a real page's own gist+title — "NOT a description of the collection as
+a whole") and explicit VOCABULARY WIDENING ("use related terminology and
+phrasings that do NOT already appear in the excerpts... the goal is a
+plausible NEW page in different words, not a restatement of the ones
+shown"). The four meta-register angles from v1 (theme-description,
+terminology-listing, task-inference, distinctive-detail) are gone — those
+were the day-one failure mode's own source. **Sparse-workstream boost**:
+`prototypeGenerationCountFor(memberCount)` returns
+`PROTOTYPE_GENERATION_COUNT_SPARSE = 3` below
+`SIDETRACK_PROTOTYPE_GENERATION_BOOST_BELOW` (default 8 members),
+`PROTOTYPE_GENERATION_COUNT_MATURE = 1` at/above it — interpolation value is
+highest exactly where medoids have the least real material to anchor on.
+**Non-fatal generation, a real behavior change from v1**: Apple FM being
+unavailable, evidence being non-English, or every generation call failing no
+longer blocks the WHOLE regeneration (v1's `'engine-unavailable'` outcome
+left the prior standing prototypes untouched, refusing to update anything).
+v2's medoid tier ALWAYS refreshes when a workstream is dirty regardless of
+generation-tier availability — `WorkstreamGenerationResult.generationSkippedReason`
+carries the reason as a non-fatal, purely observational field. Every
+prototype row is tagged `angle: 'medoid' | 'synthetic-sibling'` (additive
+column, `recall-v2/store/sqlite.ts`'s guarded `ALTER TABLE ADD COLUMN`
+idiom — same pattern `sync/eventStore.ts` uses for `resolver_url`) plus, for
+medoids, `sourceMemberUrl` (the exact member the text was drawn from) — both
+additive, optional fields on `PrototypeGeneratedSnapshot`
+(`workstreams/events.ts`), so every pre-v2 event still validates unchanged.
+
+**Per-source prequential counters — measured, not judged.**
+`tabsession/lanePrequential.ts` gained ONE small additive export,
+`recordRawLanePredictions`, which reuses the existing
+append/rotate/`LanePredictionRecord` machinery directly — the read side
+(`scoreLanePredictions`) was ALREADY generic over the lane-id string (never
+constrained to the `GuessLane` wire-contract union), so `'prototype:medoid'`
+/ `'prototype:generated'` / `'prototype:keyword'` composite ids are scored
+by the exact same code path as every disclosed lane with ZERO changes to
+that file's scoring logic. `tabsession/prototypeLane.ts`'s
+`buildPrototypeLane` computes, per candidate workstream, the best
+medoid-tagged hit, the best generated-tagged hit, and the keyword-profile
+score independently, and records each source's argmax winner as its own
+prediction — this fires for EVERY resolved page with any signal, regardless
+of whether the BLENDED score cleared the contrast-margin gate, because the
+whole point is measuring whether each source alone would have been right
+even on pages the blend called too close.
+
+**Revision (2026-08-17): live-wired, not deferred.** The first version of
+this landing note deferred `http/server.ts`'s call site as "ready-to-splice"
+— reasoned as a coordination-risk avoidance, mirroring this doc's own §8/§10
+precedent for a file another branch was actively editing. That reasoning did
+not hold up under review: unwired-but-fully-tested machinery has a live
+track record in this exact program of shipping dead (the keyword backfill
+lane, the suggestion-recompute lane, and the membership-chips surface all
+landed fully tested and then sat unreachable in production until a
+follow-up PR noticed and wired them — three separate incidents, not one).
+`server.ts` was also never actually on the flagged concurrent-branch file
+list (`companion.ts`/`visitsRoutes.ts`/`splitSuggestionEngine.ts`/
+`keywordBackfillLane.ts`/panel — server.ts is none of these), so the
+deferral was avoiding a risk that did not exist. Wired for real, same PR:
+
+- `finalizeBatchResolveResults` (`server.ts`) and its helper
+  `prototypeLaneDepsFromContent` both gained a `vaultRoot: string` parameter
+  (both of `finalizeBatchResolveResults`'s call sites already had
+  `requireVaultRoot(context)` in scope for other reasons — a one-line
+  addition at each). Inside the per-URL loop, `appendPrototypeLane`'s input
+  now carries the real `canonicalUrl`, and `pageConceptIds` is resolved via
+  a new cached-only peek, `peekPrototypeKeywordConceptIds(vaultRoot,
+  canonicalUrl)`.
+- **New**: `workstreams/prototypeKeywordLaneLookup.ts` — a request-time
+  keyword-concept lookup cache mirroring `recall-v2/pipeline.ts`'s
+  `peekRecallV2Store`/`warmRecallV2Store` pattern EXACTLY (module-level
+  cache keyed by vaultRoot, `warmPrototypeKeywordLayer` opens
+  fire-and-forget, `peekPrototypeKeywordConceptIds` never opens a fresh
+  handle on the request path — a cold-start resolve degrades to
+  `pageConceptIds: undefined`, pure vector scoring, until the layer warms
+  and the next resolve finds it, the identical "next one finds the handle"
+  contract every other lane-side store cache in this codebase already
+  uses). `prototypeLaneDepsFromContent` calls `warmPrototypeKeywordLayer`
+  on every invocation (idempotent no-op once warm), the same warm-on-miss
+  idiom `buildContentLaneDeps` already uses for the recall-v2 store.
+  (A near-identical per-request keyword-store-caching precedent already
+  existed in `http/routes/workstreamSuggestionsRoutes.ts`'s `ensureHandles`
+  — confirmed independently during review — so this is not a novel pattern
+  for this codebase, just a second instance of an established one.)
+- The recall-v2 STORE HANDLE itself needed no server.ts change —
+  `PrototypeLaneStore`'s interface gained the keyword-profile read methods
+  as OPTIONAL members, and the SAME concrete `SqliteRecallStore` instance
+  `contentDeps.store` already casts to `PrototypeLaneStore` satisfies the
+  wider shape automatically.
+
+**Proof, not just unit tests on the modules.** New
+`http/prototypeLaneWiring.test.ts` — a route-level integration test using
+the same real in-process `createCompanionHttpServer`/`startHttpServer`
+harness `batchResolveShape.characterization.test.ts` established for the
+sqlite-store resolve path. It seeds the keyword-index/concept stores and a
+medoid prototype + keyword profile directly into the vault (through the
+SAME module-level singleton caches — `recall-v2/pipeline.ts`'s
+`storeCache`, `prototypeKeywordLaneLookup.ts`'s `cache` — the production
+route reads, not a mocked store injected into the route's own dependency
+graph), fires a real `POST /v1/visits/batch-resolve`, and asserts on:
+(1) the served `prototype` lane candidate's `why` string names the matched
+concept (`"...matches duckdb from this workstream's pages"`) — provable
+only if `pageConceptIds` reached `buildPrototypeLane` through a REAL
+`peekPrototypeKeywordConceptIds` call inside the route handler; (2) a
+`prototype:medoid` AND a `prototype:keyword` prediction land in the real
+`lane-prequential.jsonl` on disk, keyed to the real canonical URL — provable
+only if the route threaded the real `canonicalUrl`/`vaultRoot` into
+`appendPrototypeLane`'s deps. Uses the deterministic test embedder
+(`SIDETRACK_TEST_EMBEDDER=1`, `recall/embedder.ts`) so the seeded prototype
+vector and the live query embed are guaranteed bit-identical (cosine
+similarity exactly 1.0) with no ONNX load and no fragile "close enough"
+tuning. One environment-specific catch, worth naming for future test
+authors: `bun:sqlite`'s `setCustomSQLite` (the call that makes sqlite-vec
+available at all — `recall-v2/store/setup-sqlite.ts`) can only run once per
+process and must be triggered by an early import; a standalone run of this
+file without that import reports "vector backend unavailable" even with
+correct data seeded (harmless in a full suite run, where an earlier test
+file happens to trigger it first) — fixed by importing
+`setup-sqlite.ts`'s `installCustomSqlite` at the top of the new test file,
+the same precedent two existing recall-v2 store tests already use.
+
+**§5 — regeneration, no manual migration.**
+`PROTOTYPE_EMBEDDING_SCHEMA_VERSION` bumped 1→2. `WorkstreamGenerationState`
+gained a required `embeddingSchemaVersion` field (every real historical
+event already carries this — v1 wrote it, hardcoded to 1, but
+`decideDirty` never read it back, a gap the Explore research for this phase
+surfaced explicitly). `decideDirty` now checks the version BEFORE the
+watermark-unchanged short-circuit — a version mismatch fires
+`{dirty: true, reason: 'version-bumped'}` even for byte-identical evidence,
+so the existing debounced tick loop naturally regenerates every workstream
+exactly once on its next tick after this PR deploys, with no manual
+migration and no full-pass sweep, exactly as specified.
+
+**Tests** (all new/rewritten, `bun test`):
+`prototypeMedoids.test.ts` (11) — determinism (repeated calls over an
+unchanged pool agree exactly) + outlier exclusion (a planted
+near-orthogonal "pineapple cake" vector excluded from a tight cluster,
+tight-cluster members never swept up as collateral) + diversification (a
+3-medoid pick is never 3 near-duplicates of the centroid).
+`prototypeKeywordProfile.test.ts` (12) + `prototypeKeywordProfileBuild.test.ts`
+(4) — idf down-weighting (a concept in every workstream scores `idf===0`,
+contributing exactly zero even under heavy raw overlap) + the keyword-index/
+concept-store join (undefined/unassigned degrade gracefully, never throw).
+`prototypeContrastMargin.test.ts` (7) — the day-one tie case now asserts
+`kept: []`; a clear winner (large spread) is kept, sorted, with its margin;
+a solitary candidate always passes.
+`prototypeGeneration.test.ts` (26, rewritten) — medoid tier always produces
+output even when Apple FM is down/zh-dominant/every generation call fails;
+sparse-vs-mature K_gen boost; angle/`sourceMemberUrl` provenance persisted
+on both the store rows AND the durable event log; a version-bump-alone
+(byte-identical evidence) triggers exactly one regeneration.
+`prototypeLane.test.ts` (23, rewritten) — angle-bucketed vector aggregation;
+keyword blend FLIPPING the ranking versus pure-vector order (not just
+decorating an already-decided winner); the reproduced day-one tie asserting
+`emptyReason` contains "no clearly closer workstream"; per-source
+predictions recorded to the real `lanePrequential.jsonl` file and read back
+byte-for-byte, including a workstream that wins the KEYWORD sub-prediction
+with ZERO vector hits at all (proving the three sources are measured
+independently); the existing golden-case-5 regression (prototype lane still
+structurally unable to decide) is untouched — it constructs its
+`GuessLaneResult` fixture directly, never calling `buildPrototypeLane`, so
+this phase's changes cannot affect it.
+
+**Files changed.** NEW —
+`workstreams/prototypeMedoids.ts`+`.test.ts`,
+`workstreams/prototypeKeywordProfile.ts`+`.test.ts`,
+`workstreams/prototypeKeywordProfileBuild.ts`+`.test.ts`,
+`workstreams/prototypeContrastMargin.ts`+`.test.ts`,
+`workstreams/prototypeKeywordLaneLookup.ts`+`.test.ts` (the live request-time
+keyword-lookup cache), `http/prototypeLaneWiring.test.ts` (the route-level
+integration proof). MODIFIED —
+`workstreams/events.ts` (additive `angle`/`sourceMemberUrl` fields),
+`workstreams/prototypeGeneration.ts` (medoid tier, expansion-tier rewrite,
+version-bump dirty-marking, keyword-profile tick wiring),
+`workstreams/prototypeGeneration.test.ts` (rewritten for the new
+production API), `workstreams/prototypeStatus.test.ts` (fixture gained
+`embeddingSchemaVersion`), `recall-v2/store/sqlite.ts` (`angle`/
+`source_member_url` guarded columns on `prototypes`; two new
+`prototype_keyword_*` tables + their read/replace methods),
+`tabsession/lanePrequential.ts` (additive `recordRawLanePredictions`),
+`tabsession/prototypeLane.ts` (angle-bucketed aggregation, keyword blend,
+contrast-margin gate, per-source recording, richer why-strings),
+`tabsession/prototypeLane.test.ts` (rewritten + extended), `http/server.ts`
+(`finalizeBatchResolveResults`/`prototypeLaneDepsFromContent` gained
+`vaultRoot`; the `appendPrototypeLane` call site now passes real
+`canonicalUrl`/`pageConceptIds` — see the live-wiring revision above). NOT
+touched, as scoped: `companion.ts`, `visitsRoutes.ts`,
+`splitSuggestionEngine.ts`, `keywordBackfillLane.ts`, any panel/extension
+file.
+
+Full `bun test` (post-wiring, final run): **3631 pass / 8 skip / 0 fail**
+across 3639 tests, 401 files (175s) — 5 more passing tests and 2 more files
+than the pre-wiring run (3626/399), exactly matching the 5 new tests /
+2 new files this wiring phase added
+(`prototypeKeywordLaneLookup.test.ts` ×4, `http/prototypeLaneWiring.test.ts`
+×1). `npm run build` (`tsc -p tsconfig.build.json`) clean throughout,
+including after the wiring change. One transient log line worth naming so a
+future reader does not mistake it for a real failure: the connections
+materializer suite logs `[connections] drain failed: disk full` /
+`catchUp failed: disk full` mid-run — a DELIBERATE fault-injection case in
+that suite (unrelated to this phase), not an actual disk-space exhaustion;
+confirmed via `df -h` showing 8.4GB stably free throughout the run, and the
+final tally is 0 fail. Bun itself (v1.3.14) panics with a C++ exception on
+process EXIT after the test summary already printed "0 fail" — the SAME
+pre-existing engine-level crash this doc's own §8 landing note documented
+("this indicates a bug in Bun, not your code"), not a test failure and not
+caused by this phase. This phase's own new/changed suites (`prototypeMedoids.test.ts`,
+`prototypeKeywordProfile.test.ts`, `prototypeKeywordProfileBuild.test.ts`,
+`prototypeContrastMargin.test.ts`, `prototypeGeneration.test.ts`,
+`prototypeLane.test.ts`, `prototypeStatus.test.ts`,
+`prototypeKeywordLaneLookup.test.ts`, `http/prototypeLaneWiring.test.ts` —
+98 tests total) were run repeatedly in isolation, clean every time, no
+flakes observed — including the new route-level integration test, which
+depends on real sqlite-vec + a real in-process HTTP server and was run
+several times back-to-back specifically to rule out timing flakiness before
+landing.

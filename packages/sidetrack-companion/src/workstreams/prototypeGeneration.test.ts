@@ -5,7 +5,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'bun:test';
 
 import { createEventLog, type EventLog } from '../sync/eventLog.js';
 import { loadOrCreateReplica } from '../sync/replicaId.js';
-import { WORKSTREAM_PROTOTYPE_GENERATED } from './events.js';
+import { WORKSTREAM_PROTOTYPE_GENERATED, isPrototypeGeneratedSnapshot } from './events.js';
 import type { WorkstreamEvidenceItem } from './prototypeEvidence.js';
 import {
   computeEvidenceWatermark,
@@ -15,16 +15,20 @@ import {
   MAX_STALE_MS,
   MIN_EVIDENCE_FOR_GENERATION,
   MIN_NEW_EVIDENCE_SINCE_LAST,
-  producePrototypeTexts,
+  produceWorkstreamPrototypes,
+  prototypeGenerationCountFor,
+  PROTOTYPE_EMBEDDING_SCHEMA_VERSION,
+  PROTOTYPE_GENERATION_COUNT_MATURE,
+  PROTOTYPE_GENERATION_COUNT_SPARSE,
   type AppleFmClient,
   type EmbedFn,
   type PrototypeStore,
   type WorkstreamGenerationState,
 } from './prototypeGeneration.js';
 
-// PROTOTYPE GENERATION — unit tests with a FAKE engine ONLY. The real Apple
-// FM engine (appleFmEngine.ts) is never called from this file — every test
-// injects a deterministic stub, matching appleFmEngine.test.ts's own
+// PROTOTYPE GENERATION v2 — unit tests with a FAKE engine ONLY. The real
+// Apple FM engine (appleFmEngine.ts) is never called from this file — every
+// test injects a deterministic stub, matching appleFmEngine.test.ts's own
 // hermeticity discipline (a test's result must never depend on whether
 // `apfel --serve` happens to be running on the machine executing it).
 
@@ -58,7 +62,25 @@ const CHINESE_ITEMS: readonly WorkstreamEvidenceItem[] = Array.from({ length: 5 
   item(`https://zh.test/${String(i)}`, { gist: CHINESE_GIST }),
 );
 
+// Identical embeddings for every text — keeps medoid selection deterministic
+// in these orchestration tests (the medoid ALGORITHM itself, incl. outlier
+// exclusion, is covered exhaustively by prototypeMedoids.test.ts against a
+// non-degenerate embedding space; this file is about the ORCHESTRATION
+// around it — dirty-marking, engine wiring, event/store writes).
+const fakeEmbed: EmbedFn = async (texts) => texts.map(() => new Float32Array(4).fill(1));
+
 // ---- decideDirty --------------------------------------------------------
+
+const genState = (over: Partial<WorkstreamGenerationState> = {}): WorkstreamGenerationState => ({
+  workstreamId: 'ws-1',
+  evidenceWatermark: '5:abc',
+  generatedAt: 1000,
+  generatorModelId: 'apple-fm#reason=ok',
+  method: 'generated',
+  prototypeIds: ['p1'],
+  embeddingSchemaVersion: PROTOTYPE_EMBEDDING_SCHEMA_VERSION,
+  ...over,
+});
 
 describe('decideDirty — pure dirty-marking, no full-pass sweeps', () => {
   it('below the cold-start floor: never dirty regardless of watermark/last state', () => {
@@ -71,58 +93,42 @@ describe('decideDirty — pure dirty-marking, no full-pass sweeps', () => {
     expect(decision).toEqual({ dirty: true, reason: 'first-generation' });
   });
 
-  it('unchanged evidence (same watermark) is never dirty — no full re-generation on a no-op tick', () => {
-    const last: WorkstreamGenerationState = {
-      workstreamId: 'ws-1',
-      evidenceWatermark: '5:abc',
-      generatedAt: 1000,
-      generatorModelId: 'apple-fm#reason=ok',
-      method: 'generated',
-      prototypeIds: ['p1'],
-    };
+  it('unchanged evidence (same watermark, same version) is never dirty — no full re-generation on a no-op tick', () => {
+    const last = genState({ evidenceWatermark: '5:abc' });
     const decision = decideDirty(5, '5:abc', last, 1000);
     expect(decision).toEqual({ dirty: false, reason: 'unchanged' });
   });
 
   it(`fires once evidence grows by >= ${String(MIN_NEW_EVIDENCE_SINCE_LAST)} since the last generation`, () => {
-    const last: WorkstreamGenerationState = {
-      workstreamId: 'ws-1',
-      evidenceWatermark: '5:abc',
-      generatedAt: 1000,
-      generatorModelId: 'apple-fm#reason=ok',
-      method: 'generated',
-      prototypeIds: ['p1'],
-    };
+    const last = genState({ evidenceWatermark: '5:abc' });
     const grown = 5 + MIN_NEW_EVIDENCE_SINCE_LAST;
     const decision = decideDirty(grown, `${String(grown)}:def`, last, 1000);
     expect(decision).toEqual({ dirty: true, reason: 'evidence-grew' });
   });
 
   it('debounces a small evidence change under the growth threshold and under the staleness ceiling', () => {
-    const last: WorkstreamGenerationState = {
-      workstreamId: 'ws-1',
-      evidenceWatermark: '5:abc',
-      generatedAt: 1_000_000,
-      generatorModelId: 'apple-fm#reason=ok',
-      method: 'generated',
-      prototypeIds: ['p1'],
-    };
+    const last = genState({ evidenceWatermark: '5:abc', generatedAt: 1_000_000 });
     const grown = 5 + MIN_NEW_EVIDENCE_SINCE_LAST - 1; // one short of the growth trigger
     const decision = decideDirty(grown, `${String(grown)}:def`, last, last.generatedAt + 1000);
     expect(decision).toEqual({ dirty: false, reason: 'debounced' });
   });
 
   it(`fires after ${String(MAX_STALE_MS / (24 * 60 * 60 * 1000))} days even with no evidence growth`, () => {
-    const last: WorkstreamGenerationState = {
-      workstreamId: 'ws-1',
-      evidenceWatermark: '5:abc',
-      generatedAt: 1_000_000,
-      generatorModelId: 'apple-fm#reason=ok',
-      method: 'generated',
-      prototypeIds: ['p1'],
-    };
+    const last = genState({ evidenceWatermark: '5:abc', generatedAt: 1_000_000 });
     const decision = decideDirty(5, '5:xyz', last, last.generatedAt + MAX_STALE_MS);
     expect(decision).toEqual({ dirty: true, reason: 'stale' });
+  });
+
+  it('a scoring-version mismatch fires regardless of an otherwise-unchanged watermark (the v1->v2 migration trigger)', () => {
+    const last = genState({ evidenceWatermark: '5:abc', embeddingSchemaVersion: 1 });
+    const decision = decideDirty(5, '5:abc', last, 1000, 2);
+    expect(decision).toEqual({ dirty: true, reason: 'version-bumped' });
+  });
+
+  it('a version mismatch below the evidence floor still reports below-floor — nothing to regenerate from', () => {
+    const last = genState({ embeddingSchemaVersion: 1 });
+    const decision = decideDirty(MIN_EVIDENCE_FOR_GENERATION - 1, 'w1', last, 1000, 2);
+    expect(decision).toEqual({ dirty: false, reason: 'below-floor' });
   });
 });
 
@@ -147,7 +153,20 @@ describe('computeEvidenceWatermark', () => {
   });
 });
 
-// ---- producePrototypeTexts (the language gate) --------------------------
+// ---- prototypeGenerationCountFor (sparse-workstream boost) ---------------
+
+describe('prototypeGenerationCountFor — sparse-workstream generation boost', () => {
+  it('boosts K_gen for a sparse workstream (below the boost-below threshold)', () => {
+    expect(prototypeGenerationCountFor(3)).toBe(PROTOTYPE_GENERATION_COUNT_SPARSE);
+  });
+
+  it('drops to K_gen=1 for a mature workstream (at/above the threshold)', () => {
+    expect(prototypeGenerationCountFor(8)).toBe(PROTOTYPE_GENERATION_COUNT_MATURE);
+    expect(prototypeGenerationCountFor(100)).toBe(PROTOTYPE_GENERATION_COUNT_MATURE);
+  });
+});
+
+// ---- produceWorkstreamPrototypes (medoid tier always-on, generation as expansion) --
 
 const fakeClient = (
   available: boolean,
@@ -174,44 +193,52 @@ const fakeClient = (
     },
     generate: async () => {
       counts.generateCalls += 1;
-      return generateImpl ? generateImpl() : 'a generated example about this collection';
+      return generateImpl ? generateImpl() : 'a plausible new excerpt using different wording';
     },
   };
 };
 
-describe('producePrototypeTexts — Apple FM for English, ReDE-RF selection otherwise', () => {
-  it('generates m texts on Apple FM for english-dominant evidence', async () => {
+describe('produceWorkstreamPrototypes — medoid tier (always-on) + generation tier (expansion)', () => {
+  it('produces K_medoid medoids PLUS the boosted K_gen generated siblings for a sparse english workstream', async () => {
     const client = fakeClient(true);
-    const outcome = await producePrototypeTexts(ENGLISH_ITEMS, 4, client);
-    expect(outcome.kind).toBe('texts');
-    if (outcome.kind !== 'texts') throw new Error('unreachable');
-    expect(outcome.texts).toHaveLength(4);
-    expect(outcome.texts.every((t) => t.method === 'generated')).toBe(true);
-    expect(outcome.generatorModelId.startsWith('apple-fm')).toBe(true);
+    const outcome = await produceWorkstreamPrototypes(ENGLISH_ITEMS, 4, { embed: fakeEmbed, client });
+    expect(outcome.kind).toBe('produced');
+    if (outcome.kind !== 'produced') throw new Error('unreachable');
+    const medoids = outcome.prototypes.filter((p) => p.angle === 'medoid');
+    const generated = outcome.prototypes.filter((p) => p.angle === 'synthetic-sibling');
+    expect(medoids).toHaveLength(4);
+    expect(medoids.every((p) => p.method === 'selected')).toBe(true);
+    expect(medoids.every((p) => p.sourceMemberUrl !== undefined)).toBe(true);
+    // ENGLISH_ITEMS.length (5) < the default boost-below threshold (8).
+    expect(generated).toHaveLength(PROTOTYPE_GENERATION_COUNT_SPARSE);
+    expect(generated.every((p) => p.method === 'generated')).toBe(true);
+    expect(outcome.generationSkippedReason).toBeNull();
     expect(client.statusCalls).toBe(1);
-    expect(client.generateCalls).toBe(4);
+    expect(client.generateCalls).toBe(PROTOTYPE_GENERATION_COUNT_SPARSE);
   });
 
   it(
-    'ZH-DOMINANT EVIDENCE SKIPS GENERATION ENTIRELY: the engine is never probed or called ' +
-      '(design doc §3 hazard — a broken/English-leaking zh prototype must never be produced)',
+    'ZH-DOMINANT EVIDENCE: the medoid tier still runs (real excerpts), generation is never probed ' +
+      '(design doc §3 hazard — a broken/English-leaking generated prototype must never be produced)',
     async () => {
       const client = fakeClient(true, () => {
         throw new Error('generate() must never be called for zh-dominant evidence');
       });
-      const outcome = await producePrototypeTexts(CHINESE_ITEMS, 4, client);
-      expect(outcome.kind).toBe('texts');
-      if (outcome.kind !== 'texts') throw new Error('unreachable');
-      expect(outcome.texts.every((t) => t.method === 'selected')).toBe(true);
+      const outcome = await produceWorkstreamPrototypes(CHINESE_ITEMS, 4, { embed: fakeEmbed, client });
+      expect(outcome.kind).toBe('produced');
+      if (outcome.kind !== 'produced') throw new Error('unreachable');
+      expect(outcome.prototypes.length).toBeGreaterThan(0);
+      expect(outcome.prototypes.every((p) => p.angle === 'medoid')).toBe(true);
+      expect(outcome.prototypes.every((p) => p.method === 'selected')).toBe(true);
       // Every selected text IS a real evidence excerpt — never invented.
-      expect(outcome.texts.every((t) => t.text === CHINESE_GIST)).toBe(true);
-      expect(outcome.generatorModelId).toBe('evidence-selection#reason=zh');
+      expect(outcome.prototypes.every((p) => p.text === CHINESE_GIST)).toBe(true);
+      expect(outcome.generationSkippedReason).toContain('zh');
       expect(client.statusCalls).toBe(0); // never even probed
       expect(client.generateCalls).toBe(0);
     },
   );
 
-  it('mixed-en-zh evidence ALSO selects rather than generates (appleCanServe is english-only)', async () => {
+  it('mixed-en-zh evidence ALSO skips generation (appleCanServe is english-only) but still medoids', async () => {
     const mixed: readonly WorkstreamEvidenceItem[] = [
       item('https://mix.test/1', {
         gist: 'Notes on 深度学习模型 with English commentary mixed in.',
@@ -226,35 +253,65 @@ describe('producePrototypeTexts — Apple FM for English, ReDE-RF selection othe
     const client = fakeClient(true, () => {
       throw new Error('generate() must never be called for mixed-en-zh evidence');
     });
-    const outcome = await producePrototypeTexts(mixed, 3, client);
-    expect(outcome.kind).toBe('texts');
-    if (outcome.kind !== 'texts') throw new Error('unreachable');
-    expect(outcome.texts.every((t) => t.method === 'selected')).toBe(true);
+    const outcome = await produceWorkstreamPrototypes(mixed, 3, { embed: fakeEmbed, client });
+    expect(outcome.kind).toBe('produced');
+    if (outcome.kind !== 'produced') throw new Error('unreachable');
+    expect(outcome.prototypes.every((p) => p.angle === 'medoid')).toBe(true);
     expect(client.generateCalls).toBe(0);
   });
 
-  it('reports engine-unavailable (not an error) when Apple FM is not reachable', async () => {
+  it('Apple FM unavailable: medoids still land, generation degrades non-fatally', async () => {
     const client = fakeClient(false);
-    const outcome = await producePrototypeTexts(ENGLISH_ITEMS, 4, client);
-    expect(outcome.kind).toBe('engine-unavailable');
-    if (outcome.kind !== 'engine-unavailable') throw new Error('unreachable');
-    expect(outcome.reason.length).toBeGreaterThan(0);
+    const outcome = await produceWorkstreamPrototypes(ENGLISH_ITEMS, 4, { embed: fakeEmbed, client });
+    expect(outcome.kind).toBe('produced');
+    if (outcome.kind !== 'produced') throw new Error('unreachable');
+    expect(outcome.prototypes.length).toBeGreaterThan(0);
+    expect(outcome.prototypes.every((p) => p.angle === 'medoid')).toBe(true);
+    expect(outcome.generationSkippedReason).not.toBeNull();
   });
 
-  it('reports engine-unavailable when every generation call fails', async () => {
+  it('every generation call failing degrades non-fatally — medoids still land', async () => {
     const client = fakeClient(true, () => null);
-    const outcome = await producePrototypeTexts(ENGLISH_ITEMS, 3, client);
-    expect(outcome.kind).toBe('engine-unavailable');
+    const outcome = await produceWorkstreamPrototypes(ENGLISH_ITEMS, 3, { embed: fakeEmbed, client });
+    expect(outcome.kind).toBe('produced');
+    if (outcome.kind !== 'produced') throw new Error('unreachable');
+    expect(outcome.prototypes.every((p) => p.angle === 'medoid')).toBe(true);
+    expect(outcome.generationSkippedReason).toContain('every generation failed');
+  });
+
+  it('total embedder failure is the one fatal outcome — nothing can be produced without vectors', async () => {
+    const brokenEmbed: EmbedFn = async () => []; // wrong count
+    const outcome = await produceWorkstreamPrototypes(ENGLISH_ITEMS, 4, {
+      embed: brokenEmbed,
+      client: fakeClient(true),
+    });
+    expect(outcome.kind).toBe('embedder-unavailable');
   });
 });
 
 // ---- generatePrototypesForWorkstream (end-to-end, fake engine + store) --
 
 const fakePrototypeStore = (): PrototypeStore & {
-  readonly rows: Map<string, { readonly workstreamId: string; readonly generatedText: string }>;
+  readonly rows: Map<
+    string,
+    {
+      readonly workstreamId: string;
+      readonly generatedText: string;
+      readonly angle?: 'medoid' | 'synthetic-sibling';
+      readonly sourceMemberUrl?: string;
+    }
+  >;
   deleteCalls: number;
 } => {
-  const rows = new Map<string, { readonly workstreamId: string; readonly generatedText: string }>();
+  const rows = new Map<
+    string,
+    {
+      readonly workstreamId: string;
+      readonly generatedText: string;
+      readonly angle?: 'medoid' | 'synthetic-sibling';
+      readonly sourceMemberUrl?: string;
+    }
+  >();
   let deleteCalls = 0;
   return {
     get deleteCalls() {
@@ -269,6 +326,8 @@ const fakePrototypeStore = (): PrototypeStore & {
       rows.set(row.prototypeId, {
         workstreamId: row.workstreamId,
         generatedText: row.generatedText,
+        ...(row.angle === undefined ? {} : { angle: row.angle }),
+        ...(row.sourceMemberUrl === undefined ? {} : { sourceMemberUrl: row.sourceMemberUrl }),
       });
     },
     deletePrototypesForWorkstream(workstreamId) {
@@ -287,6 +346,8 @@ const fakePrototypeStore = (): PrototypeStore & {
           method: 'generated' as const,
           generatedAt: 0,
           evidenceWatermark: '',
+          ...(row.angle === undefined ? {} : { angle: row.angle }),
+          ...(row.sourceMemberUrl === undefined ? {} : { sourceMemberUrl: row.sourceMemberUrl }),
         }));
     },
     allPrototypeWorkstreamIds() {
@@ -297,8 +358,6 @@ const fakePrototypeStore = (): PrototypeStore & {
     },
   };
 };
-
-const fakeEmbed: EmbedFn = async (texts) => texts.map(() => new Float32Array(4).fill(1));
 
 describe('generatePrototypesForWorkstream — end-to-end with a fake engine + fake store', () => {
   let vaultRoot: string;
@@ -331,7 +390,7 @@ describe('generatePrototypesForWorkstream — end-to-end with a fake engine + fa
     expect(store.rows.size).toBe(0);
   });
 
-  it('first generation: appends one event per prototype and writes the store', async () => {
+  it('first generation: appends one event per prototype (medoid + generated), writes the store, angle/provenance persisted', async () => {
     const store = fakePrototypeStore();
     const client = fakeClient(true);
     const result = await generatePrototypesForWorkstream(
@@ -339,14 +398,42 @@ describe('generatePrototypesForWorkstream — end-to-end with a fake engine + fa
       { eventLog, embed: fakeEmbed, store, client },
     );
     expect(result.outcome).toBe('regenerated');
-    expect(result.prototypeCount).toBe(4);
-    expect(store.rows.size).toBe(4);
+    expect(result.medoidCount).toBe(4);
+    expect(result.generatedCount).toBe(PROTOTYPE_GENERATION_COUNT_SPARSE);
+    expect(result.prototypeCount).toBe(4 + PROTOTYPE_GENERATION_COUNT_SPARSE);
+    expect(store.rows.size).toBe(4 + PROTOTYPE_GENERATION_COUNT_SPARSE);
     for (const row of store.rows.values()) expect(row.workstreamId).toBe('ws-kv-cache');
 
+    // Angle/source provenance persisted on the STORE rows.
+    const medoidRows = [...store.rows.values()].filter((r) => r.angle === 'medoid');
+    const generatedRows = [...store.rows.values()].filter((r) => r.angle === 'synthetic-sibling');
+    expect(medoidRows).toHaveLength(4);
+    expect(generatedRows).toHaveLength(PROTOTYPE_GENERATION_COUNT_SPARSE);
+    expect(medoidRows.every((r) => r.sourceMemberUrl !== undefined)).toBe(true);
+    expect(generatedRows.every((r) => r.sourceMemberUrl === undefined)).toBe(true);
+
+    // Angle/source provenance ALSO persisted on the durable EVENT log — the
+    // brief's "tag every prototype row with angle provenance" and "provenance
+    // (member url, evidence watermark)" requirements.
     const events = (await eventLog.readMerged()).filter(
       (e) => e.type === WORKSTREAM_PROTOTYPE_GENERATED,
     );
-    expect(events).toHaveLength(4);
+    expect(events).toHaveLength(4 + PROTOTYPE_GENERATION_COUNT_SPARSE);
+    for (const event of events) {
+      if (!isPrototypeGeneratedSnapshot(event.payload)) throw new Error('bad payload');
+      expect(event.payload.angle === 'medoid' || event.payload.angle === 'synthetic-sibling').toBe(
+        true,
+      );
+      expect(event.payload.embeddingSchemaVersion).toBe(PROTOTYPE_EMBEDDING_SCHEMA_VERSION);
+      if (event.payload.angle === 'medoid') {
+        expect(event.payload.sourceMemberUrl).toBeDefined();
+        expect(ENGLISH_ITEMS.some((i) => i.canonicalUrl === event.payload.sourceMemberUrl)).toBe(
+          true,
+        );
+      } else {
+        expect(event.payload.sourceMemberUrl).toBeUndefined();
+      }
+    }
   });
 
   it('unchanged evidence on the next tick: no regeneration, no duplicate writes', async () => {
@@ -366,9 +453,9 @@ describe('generatePrototypesForWorkstream — end-to-end with a fake engine + fa
     );
     expect(result.outcome).toBe('unchanged');
     // The engine was never touched a second time — the debounce short-
-    // circuits before producePrototypeTexts runs at all.
+    // circuits before produceWorkstreamPrototypes runs at all.
     expect(client.statusCalls).toBe(1);
-    expect(client.generateCalls).toBe(4);
+    expect(client.generateCalls).toBe(PROTOTYPE_GENERATION_COUNT_SPARSE);
     expect(store.deleteCalls).toBe(1); // only from the first (real) generation
   });
 
@@ -394,17 +481,16 @@ describe('generatePrototypesForWorkstream — end-to-end with a fake engine + fa
     expect(events).toHaveLength(0);
   });
 
-  it('engine unavailable: prior standing prototypes are left untouched', async () => {
+  it('engine unavailable: medoid tier STILL refreshes (selection anchors regardless of generation)', async () => {
     const store = fakePrototypeStore();
     await generatePrototypesForWorkstream(
       { workstreamId: 'ws-kv-cache', items: ENGLISH_ITEMS, last: undefined, nowMs: 1000, count: 4 },
       { eventLog, embed: fakeEmbed, store, client: fakeClient(true) },
     );
-    expect(store.rows.size).toBe(4);
+    expect(store.rows.size).toBe(4 + PROTOTYPE_GENERATION_COUNT_SPARSE);
 
     // Dirty via evidence growth (>= MIN_NEW_EVIDENCE_SINCE_LAST new items)
-    // but the engine is down this time — must not touch the ALREADY-
-    // standing prototypes above.
+    // but the engine is down this time.
     const grown = [
       ...ENGLISH_ITEMS,
       ...Array.from({ length: MIN_NEW_EVIDENCE_SINCE_LAST }, (_unused, i) =>
@@ -417,7 +503,47 @@ describe('generatePrototypesForWorkstream — end-to-end with a fake engine + fa
       { workstreamId: 'ws-kv-cache', items: grown, last, nowMs: 2000, count: 4 },
       { eventLog, embed: fakeEmbed, store, client: fakeClient(false) },
     );
-    expect(result.outcome).toBe('engine-unavailable');
-    expect(store.rows.size).toBe(4); // untouched, not deleted
+    // Medoids still refresh — v2's "selection anchors regardless of
+    // generation" behavior, a deliberate departure from v1 (where engine-
+    // down made the WHOLE regeneration a no-op).
+    expect(result.outcome).toBe('regenerated');
+    expect(result.medoidCount).toBe(4);
+    expect(result.generatedCount).toBe(0);
+    expect(result.generationSkippedReason).toBeDefined();
+    expect(store.rows.size).toBe(4); // replaced with the fresh medoid-only batch
+  });
+
+  it('a scoring-version bump alone (byte-identical evidence) triggers exactly one regeneration', async () => {
+    const store = fakePrototypeStore();
+    const client = fakeClient(true);
+    await generatePrototypesForWorkstream(
+      { workstreamId: 'ws-kv-cache', items: ENGLISH_ITEMS, last: undefined, nowMs: 1000, count: 4 },
+      { eventLog, embed: fakeEmbed, store, client },
+    );
+    const priorEvents = await eventLog.readMerged();
+    const real = foldLatestPrototypeGenerations(priorEvents).get('ws-kv-cache')!;
+    // Simulate a pre-v2 persisted state: same watermark, OLD version.
+    const legacyLast: WorkstreamGenerationState = { ...real, embeddingSchemaVersion: 1 };
+
+    const result = await generatePrototypesForWorkstream(
+      { workstreamId: 'ws-kv-cache', items: ENGLISH_ITEMS, last: legacyLast, nowMs: 2000, count: 4 },
+      { eventLog, embed: fakeEmbed, store, client },
+    );
+    expect(result.outcome).toBe('regenerated');
+    expect(store.deleteCalls).toBe(2); // first generation + the version-bump regen
+  });
+
+  it('a mature workstream (>= the boost-below threshold) gets K_gen=1, not the sparse boost', async () => {
+    const store = fakePrototypeStore();
+    const client = fakeClient(true);
+    const matureItems: readonly WorkstreamEvidenceItem[] = Array.from({ length: 10 }, (_unused, i) =>
+      item(`https://mature.test/${String(i)}`, { gist: `Evidence excerpt number ${String(i)}.` }),
+    );
+    const result = await generatePrototypesForWorkstream(
+      { workstreamId: 'ws-mature', items: matureItems, last: undefined, nowMs: 1000, count: 4 },
+      { eventLog, embed: fakeEmbed, store, client },
+    );
+    expect(result.outcome).toBe('regenerated');
+    expect(result.generatedCount).toBe(PROTOTYPE_GENERATION_COUNT_MATURE);
   });
 });

@@ -90,14 +90,41 @@ export interface PrototypeGeneratedSnapshot {
   readonly generatedAt: number;
   // 'generated' — an on-device engine wrote this text, conditioned on the
   // evidence excerpts in the prompt (never free invention).
-  // 'selected'  — the zh/non-en-dominant fallback: the text IS a real
-  // evidence excerpt (title/gist), embedded directly with no generation step
-  // (ReDE-RF pattern, design doc §3's zh hazard mitigation).
+  // 'selected'  — a REAL evidence excerpt (title/gist), embedded directly
+  // with no generation step (ReDE-RF pattern). v1 used this only for the
+  // zh/non-en-dominant fallback; v2 (§11) generalizes it to every
+  // workstream's medoid tier (see `angle`) — 'selected' now means "this text
+  // is verbatim member evidence", regardless of language.
   readonly method: 'generated' | 'selected';
   // Hash of the evidence corpus this batch was generated from — the join key
   // dirty-marking reads to decide "has this workstream's evidence changed
   // materially since the last batch". See prototypeGeneration.ts.
   readonly evidenceWatermark: string;
+  // ---- v2 additive fields (docs/plans/2026-08-16-category-flexibility-
+  // hyde.md §11 — prototype lane v2). Both OPTIONAL: absent on every v1 row,
+  // never required by the validator, so old events keep validating byte-
+  // identically. A reader that wants "how was this specific text produced"
+  // treats an absent `angle` as a pre-v2 row (method alone is all v1 ever
+  // recorded).
+  //
+  // 'medoid'            — method='selected'; one of the workstream's K
+  //                        greedy-k-medoid representative real member texts
+  //                        (prototypeMedoids.ts). The v2 default tier, ALWAYS
+  //                        attempted for every workstream (English or not) —
+  //                        the generalized ReDE-RF path.
+  // 'synthetic-sibling' — method='generated'; the ONLY generation angle v2
+  //                        keeps (register-matched, excerpt-style,
+  //                        vocabulary-widening — see prototypeGeneration.ts's
+  //                        SYNTHETIC_SIBLING_PROMPT). The expansion tier:
+  //                        interpolates/bridges vocabulary the saved medoids
+  //                        do not cover, boosted for sparse workstreams.
+  readonly angle?: 'medoid' | 'synthetic-sibling';
+  // The exact member canonicalUrl this text was drawn from — populated only
+  // for angle='medoid' rows (a generated row has no single source member;
+  // its provenance is the WHOLE evidence corpus, already covered by
+  // `sourceEvidenceIds`). Point-in-time provenance down to the individual
+  // page, per the brief's "provenance (member url, evidence watermark)".
+  readonly sourceMemberUrl?: string;
 }
 
 const isStringArray = (value: unknown, maxLength: number): value is readonly string[] =>
@@ -124,4 +151,7 @@ export const isPrototypeGeneratedSnapshot = (value: unknown): value is Prototype
   Number.isFinite(value['generatedAt']) &&
   (value['method'] === 'generated' || value['method'] === 'selected') &&
   typeof value['evidenceWatermark'] === 'string' &&
-  value['evidenceWatermark'].length > 0;
+  value['evidenceWatermark'].length > 0 &&
+  (value['angle'] === undefined || value['angle'] === 'medoid' || value['angle'] === 'synthetic-sibling') &&
+  (value['sourceMemberUrl'] === undefined ||
+    (typeof value['sourceMemberUrl'] === 'string' && value['sourceMemberUrl'].length > 0));

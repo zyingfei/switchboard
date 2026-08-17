@@ -1,21 +1,59 @@
-// Guess lane 9 — 'prototype': pure vector KNN against OFFLINE, per-workstream
-// generated prototype texts (docs/plans/2026-08-16-category-flexibility-hyde.md
-// §3). See workstreams/prototypeGeneration.ts for how the prototype texts are
-// produced (offline, on a background cadence, Apple FM or evidence
-// selection) — this module is ONLY the serve-time read side: embed the
-// incoming page's own title+gist once, KNN it against prototype_vec, group by
-// workstream, done. NO LLM call ever happens on this path — the design doc's
-// "serve-time = pure vector match" contract, verbatim.
+// Guess lane 9 — 'prototype': vector KNN + keyword-profile blend against
+// OFFLINE, per-workstream medoid/generated prototype texts
+// (docs/plans/2026-08-16-category-flexibility-hyde.md §3 + §11 "prototype
+// lane v2"). See workstreams/prototypeGeneration.ts for how the prototype
+// texts are produced (offline, on a background cadence: medoid selection —
+// the always-on default tier — plus, for English-dominant evidence with
+// Apple FM available, a small synthetic-sibling generation/expansion tier)
+// — this module is ONLY the serve-time read side: embed the incoming page's
+// own title+gist once, KNN it against prototype_vec, blend in the keyword-
+// profile signal, apply a contrast-margin honest-empty gate, group by
+// workstream, done. NO LLM call ever happens on this path — the design
+// doc's "serve-time = pure vector match" contract, verbatim.
+//
+// v2 CHANGES FROM v1 (§11):
+//   - Per-source (medoid | generated | keyword) sub-scores are tracked
+//     alongside the blended candidate score, and emitted as their OWN
+//     prequential predictions (tabsession/lanePrequential.ts's generic,
+//     GuessLane-independent raw-record writer) — the measurement that lets
+//     a future promotion decide the blend by measured precision, not
+//     judgment, per source AND per workstream population regime (sparse vs
+//     mature — see prototypeGeneration.ts's sparse-workstream boost).
+//   - CONTRAST-MARGIN GATE (prototypeContrastMargin.ts): the day-one bug —
+//     three unrelated workstreams tying at ~0.82 because generic prototype
+//     prose is close to every tech page — is fixed by ranking on MARGIN
+//     over the page's own cross-workstream mean score, not raw score alone.
+//     A near-tie is an honest empty ("no clearly closer workstream"), never
+//     three confident-looking guesses.
+//   - KEYWORD-PROFILE BLEND (prototypeKeywordProfile.ts): a discrete,
+//     self-explaining signal (idf-weighted concept overlap with the
+//     workstream's own keyword vocabulary) blended into the score,
+//     env-weighted the same idiom as SIDETRACK_KEYWORD_CLUSTER_WEIGHT.
 //
 // DISCLOSURE ONLY, exactly like lanes 7/8 (see contentLane.ts's header for
 // the shared idiom this mirrors: idempotent replace-by-lane-id, typed
-// emptiness, no I/O beyond one bounded embed + one KNN). laneCorroboration.ts
-// and laneFallback.ts both hardcode their lane set to ['content','ai'], so
-// this lane's opinion is structurally unable to influence a resolve decision
-// in this PR — see goldenResolveCases.test.ts's "prototype-disclosure-never-
-// decides" case for a frozen regression guard on exactly that property.
+// emptiness, no I/O beyond one bounded embed + one KNN + one cheap indexed
+// keyword-profile read). laneCorroboration.ts and laneFallback.ts both
+// hardcode their lane set to ['content','ai'], so this lane's opinion is
+// structurally unable to influence a resolve decision in this PR — see
+// goldenResolveCases.test.ts's "prototype-disclosure-never-decides" case for
+// a frozen regression guard on exactly that property.
 
 import type { GuessLaneCandidate, GuessLaneResult } from './guessLanes.js';
+import type { LanePredictionRecord } from './lanePrequential.js';
+import { recordRawLanePredictions } from './lanePrequential.js';
+import {
+  applyContrastMargin,
+  contrastMarginEmptyReason,
+  type ContrastCandidate,
+} from '../workstreams/prototypeContrastMargin.js';
+import {
+  blendVectorAndKeywordScore,
+  keywordMatchWhy,
+  resolvePrototypeKeywordWeight,
+  scorePageAgainstProfile,
+  type PrototypeKeywordProfile,
+} from '../workstreams/prototypeKeywordProfile.js';
 
 // ---- env flag ---------------------------------------------------------
 
@@ -57,7 +95,12 @@ export const prototypeLaneEnabled = (): boolean => {
 // server.ts appends this lane's result into `result.lanes`, the SAME
 // recordLanePredictions/stampLanePredictionOpportunities call sites that
 // already run for every lane start accruing 'prototype' precision — no
-// prototype-specific wiring needed.
+// prototype-specific wiring needed. v2 ADDITIONALLY records three
+// composite-id sub-predictions ('prototype:medoid' / 'prototype:generated'
+// / 'prototype:keyword') via lanePrequential.ts's recordRawLanePredictions
+// (generic over any string lane id, bypassing the GuessLane wire-contract
+// union entirely — see that function's own doc comment) — see
+// recordPerSourcePredictions below.
 //
 // Part (2) — an explicit precision/sample threshold, measured FRESH (design
 // doc: "not inherited from LANE_CORROBORATION_MIN_PRECISION/MIN_SAMPLES —
@@ -82,17 +125,23 @@ export const PROTOTYPE_LANE_MAX_ACTION = 'suggest' as const;
 
 // ---- injectable store dep ----------------------------------------------
 
-/** Structural subset of the recall-v2 sqlite store's prototype read path
- *  (see recall-v2/store/sqlite.ts's queryPrototypeVector). Mirrors
+/** Structural subset of the recall-v2 sqlite store's prototype + keyword-
+ *  profile read path (see recall-v2/store/sqlite.ts's queryPrototypeVector /
+ *  getPrototypeKeywordIdf / getPrototypeKeywordProfile). Mirrors
  *  ContentLaneStore's precedent: consumer declares the narrow shape it
- *  needs, production casts the concrete store to it. */
+ *  needs, production casts the concrete store to it. The keyword-profile
+ *  reads are OPTIONAL on the interface — a store/fixture that predates v2
+ *  still satisfies it, and the lane degrades to pure vector scoring. */
 export interface PrototypeLaneStore {
   readonly vectorBackendAvailable: boolean;
   queryPrototypeVector(opts: { readonly vec: Float32Array; readonly limit: number }): readonly {
     readonly prototypeId: string;
     readonly workstreamId: string;
     readonly cosineDistance: number;
+    readonly angle?: 'medoid' | 'synthetic-sibling';
   }[];
+  getPrototypeKeywordIdf?(): ReadonlyMap<string, number>;
+  getPrototypeKeywordProfile?(workstreamId: string): PrototypeKeywordProfile | undefined;
 }
 
 export type PrototypeLaneEmbed = (text: string) => Promise<Float32Array | undefined>;
@@ -118,19 +167,52 @@ const cosineSimilarityFromL2 = (l2Distance: number): number => {
   return sim < 0 ? 0 : sim > 1 ? 1 : sim;
 };
 
+// ---- per-workstream aggregation (v2: split by source) --------------------
+
+interface WorkstreamAggregate {
+  readonly workstreamId: string;
+  count: number;
+  vectorBest: number;
+  medoidBest: number;
+  generatedBest: number;
+}
+
+const newAggregate = (workstreamId: string): WorkstreamAggregate => ({
+  workstreamId,
+  count: 0,
+  vectorBest: 0,
+  medoidBest: 0,
+  generatedBest: 0,
+});
+
 export interface BuildPrototypeLaneInput {
   readonly title: string | null;
   readonly gist?: string | null;
   readonly store: PrototypeLaneStore | undefined;
   readonly embed?: PrototypeLaneEmbed | undefined;
   readonly embedderUsable: boolean;
+  /** v2 (§11) — this page's own concept ids, already resolved via the
+   *  keyword-concept layer (enrichment/keywordConceptStore.ts). Optional:
+   *  undefined means "not resolved for this request" — the keyword blend
+   *  degrades to pure vector scoring for every candidate, the same
+   *  "vectors only" fallback contract splitSuggestionEngine.ts's
+   *  hybridSimilarity documents. READY-TO-SPLICE: the live server.ts call
+   *  site does not thread this yet — see this file's landing note in the
+   *  design doc for the exact follow-up. */
+  readonly pageConceptIds?: readonly string[];
+  /** v2 (§11) — for per-source prequential recording (recordRawLanePredictions).
+   *  Both optional and BOTH required together for recording to fire — same
+   *  ready-to-splice status as pageConceptIds. */
+  readonly canonicalUrl?: string;
+  readonly vaultRoot?: string;
 }
 
 /**
- * Pure vector KNN — no LLM call, no ranking beyond similarity. Query text is
- * the same gist-leads-title composition the content lane uses (gist carries
- * more topical signal when present); a page with neither yields typed
- * emptiness rather than an embed of nothing.
+ * Pure vector KNN + keyword-profile blend + contrast-margin gate — no LLM
+ * call, no ranking beyond these three signals. Query text is the same
+ * gist-leads-title composition the content lane uses (gist carries more
+ * topical signal when present); a page with neither yields typed emptiness
+ * rather than an embed of nothing.
  */
 export const buildPrototypeLane = async (
   input: BuildPrototypeLaneInput,
@@ -157,6 +239,7 @@ export const buildPrototypeLane = async (
     readonly prototypeId: string;
     readonly workstreamId: string;
     readonly cosineDistance: number;
+    readonly angle?: 'medoid' | 'synthetic-sibling';
   }[];
   try {
     hits = input.store.queryPrototypeVector({ vec, limit: KNN_LIMIT });
@@ -167,40 +250,134 @@ export const buildPrototypeLane = async (
     return typedEmpty('no prototypes generated for any workstream yet');
   }
 
-  const perWorkstream = new Map<string, { best: number; count: number }>();
+  const perWorkstream = new Map<string, WorkstreamAggregate>();
   for (const hit of hits) {
     const sim = cosineSimilarityFromL2(hit.cosineDistance);
-    const agg = perWorkstream.get(hit.workstreamId);
-    if (agg === undefined) {
-      perWorkstream.set(hit.workstreamId, { best: sim, count: 1 });
-    } else {
-      agg.count += 1;
-      if (sim > agg.best) agg.best = sim;
+    const agg = perWorkstream.get(hit.workstreamId) ?? newAggregate(hit.workstreamId);
+    agg.count += 1;
+    if (sim > agg.vectorBest) agg.vectorBest = sim;
+    if (hit.angle === 'medoid' && sim > agg.medoidBest) agg.medoidBest = sim;
+    if (hit.angle === 'synthetic-sibling' && sim > agg.generatedBest) agg.generatedBest = sim;
+    perWorkstream.set(hit.workstreamId, agg);
+  }
+
+  // ---- keyword-profile blend (v2 §11) -----------------------------------
+  const idf = input.pageConceptIds !== undefined ? input.store.getPrototypeKeywordIdf?.() : undefined;
+  const keywordWeight = resolvePrototypeKeywordWeight();
+  const keywordScoreByWorkstream = new Map<
+    string,
+    { readonly score: number; readonly matchedConceptIds: readonly string[]; readonly displayKeyword: ReadonlyMap<string, string> }
+  >();
+  if (input.pageConceptIds !== undefined && idf !== undefined) {
+    for (const workstreamId of perWorkstream.keys()) {
+      const profile = input.store.getPrototypeKeywordProfile?.(workstreamId);
+      if (profile === undefined) continue;
+      const result = scorePageAgainstProfile(input.pageConceptIds, idf, profile);
+      if (result.score > 0) {
+        keywordScoreByWorkstream.set(workstreamId, { ...result, displayKeyword: profile.displayKeyword });
+      }
     }
   }
 
-  const candidates: GuessLaneCandidate[] = [...perWorkstream.entries()]
-    .map(([workstreamId, agg]) => ({
+  const blendedByWorkstream = new Map<string, number>();
+  for (const [workstreamId, agg] of perWorkstream) {
+    const keywordResult = keywordScoreByWorkstream.get(workstreamId);
+    blendedByWorkstream.set(
       workstreamId,
-      score: agg.best < 0 ? 0 : agg.best > 1 ? 1 : agg.best,
-      // UI-visibility phase (docs/plans/2026-08-16-category-flexibility-
-      // hyde.md) — plain-language `why`, not the ML term "prototype": the
-      // client already shows the matched workstream's NAME beside this
-      // string (guess-lane-name), so this doesn't repeat it.
-      why: `close to ${String(agg.count)} example${agg.count === 1 ? '' : 's'} generated for this workstream (${agg.best.toFixed(2)})`,
-    }))
-    .sort((left, right) =>
-      right.score !== left.score
-        ? right.score - left.score
-        : left.workstreamId < right.workstreamId
-          ? -1
-          : left.workstreamId > right.workstreamId
-            ? 1
-            : 0,
-    )
-    .slice(0, MAX_LANE_CANDIDATES);
+      blendVectorAndKeywordScore(agg.vectorBest, keywordResult?.score ?? 0, keywordWeight),
+    );
+  }
+
+  // ---- per-source prequential (v2 §11) — measurement, not disclosure ----
+  // Fires regardless of the contrast-margin outcome below: an honest-empty
+  // disclosure to the user does not mean each SOURCE has nothing to say —
+  // the whole point of measuring per-source precision is to find out
+  // whether medoid/generated/keyword alone would have been right, even on
+  // pages where the BLEND was too close to call. AWAITED (not fire-and-
+  // forget like server.ts's batch-level recordLanePredictions): this write
+  // is one small local JSONL append (a few dozen bytes, one syscall), not a
+  // network call or another KNN query — cheap enough that correctness
+  // (never losing a measurement row to a process-exit race) outweighs the
+  // sub-millisecond latency add. Never throws (recordPerSourcePredictions
+  // catches internally).
+  await recordPerSourcePredictions(input, perWorkstream, keywordScoreByWorkstream);
+
+  // ---- contrast-margin gate (v2 §11) ------------------------------------
+  const contrastCandidates: ContrastCandidate[] = [...blendedByWorkstream.entries()].map(
+    ([workstreamId, score]) => ({ workstreamId, score }),
+  );
+  const contrastResult = applyContrastMargin(contrastCandidates);
+  if (contrastResult.kept.length === 0) {
+    return typedEmpty(contrastMarginEmptyReason(contrastResult));
+  }
+
+  const candidates: GuessLaneCandidate[] = contrastResult.kept.slice(0, MAX_LANE_CANDIDATES).map((c) => {
+    const agg = perWorkstream.get(c.workstreamId)!;
+    const keywordResult = keywordScoreByWorkstream.get(c.workstreamId);
+    // UI-visibility phase (docs/plans/2026-08-16-category-flexibility-
+    // hyde.md) — plain-language `why`, not the ML term "prototype": the
+    // client already shows the matched workstream's NAME beside this
+    // string (guess-lane-name), so this doesn't repeat it.
+    const vectorWhy = `close to ${String(agg.count)} example${agg.count === 1 ? '' : 's'} generated for this workstream (${agg.vectorBest.toFixed(2)})`;
+    const keywordWhy =
+      keywordResult === undefined
+        ? null
+        : keywordMatchWhy(keywordResult.matchedConceptIds, keywordResult.displayKeyword);
+    return {
+      workstreamId: c.workstreamId,
+      score: c.score,
+      why: keywordWhy === null ? vectorWhy : `${vectorWhy}; ${keywordWhy}`,
+    };
+  });
 
   return { lane: 'prototype', candidates };
+};
+
+/**
+ * Best-effort per-source predictions — the measurement that lets a future
+ * promotion decide the medoid/generated/keyword blend by PRECISION, not
+ * judgment (the brief's explicit requirement, §11 item 4). Reuses
+ * lanePrequential.ts's generic raw-record writer (bypasses the GuessLane
+ * wire-contract union entirely — these three composite ids are never
+ * disclosed in `result.lanes`, only measured). No-op when
+ * canonicalUrl/vaultRoot are absent (ready-to-splice — see this module's
+ * header). Never throws (recordRawLanePredictions itself never rejects).
+ */
+const recordPerSourcePredictions = async (
+  input: BuildPrototypeLaneInput,
+  perWorkstream: ReadonlyMap<string, WorkstreamAggregate>,
+  keywordScoreByWorkstream: ReadonlyMap<string, { readonly score: number }>,
+): Promise<void> => {
+  if (input.canonicalUrl === undefined || input.vaultRoot === undefined) return;
+  const nowMs = Date.now();
+  const records: LanePredictionRecord[] = [];
+
+  // Union of both maps — a workstream can win the KEYWORD sub-prediction
+  // with zero vector hits at all (it never entered `perWorkstream`), and
+  // the three sources must be measured independently of each other.
+  const candidateIds = new Set<string>([...perWorkstream.keys(), ...keywordScoreByWorkstream.keys()]);
+
+  const pushWinner = (lane: string, scoreFor: (workstreamId: string) => number): void => {
+    let bestId: string | null = null;
+    let bestScore = 0;
+    for (const workstreamId of candidateIds) {
+      const score = scoreFor(workstreamId);
+      if (score > bestScore) {
+        bestScore = score;
+        bestId = workstreamId;
+      }
+    }
+    if (bestId !== null) {
+      records.push({ u: input.canonicalUrl!, l: lane, w: bestId, t: nowMs });
+    }
+  };
+
+  pushWinner('prototype:medoid', (id) => perWorkstream.get(id)?.medoidBest ?? 0);
+  pushWinner('prototype:generated', (id) => perWorkstream.get(id)?.generatedBest ?? 0);
+  pushWinner('prototype:keyword', (id) => keywordScoreByWorkstream.get(id)?.score ?? 0);
+
+  if (records.length === 0) return;
+  await recordRawLanePredictions(input.vaultRoot, records).catch(() => undefined);
 };
 
 // ---- serve-side orchestration -------------------------------------------
@@ -214,6 +391,10 @@ export interface AppendPrototypeLaneDeps {
   readonly embed?: PrototypeLaneEmbed | undefined;
   readonly embedderUsable: boolean;
   readonly guessLanesEnabled: boolean;
+  /** v2 (§11) — see BuildPrototypeLaneInput's matching fields. Threaded
+   *  through deps (not input) since these are request-scoped context the
+   *  caller assembles once per resolve, same shape as `store`/`embed`. */
+  readonly vaultRoot?: string;
 }
 
 /**
@@ -225,7 +406,12 @@ export interface AppendPrototypeLaneDeps {
  */
 export const appendPrototypeLane = async <T extends ResultWithLanes>(
   result: T,
-  input: { readonly title: string | null; readonly gist?: string | null },
+  input: {
+    readonly title: string | null;
+    readonly gist?: string | null;
+    readonly canonicalUrl?: string;
+    readonly pageConceptIds?: readonly string[];
+  },
   deps: AppendPrototypeLaneDeps,
 ): Promise<T> => {
   if (!deps.guessLanesEnabled || !prototypeLaneEnabled() || result.lanes === undefined) {
@@ -239,6 +425,9 @@ export const appendPrototypeLane = async <T extends ResultWithLanes>(
       store: deps.store,
       ...(deps.embed === undefined ? {} : { embed: deps.embed }),
       embedderUsable: deps.embedderUsable,
+      ...(input.pageConceptIds === undefined ? {} : { pageConceptIds: input.pageConceptIds }),
+      ...(input.canonicalUrl === undefined ? {} : { canonicalUrl: input.canonicalUrl }),
+      ...(deps.vaultRoot === undefined ? {} : { vaultRoot: deps.vaultRoot }),
     });
   } catch {
     lane = typedEmpty('recall store unavailable');

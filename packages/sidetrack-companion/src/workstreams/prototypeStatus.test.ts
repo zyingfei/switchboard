@@ -1,6 +1,10 @@
 import { describe, expect, it } from 'vitest';
 
-import { MIN_EVIDENCE_FOR_GENERATION, type WorkstreamGenerationState } from './prototypeGeneration.js';
+import {
+  MIN_EVIDENCE_FOR_GENERATION,
+  PROTOTYPE_EMBEDDING_SCHEMA_VERSION,
+  type WorkstreamGenerationState,
+} from './prototypeGeneration.js';
 import { computeWorkstreamPrototypeStatus } from './prototypeStatus.js';
 
 const generation = (over: Partial<WorkstreamGenerationState> = {}): WorkstreamGenerationState => ({
@@ -10,6 +14,7 @@ const generation = (over: Partial<WorkstreamGenerationState> = {}): WorkstreamGe
   generatorModelId: 'apple-fm#reason=ok',
   method: 'generated',
   prototypeIds: ['proto-1', 'proto-2', 'proto-3'],
+  embeddingSchemaVersion: PROTOTYPE_EMBEDDING_SCHEMA_VERSION,
   ...over,
 });
 
