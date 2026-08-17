@@ -56,7 +56,7 @@ const BASE_LANE_ORDER: readonly GuessLane[] = [
 // even once the client parse kept it. A lane added to GuessLane that can arrive
 // after 'recency' belongs in this array — that is the single place the strip's
 // tail order is decided.
-const OPTIONAL_LANE_ORDER: readonly GuessLane[] = ['content', 'ai'];
+const OPTIONAL_LANE_ORDER: readonly GuessLane[] = ['content', 'ai', 'prototype'];
 const LANE_SHORT_LABEL: Record<GuessLane, string> = {
   graph: 'Graph',
   similarity: 'Similar',
@@ -66,6 +66,7 @@ const LANE_SHORT_LABEL: Record<GuessLane, string> = {
   recency: 'Recent',
   content: 'Content',
   ai: 'AI',
+  prototype: 'Prototype',
 };
 
 const workstreamLabel = (

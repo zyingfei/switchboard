@@ -44,6 +44,7 @@ const LANE_LABEL: Record<GuessLaneResult['lane'], string> = {
   // computed, because the whole point of splitting it out from 'content' is
   // that a reader can see what the on-device model contributed.
   ai: 'AI gist match',
+  prototype: 'Prototype match',
 };
 
 const workstreamLabel = (
