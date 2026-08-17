@@ -3920,6 +3920,20 @@ interface SqliteDatabase {
   readonly close?: () => void;
 }
 
+/** Row-level diff-efficiency counters for one publish — how many rows a
+ *  guarded-upsert write actually touched vs. left alone. Surfaced on the
+ *  `[publish.in-place]` mark (see #recordInPlacePublish) so the diff-aware
+ *  write path (#writeCurrentRows, 2026-08-17 disk-wear fix) is AUDIBLE: an
+ *  operator can see rowsChanged stay small while rowsUnchanged tracks
+ *  snapshot size, instead of inferring efficiency indirectly from WAL bytes
+ *  alone. `undefined` diagnostics (the common case for
+ *  applyProjectionEventOverlay's single-row fold and replaceScopeRows' own
+ *  already-O(delta) writes) simply omits the suffix — never fabricated. */
+interface PublishRowDiagnostics {
+  readonly rowsChanged: number;
+  readonly rowsUnchanged: number;
+}
+
 interface SqliteModule {
   readonly Database: new (
     filename: string,
@@ -3950,6 +3964,20 @@ const textField = (value: unknown, field: string): string => {
     throw new Error(`SQLite connections row is missing text field: ${field}`);
   }
   return value[field];
+};
+
+// Diff-aware writes (2026-08-17 disk-wear fix) — bun:sqlite's `.run()`
+// result carries a `changes` count (rows actually touched by that one
+// statement). Used to attribute an `INSERT OR IGNORE` call to "wrote a row"
+// vs "no-op — pk already present" without a separate SELECT, for the
+// rowsChanged/rowsUnchanged audit counters (see #writeCurrentRows and the
+// `[publish.in-place]` mark). Duck-typed against `unknown` rather than a
+// named bun:sqlite result type, matching this file's existing SqliteDatabase/
+// SqliteStatement local interfaces.
+const runChangeCount = (result: unknown): number => {
+  if (!isRecord(result)) return 0;
+  const changes = result['changes'];
+  return typeof changes === 'number' ? changes : 0;
 };
 
 export interface StoredConnectionsMetadata {
@@ -6402,8 +6430,8 @@ export class SqliteConnectionsStore implements ConnectionsStore {
     const inPlace = await this.#acquireInPlaceWriteHandle();
     const { db, finalize } = inPlace ?? (await this.#acquireGraphWriteHandle());
     try {
-      this.#writeCurrentRows(db, snapshot, null);
-      finalize(true);
+      const { rowsChanged, rowsUnchanged } = this.#writeCurrentRows(db, snapshot, null);
+      finalize(true, { rowsChanged, rowsUnchanged });
     } catch (error) {
       finalize(false);
       throw error;
@@ -6439,13 +6467,11 @@ export class SqliteConnectionsStore implements ConnectionsStore {
     const inPlace = await this.#acquireInPlaceWriteHandle();
     const { db, finalize } = inPlace ?? (await this.#acquireGraphWriteHandle());
     try {
-      const shouldBootstrapScopeMembership = this.#writeCurrentRows(
-        db,
-        snapshot,
-        progress,
-        dirtyScopes,
-        projectionAccumulatorWrite,
-      );
+      const {
+        shouldBootstrapScopeMembership,
+        rowsChanged,
+        rowsUnchanged,
+      } = this.#writeCurrentRows(db, snapshot, progress, dirtyScopes, projectionAccumulatorWrite);
       // M4 — under double-buffer the scope bootstrap must land in the SAME
       // generation the pointer flips to (before finalize): the child exits
       // right after publish, so a deferred setImmediate would race the process
@@ -6462,7 +6488,7 @@ export class SqliteConnectionsStore implements ConnectionsStore {
           });
         }
       }
-      finalize(true);
+      finalize(true, { rowsChanged, rowsUnchanged });
     } catch (error) {
       finalize(false);
       throw error;
@@ -6781,7 +6807,7 @@ export class SqliteConnectionsStore implements ConnectionsStore {
    */
   async #acquireInPlaceWriteHandle(): Promise<{
     readonly db: SqliteDatabase;
-    readonly finalize: (committed: boolean) => void;
+    readonly finalize: (committed: boolean, diagnostics?: PublishRowDiagnostics) => void;
   } | null> {
     if (!this.#doubleBuffer) {
       this.#logClonePublish('legacy');
@@ -6828,7 +6854,7 @@ export class SqliteConnectionsStore implements ConnectionsStore {
     let finalized = false;
     return {
       db,
-      finalize: (committed: boolean): void => {
+      finalize: (committed: boolean, diagnostics?: PublishRowDiagnostics): void => {
         if (finalized) return;
         finalized = true;
         // The caller's own BEGIN IMMEDIATE/COMMIT or .../ROLLBACK already
@@ -6841,7 +6867,7 @@ export class SqliteConnectionsStore implements ConnectionsStore {
         }
         if (committed) {
           const bytesAfter = generationByteFootprint(this.#root, genId);
-          this.#recordInPlacePublish(genId, Math.max(0, bytesAfter - bytesBefore));
+          this.#recordInPlacePublish(genId, Math.max(0, bytesAfter - bytesBefore), diagnostics);
         }
       },
     };
@@ -6853,11 +6879,25 @@ export class SqliteConnectionsStore implements ConnectionsStore {
    *  parent-only gap shipped undetected). See the design note's "WAL
    *  checkpoint policy" section for the measurement behind the checkpoint
    *  defaults. */
-  #recordInPlacePublish(genId: string, walDeltaBytes: number): void {
+  #recordInPlacePublish(
+    genId: string,
+    walDeltaBytes: number,
+    diagnostics?: PublishRowDiagnostics,
+  ): void {
     this.#inPlacePublishCount += 1;
     this.#lastInPlacePublishAtMs = Date.now();
+    // Diff-aware writes (2026-08-17 disk-wear fix) — rowsChanged/rowsUnchanged
+    // appended when the caller measured them (#writeCurrentRows, via
+    // putCurrent/writeSnapshotAndProgress); omitted (not fabricated as 0/0)
+    // for publishers that don't track per-row diffs today
+    // (applyProjectionEventOverlay's single-row fold, replaceScopeRows'
+    // already-O(delta) scoped rewrite).
+    const diagSuffix =
+      diagnostics === undefined
+        ? ''
+        : ` rowsChanged=${String(diagnostics.rowsChanged)} rowsUnchanged=${String(diagnostics.rowsUnchanged)}`;
     console.warn(
-      `[publish.in-place] channel=${this.#publishChannel()} bytes=${String(walDeltaBytes)}`,
+      `[publish.in-place] channel=${this.#publishChannel()} bytes=${String(walDeltaBytes)}${diagSuffix}`,
     );
     const everyN = inPlaceCheckpointEveryN();
     if (everyN > 0 && this.#inPlacePublishCount % everyN === 0) {
@@ -6956,7 +6996,7 @@ export class SqliteConnectionsStore implements ConnectionsStore {
    */
   async #acquireGraphWriteHandle(): Promise<{
     readonly db: SqliteDatabase;
-    readonly finalize: (committed: boolean) => void;
+    readonly finalize: (committed: boolean, diagnostics?: PublishRowDiagnostics) => void;
   }> {
     if (!(this.#doubleBuffer && this.#role === 'parent-reader')) {
       // Child-writer: force a fresh WRITABLE shadow open (a prior read may have
@@ -6973,7 +7013,12 @@ export class SqliteConnectionsStore implements ConnectionsStore {
         const db = await this.#database();
         return {
           db,
-          finalize: (committed: boolean): void => {
+          // `diagnostics` is unused on the clone+CAS-flip path — this
+          // signature only needs to line up with #acquireInPlaceWriteHandle's
+          // so `inPlace ?? (await this.#acquireGraphWriteHandle())` callers
+          // can pass the same `finalize(committed, diagnostics?)` shape
+          // regardless of which path was taken.
+          finalize: (committed: boolean, _diagnostics?: PublishRowDiagnostics): void => {
             if (committed) this.#publishGeneration(db);
           },
         };
@@ -7004,7 +7049,7 @@ export class SqliteConnectionsStore implements ConnectionsStore {
     this.#initSchemaOn(shadowDb);
     return {
       db: shadowDb,
-      finalize: (committed: boolean): void => {
+      finalize: (committed: boolean, _diagnostics?: PublishRowDiagnostics): void => {
         if (!committed) {
           // Rolled back — discard the shadow, leave the pointer untouched.
           try {
@@ -7739,22 +7784,29 @@ export class SqliteConnectionsStore implements ConnectionsStore {
     }
   }
 
+  /** Diff-aware full-content-replace write (2026-08-17, disk-wear fix) — see
+   *  the "disk-wear addendum" in docs/plans/2026-08-15-foundation-program.md
+   *  for the trace evidence. Every row-write path here is a GUARDED upsert
+   *  (compare-then-write) or a targeted anti-join delete, never a blind
+   *  rewrite/DELETE-all: an unchanged row costs a read + a comparison, never
+   *  a dirtied page. Returns rowsChanged/rowsUnchanged so callers can surface
+   *  diff efficiency on the `[publish.in-place]` mark (task #6). */
   #writeCurrentRows(
     db: SqliteDatabase,
     snapshot: ConnectionsSnapshot,
     progress: MaterializerProgress | null,
     dirtyScopes?: ReadonlySet<Scope>,
     projectionAccumulatorWrite?: ConnectionsProjectionAccumulatorWrite,
-  ): boolean {
+  ): { shouldBootstrapScopeMembership: boolean; rowsChanged: number; rowsUnchanged: number } {
     // F4 (blob diet) — this full-write path persists node_order/edge_order
     // verbatim (below), preserving the CALLER's exact array order rather
     // than normalizing to alpha-sort. That is a deliberate, tested contract
     // (sqlite-store.test.ts round-trip cases feed arbitrary order and expect
-    // it back byte-for-byte) — and it's cheap to keep: this path is already
-    // O(state) for the node/edge row bytes themselves on every write, so an
-    // order array on top of that is not the per-drain rewrite problem this
-    // feature targets (that's replaceScopeRows, which DELETES these keys
-    // instead — see there).
+    // it back byte-for-byte) — and it's cheap to keep on the CPU side (this
+    // path already reads O(state) node/edge rows to diff them, below); the
+    // 2026-08-17 fix is that a byte-identical order array no longer costs a
+    // WAL write — see the guarded compare-then-write just above the metadata
+    // upserts.
     const nodeIds = snapshot.nodes.map((node) => node.id);
     const edgeBuckets = new Map<string, readonly ConnectionEdge[]>();
     for (const edge of snapshot.edges) {
@@ -7770,6 +7822,42 @@ export class SqliteConnectionsStore implements ConnectionsStore {
       return { src, dst };
     });
 
+    // Diff-aware scope-membership rewrite (2026-08-17 disk-wear fix) — mirror
+    // replaceScopeRows' anti-join temp-table technique (see there and
+    // sqlBudget.ts's header for the #378 incident this pattern already
+    // proved safe against a missing-index hang) instead of this path's
+    // previous DELETE-all-then-reinsert-all shape. Live trace evidence: the
+    // reconcile child's post-catch-up thread-membership reconcile
+    // (connectionsMaterializer.ts's forceFullRebuildForThreadReconcile) calls
+    // writeSnapshotAndProgress with dirtyScopes===undefined on essentially
+    // EVERY real catch-up/drain, so an UNBOUNDED delete-all+reinsert-all here
+    // was the dominant live write channel (~59MB WAL per publish measured on
+    // an 18k-node/107k-edge vault). Created/reset OUTSIDE the transaction,
+    // same convention as replaceScopeRows' temp_replace_* tables.
+    db.exec(`
+      CREATE TEMP TABLE IF NOT EXISTS temp_writecur_scope_nodes (
+        scope_kind TEXT NOT NULL,
+        scope_id TEXT NOT NULL,
+        node_id TEXT NOT NULL,
+        PRIMARY KEY (scope_kind, scope_id, node_id)
+      ) WITHOUT ROWID;
+      CREATE TEMP TABLE IF NOT EXISTS temp_writecur_scope_edges (
+        scope_kind TEXT NOT NULL,
+        scope_id TEXT NOT NULL,
+        edge_src TEXT NOT NULL,
+        edge_dst TEXT NOT NULL,
+        PRIMARY KEY (scope_kind, scope_id, edge_src, edge_dst)
+      ) WITHOUT ROWID;
+      CREATE TEMP TABLE IF NOT EXISTS temp_writecur_dirty_scopes (
+        scope_kind TEXT NOT NULL,
+        scope_id TEXT NOT NULL,
+        PRIMARY KEY (scope_kind, scope_id)
+      ) WITHOUT ROWID;
+      DELETE FROM temp_writecur_scope_nodes;
+      DELETE FROM temp_writecur_scope_edges;
+      DELETE FROM temp_writecur_dirty_scopes;
+    `);
+
     // INSTANT-BOOT INVARIANT: nodes/edges/metadata + the projection accumulator
     // rows/progress-tag (#persistProjectionAccumulatorWrite) + the materializer
     // progress rows commit in this ONE transaction. Boot reuse
@@ -7781,6 +7869,22 @@ export class SqliteConnectionsStore implements ConnectionsStore {
     // atomic here (or invalidate the reuse check accordingly).
     db.exec('BEGIN IMMEDIATE');
     try {
+      // rowsChanged/rowsUnchanged — the full diff-efficiency audit total
+      // (nodes + edges + metadata rows + scope memberships), surfaced on the
+      // `[publish.in-place]` mark. readCurrentInputsChanged is the NARROWER
+      // subset that gates #bumpWriteSeq/#dropCachedSnapshot: per
+      // #bumpWriteSeq's own doc comment, readCurrent consumes only
+      // nodes/edges/metadata.current/node_order/edge_order — connections_
+      // scope_nodes/_edges are NOT among them (they feed scoped resolver
+      // reads, not full-snapshot reconstruction), so a drain that touches
+      // ONLY scope-membership rows must still count those writes for the
+      // audit log but must NOT bump the commit token or invalidate the
+      // readCurrent memo — doing so would be observable churn (a resolver
+      // cache bust, a wasted memo rebuild) for zero actual content change.
+      let rowsChanged = 0;
+      let rowsUnchanged = 0;
+      let readCurrentInputsChanged = false;
+
       const upsertNode = db.query(
         'INSERT INTO nodes (id, data) VALUES (?, ?) ON CONFLICT(id) DO UPDATE SET data = excluded.data',
       );
@@ -7793,14 +7897,6 @@ export class SqliteConnectionsStore implements ConnectionsStore {
       const selectMetadata = db.query('SELECT data FROM metadata WHERE key = ?');
       const deleteNode = db.query('DELETE FROM nodes WHERE id = ?');
       const deleteEdge = db.query('DELETE FROM edges WHERE src = ? AND dst = ?');
-      const deleteAllScopeNodes = db.query('DELETE FROM connections_scope_nodes');
-      const deleteAllScopeEdges = db.query('DELETE FROM connections_scope_edges');
-      const deleteScopeNodes = db.query(
-        'DELETE FROM connections_scope_nodes WHERE scope_kind = ? AND scope_id = ?',
-      );
-      const deleteScopeEdges = db.query(
-        'DELETE FROM connections_scope_edges WHERE scope_kind = ? AND scope_id = ?',
-      );
       const insertScopeNode = db.query(
         `INSERT OR IGNORE INTO connections_scope_nodes
           (scope_kind, scope_id, node_id)
@@ -7810,6 +7906,19 @@ export class SqliteConnectionsStore implements ConnectionsStore {
         `INSERT OR IGNORE INTO connections_scope_edges
           (scope_kind, scope_id, edge_src, edge_dst)
          VALUES (?, ?, ?, ?)`,
+      );
+      const insertTempScopeNode = db.query(
+        `INSERT OR IGNORE INTO temp_writecur_scope_nodes
+          (scope_kind, scope_id, node_id)
+         VALUES (?, ?, ?)`,
+      );
+      const insertTempScopeEdge = db.query(
+        `INSERT OR IGNORE INTO temp_writecur_scope_edges
+          (scope_kind, scope_id, edge_src, edge_dst)
+         VALUES (?, ?, ?, ?)`,
+      );
+      const insertTempDirtyScope = db.query(
+        `INSERT OR IGNORE INTO temp_writecur_dirty_scopes (scope_kind, scope_id) VALUES (?, ?)`,
       );
 
       const currentNodeData = new Map(
@@ -7822,11 +7931,17 @@ export class SqliteConnectionsStore implements ConnectionsStore {
         const body = JSON.stringify(node);
         if (currentNodeData.get(node.id) !== body) {
           upsertNode.run(node.id, body);
+          rowsChanged += 1;
+          readCurrentInputsChanged = true;
+        } else {
+          rowsUnchanged += 1;
         }
         currentNodeData.delete(node.id);
       }
       for (const staleId of currentNodeData.keys()) {
         deleteNode.run(staleId);
+        rowsChanged += 1;
+        readCurrentInputsChanged = true;
       }
 
       const currentEdgeData = new Map<string, string>(
@@ -7847,12 +7962,20 @@ export class SqliteConnectionsStore implements ConnectionsStore {
         const body = JSON.stringify(bucket);
         if (currentEdgeData.get(key) !== body) {
           upsertEdge.run(src, dst, body);
+          rowsChanged += 1;
+          readCurrentInputsChanged = true;
+        } else {
+          rowsUnchanged += 1;
         }
         currentEdgeData.delete(key);
       }
       for (const staleKey of currentEdgeData.keys()) {
         const [src, dst] = staleKey.split('\u0000');
-        if (src !== undefined && dst !== undefined) deleteEdge.run(src, dst);
+        if (src !== undefined && dst !== undefined) {
+          deleteEdge.run(src, dst);
+          rowsChanged += 1;
+          readCurrentInputsChanged = true;
+        }
       }
 
       const scopeMembershipEmpty =
@@ -7873,21 +7996,25 @@ export class SqliteConnectionsStore implements ConnectionsStore {
           dirtyScopes === undefined
             ? null
             : new Set([...dirtyScopes].map((scope) => `${scope.kind}\u0000${scope.id}`));
-        if (dirtyScopes === undefined) {
-          deleteAllScopeNodes.run();
-          deleteAllScopeEdges.run();
-        } else {
-          for (const scope of dirtyScopes) {
-            deleteScopeNodes.run(scope.kind, scope.id);
-            deleteScopeEdges.run(scope.kind, scope.id);
-          }
-        }
+
+        // Populate the incoming (post dirty-scope-filter) membership set into
+        // the temp tables AND upsert it into the real tables in the same
+        // pass -- `INSERT OR IGNORE` against an already-present pk is a true
+        // no-op (measured: zero WAL bytes for a fully-redundant pass -- see
+        // this PR's landing note), so this loop is the same shape the code
+        // already ran, just also mirrored into the temp table the anti-join
+        // delete below needs.
         for (const [nodeId, scopes] of memberships.nodeScopes.entries()) {
           for (const scope of scopes) {
             if (dirtyScopeKeys !== null && !dirtyScopeKeys.has(`${scope.kind}\u0000${scope.id}`)) {
               continue;
             }
-            insertScopeNode.run(scope.kind, scope.id, nodeId);
+            insertTempScopeNode.run(scope.kind, scope.id, nodeId);
+            if (runChangeCount(insertScopeNode.run(scope.kind, scope.id, nodeId)) > 0) {
+              rowsChanged += 1;
+            } else {
+              rowsUnchanged += 1;
+            }
           }
         }
         for (const [key, scopes] of memberships.edgeScopes.entries()) {
@@ -7897,9 +8024,93 @@ export class SqliteConnectionsStore implements ConnectionsStore {
             if (dirtyScopeKeys !== null && !dirtyScopeKeys.has(`${scope.kind}\u0000${scope.id}`)) {
               continue;
             }
-            insertScopeEdge.run(scope.kind, scope.id, src, dst);
+            insertTempScopeEdge.run(scope.kind, scope.id, src, dst);
+            if (runChangeCount(insertScopeEdge.run(scope.kind, scope.id, src, dst)) > 0) {
+              rowsChanged += 1;
+            } else {
+              rowsUnchanged += 1;
+            }
           }
         }
+
+        // Anti-join delete: remove exactly the rows absent from the incoming
+        // set, never DELETE-all. `dirtyScopeKeys === null` (full rebuild) has
+        // no scope filter -- every existing row not matched in the temp
+        // table is stale; `dirtyScopeKeys !== null` (scoped write)
+        // additionally constrains to rows whose scope was actually touched
+        // this drain, matching the old per-scope-targeted delete's bounded
+        // blast radius. The statement's own target-table SCAN (no equality
+        // predicate on connections_scope_nodes/_edges itself) is unavoidable
+        // and matches replaceScopeRows' deleteScopeNodes/deleteScopeEdges
+        // precedent (registered `allowScanTables` in queryPlanLint.test.ts)
+        // -- the anti-join's WAL savings come from writing zero pages for
+        // matched (kept) rows, not from skipping the scan.
+        let deleteScopeNodesStmt: SqliteStatement;
+        let deleteScopeEdgesStmt: SqliteStatement;
+        if (dirtyScopeKeys === null) {
+          deleteScopeNodesStmt = budgetedStatement(
+            db,
+            'connections.writeCurrentRows.deleteScopeNodesAntiJoin',
+            `DELETE FROM connections_scope_nodes
+             WHERE NOT EXISTS (
+               SELECT 1 FROM temp_writecur_scope_nodes t
+               WHERE t.scope_kind = connections_scope_nodes.scope_kind
+                 AND t.scope_id = connections_scope_nodes.scope_id
+                 AND t.node_id = connections_scope_nodes.node_id
+             )`,
+          );
+          deleteScopeEdgesStmt = budgetedStatement(
+            db,
+            'connections.writeCurrentRows.deleteScopeEdgesAntiJoin',
+            `DELETE FROM connections_scope_edges
+             WHERE NOT EXISTS (
+               SELECT 1 FROM temp_writecur_scope_edges t
+               WHERE t.scope_kind = connections_scope_edges.scope_kind
+                 AND t.scope_id = connections_scope_edges.scope_id
+                 AND t.edge_src = connections_scope_edges.edge_src
+                 AND t.edge_dst = connections_scope_edges.edge_dst
+             )`,
+          );
+        } else {
+          for (const scope of dirtyScopes ?? []) {
+            insertTempDirtyScope.run(scope.kind, scope.id);
+          }
+          deleteScopeNodesStmt = budgetedStatement(
+            db,
+            'connections.writeCurrentRows.deleteScopeNodesScopedAntiJoin',
+            `DELETE FROM connections_scope_nodes
+             WHERE EXISTS (
+               SELECT 1 FROM temp_writecur_dirty_scopes d
+               WHERE d.scope_kind = connections_scope_nodes.scope_kind
+                 AND d.scope_id = connections_scope_nodes.scope_id
+             )
+             AND NOT EXISTS (
+               SELECT 1 FROM temp_writecur_scope_nodes t
+               WHERE t.scope_kind = connections_scope_nodes.scope_kind
+                 AND t.scope_id = connections_scope_nodes.scope_id
+                 AND t.node_id = connections_scope_nodes.node_id
+             )`,
+          );
+          deleteScopeEdgesStmt = budgetedStatement(
+            db,
+            'connections.writeCurrentRows.deleteScopeEdgesScopedAntiJoin',
+            `DELETE FROM connections_scope_edges
+             WHERE EXISTS (
+               SELECT 1 FROM temp_writecur_dirty_scopes d
+               WHERE d.scope_kind = connections_scope_edges.scope_kind
+                 AND d.scope_id = connections_scope_edges.scope_id
+             )
+             AND NOT EXISTS (
+               SELECT 1 FROM temp_writecur_scope_edges t
+               WHERE t.scope_kind = connections_scope_edges.scope_kind
+                 AND t.scope_id = connections_scope_edges.scope_id
+                 AND t.edge_src = connections_scope_edges.edge_src
+                 AND t.edge_dst = connections_scope_edges.edge_dst
+             )`,
+          );
+        }
+        rowsChanged += runChangeCount(deleteScopeNodesStmt.run());
+        rowsChanged += runChangeCount(deleteScopeEdgesStmt.run());
       }
 
       const metadataRow = selectMetadata.get('current');
@@ -7916,12 +8127,56 @@ export class SqliteConnectionsStore implements ConnectionsStore {
               db,
               JSON.parse(textField(metadataRow, 'data')) as StoredConnectionsMetadata,
             );
-      upsertMetadata.run(
-        'current',
-        JSON.stringify(metadataForSnapshotWrite(snapshot, existingMetadata)),
+      // Guarded upserts (2026-08-17 disk-wear fix) — 'current'/node_order/
+      // edge_order are each a SINGLE metadata row, but node_order/edge_order
+      // serialize the FULL id array (O(state) bytes): rewriting them
+      // unconditionally on every publish — even one where only a handful of
+      // node/edge rows actually changed — was a second O(state) WAL source
+      // alongside the scope tables above. metadataForSnapshotWrite/nodeIds/
+      // edge-id-array are deterministic functions of snapshot content (no
+      // wall-clock), so a plain string compare correctly detects a true
+      // no-op vs. a real change.
+      const rawExistingCurrentJson =
+        metadataRow === null || metadataRow === undefined ? null : textField(metadataRow, 'data');
+      const newCurrentMetadataJson = JSON.stringify(
+        metadataForSnapshotWrite(snapshot, existingMetadata),
       );
-      upsertMetadata.run('node_order', JSON.stringify(nodeIds));
-      upsertMetadata.run('edge_order', JSON.stringify(snapshot.edges.map((edge) => edge.id)));
+      if (rawExistingCurrentJson !== newCurrentMetadataJson) {
+        upsertMetadata.run('current', newCurrentMetadataJson);
+        rowsChanged += 1;
+        readCurrentInputsChanged = true;
+      } else {
+        rowsUnchanged += 1;
+      }
+
+      const existingNodeOrderRow = selectMetadata.get('node_order');
+      const rawExistingNodeOrderJson =
+        existingNodeOrderRow === null || existingNodeOrderRow === undefined
+          ? null
+          : textField(existingNodeOrderRow, 'data');
+      const newNodeOrderJson = JSON.stringify(nodeIds);
+      if (rawExistingNodeOrderJson !== newNodeOrderJson) {
+        upsertMetadata.run('node_order', newNodeOrderJson);
+        rowsChanged += 1;
+        readCurrentInputsChanged = true;
+      } else {
+        rowsUnchanged += 1;
+      }
+
+      const existingEdgeOrderRow = selectMetadata.get('edge_order');
+      const rawExistingEdgeOrderJson =
+        existingEdgeOrderRow === null || existingEdgeOrderRow === undefined
+          ? null
+          : textField(existingEdgeOrderRow, 'data');
+      const newEdgeOrderJson = JSON.stringify(snapshot.edges.map((edge) => edge.id));
+      if (rawExistingEdgeOrderJson !== newEdgeOrderJson) {
+        upsertMetadata.run('edge_order', newEdgeOrderJson);
+        rowsChanged += 1;
+        readCurrentInputsChanged = true;
+      } else {
+        rowsUnchanged += 1;
+      }
+
       if (projectionAccumulatorWrite !== undefined) {
         this.#persistProjectionAccumulatorWrite(db, projectionAccumulatorWrite);
         // Same write-side probe as the replaceScopeRows site — see the
@@ -7944,14 +8199,27 @@ export class SqliteConnectionsStore implements ConnectionsStore {
         );
       }
       // H6: writeCurrentRows mutates nodes/edges/current/node_order/
-      // edge_order — all readCurrent inputs. Bump the commit token.
-      this.#bumpWriteSeq(db);
+      // edge_order — all readCurrent inputs. Bump the commit token only when
+      // one of THOSE actually changed this write (see readCurrentInputsChanged's
+      // doc comment above) — a scope-membership-only or fully no-op write
+      // must not bump write_seq or invalidate the readCurrent memo (task #5:
+      // "a no-op putCurrent must skip the bump + skip the resolver-cache
+      // invalidation").
+      if (readCurrentInputsChanged) {
+        this.#bumpWriteSeq(db);
+      }
       if (progress !== null) this.#writeProgressRows(db, progress);
       db.exec('COMMIT');
-      // Invalidate the readCurrent memo — the next read will see the
-      // new snapshotRevision and rebuild.
-      this.#dropCachedSnapshot();
-      return progress !== null && scopeMembershipEmpty;
+      if (readCurrentInputsChanged) {
+        // Invalidate the readCurrent memo — the next read will see the
+        // new snapshotRevision and rebuild.
+        this.#dropCachedSnapshot();
+      }
+      return {
+        shouldBootstrapScopeMembership: progress !== null && scopeMembershipEmpty,
+        rowsChanged,
+        rowsUnchanged,
+      };
     } catch (error) {
       db.exec('ROLLBACK');
       throw error;
