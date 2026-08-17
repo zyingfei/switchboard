@@ -307,6 +307,192 @@ describe('per-URL HTTP routes', () => {
     expect(merged.some((event) => event.type === 'workstream.membership.set')).toBe(false);
   });
 
+  it('GET /v1/visits/{url}/memberships reads back active rows, latest-wins, removed rows excluded', async () => {
+    const canonicalUrl = 'https://github.com/zyingfei/switchboard/memberships-read';
+    await appendObservation({ seq: 1, url: canonicalUrl, tabSessionId: 'tses_membership_read' });
+
+    // No memberships yet.
+    const empty = await fetch(
+      `${serverUrl}/v1/visits/${encodeURIComponent(canonicalUrl)}/memberships`,
+      { headers: headers() },
+    );
+    expect(empty.status).toBe(200);
+    const emptyBody = (await empty.json()) as { data: { memberships: unknown[] } };
+    expect(emptyBody.data.memberships).toEqual([]);
+
+    await fetch(`${serverUrl}/v1/visits/${encodeURIComponent(canonicalUrl)}/memberships`, {
+      method: 'POST',
+      headers: headers('idem-mread-1'),
+      body: JSON.stringify({ workstreamId: 'ws_primary', role: 'primary' }),
+    });
+    await fetch(`${serverUrl}/v1/visits/${encodeURIComponent(canonicalUrl)}/memberships`, {
+      method: 'POST',
+      headers: headers('idem-mread-2'),
+      body: JSON.stringify({ workstreamId: 'ws_secondary' }),
+    });
+    await fetch(`${serverUrl}/v1/visits/${encodeURIComponent(canonicalUrl)}/memberships`, {
+      method: 'POST',
+      headers: headers('idem-mread-3'),
+      body: JSON.stringify({ workstreamId: 'ws_removed' }),
+    });
+    await fetch(
+      `${serverUrl}/v1/visits/${encodeURIComponent(canonicalUrl)}/memberships/ws_removed/remove`,
+      { method: 'POST', headers: headers('idem-mread-4'), body: JSON.stringify({}) },
+    );
+
+    const response = await fetch(
+      `${serverUrl}/v1/visits/${encodeURIComponent(canonicalUrl)}/memberships`,
+      { headers: headers() },
+    );
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as {
+      data: { memberships: { workstreamId: string; role: string; provenance: string }[] };
+    };
+    const byWorkstream = new Map(body.data.memberships.map((row) => [row.workstreamId, row]));
+    expect(byWorkstream.has('ws_removed')).toBe(false);
+    expect(byWorkstream.get('ws_primary')).toMatchObject({ role: 'primary', provenance: 'user-filed' });
+    expect(byWorkstream.get('ws_secondary')).toMatchObject({
+      role: 'secondary',
+      provenance: 'user-filed',
+    });
+  });
+
+  // Regression, investigated 2026-08-17 against a real dogfood vault after a
+  // report that membership chips stayed empty post-backfill. VERIFIED FINDING
+  // (not the originally-suspected cause): `workstreamMembershipStore.ts` has
+  // ZERO production callers — this route never touches it, reading instead
+  // via `readEventsFromStoreOrLog` -> the shared typed event-store mirror
+  // (`sync/eventStore.ts`). Replaying the real vault's actual backfilled
+  // rows through this exact route logic resolved correctly, and
+  // `membershipBackfill.ts`'s CLI half REFUSES to run against a live
+  // companion (vault-lock check) — the backfill only ever runs offline, and
+  // `runtime/companion.ts` `await`s a full event-store catch-up
+  // (`refreshPrivacyProjectionFromLog` -> `getCaughtUpSharedEventStore`)
+  // BEFORE `startHttpServer` on every boot, so a real companion's very
+  // first post-restart request already sees a fully-caught-up mirror. This
+  // test pins that same guarantee at the route level: a `getCaughtUpSharedEventStore`
+  // pass (this file's harness starts the HTTP server directly, without
+  // `runtime/companion.ts`'s boot sequence, so this call stands in for that
+  // boot-time warm-up) makes events written straight to the causal log —
+  // the same way the backfill CLI appends, via a synthetic replica's own
+  // pre-assigned dot, never through this route's live POST path — visible
+  // on the very next read. (Without an equivalent warm-up, the FIRST-EVER
+  // touch of a brand-new event-store.db races its own kicked-not-awaited
+  // catch-up and can miss it — confirmed separately; boot's await is what
+  // closes that window in production, which is what this test pins.)
+  it('GET /v1/visits/{url}/memberships serves events pre-existing in the log once the store has been caught up (backfill shape)', async () => {
+    const priorFlag = process.env['SIDETRACK_EVENT_STORE'];
+    process.env['SIDETRACK_EVENT_STORE'] = '1';
+    try {
+      const canonicalUrl = 'https://github.com/zyingfei/switchboard/backfilled-memberships';
+      // Written the same way membershipBackfill.ts's CLI half appends its
+      // plan: directly to the causal log via a synthetic replica's own
+      // pre-assigned dot (importPeerEvent), with NO live drain / HTTP
+      // traffic ever having touched this vault first.
+      await eventLog.importPeerEvent({
+        clientEventId: 'backfill:workstream.membership.set:canonical-url:pre-existing:ws_backfilled',
+        dot: { replicaId: 'workstream_membership_backfill', seq: 1 },
+        deps: {},
+        aggregateId: `membership:canonical-url:${canonicalUrl}:ws_backfilled`,
+        type: 'workstream.membership.set',
+        payload: {
+          payloadVersion: 1,
+          subjectKind: 'canonical-url',
+          subjectId: canonicalUrl,
+          workstreamId: 'ws_backfilled',
+          role: 'primary',
+          provenance: 'user-filed',
+        },
+        acceptedAtMs: Date.now(),
+      });
+
+      // Stand-in for runtime/companion.ts's boot-time AWAITED catch-up
+      // (refreshPrivacyProjectionFromLog), which always completes before
+      // startHttpServer in a real companion process — this test's harness
+      // starts the HTTP server directly and skips that boot sequence, so it
+      // is reproduced explicitly here rather than silently assumed.
+      const { getCaughtUpSharedEventStore } = await import('../sync/eventStore.js');
+      await getCaughtUpSharedEventStore(vaultRoot);
+
+      const response = await fetch(
+        `${serverUrl}/v1/visits/${encodeURIComponent(canonicalUrl)}/memberships`,
+        { headers: headers() },
+      );
+      expect(response.status).toBe(200);
+      const body = (await response.json()) as {
+        data: { memberships: { workstreamId: string; role: string; provenance: string }[] };
+      };
+      expect(body.data.memberships).toMatchObject([
+        { workstreamId: 'ws_backfilled', role: 'primary', provenance: 'user-filed' },
+      ]);
+    } finally {
+      if (priorFlag === undefined) delete process.env['SIDETRACK_EVENT_STORE'];
+      else process.env['SIDETRACK_EVENT_STORE'] = priorFlag;
+    }
+  });
+
+  it('GET /v1/visits/projection and /v1/visits/inbox overlay SECONDARY memberships onto items', async () => {
+    const primaryUrl = 'https://github.com/zyingfei/switchboard/overlay-primary';
+    const unfiledUrl = 'https://github.com/zyingfei/switchboard/overlay-unfiled';
+    await appendObservation({ seq: 1, url: primaryUrl, tabSessionId: 'tses_overlay_a' });
+    await appendObservation({ seq: 2, url: unfiledUrl, tabSessionId: 'tses_overlay_b' });
+
+    // primaryUrl: real primary attribution (via /attribute) PLUS an
+    // additive secondary membership — the projection overlay must show
+    // both without disturbing currentAttribution.
+    await fetch(`${serverUrl}/v1/visits/${encodeURIComponent(primaryUrl)}/attribute`, {
+      method: 'POST',
+      headers: headers('idem-overlay-attr'),
+      body: JSON.stringify({ workstreamId: 'ws_home' }),
+    });
+    await fetch(`${serverUrl}/v1/visits/${encodeURIComponent(primaryUrl)}/memberships`, {
+      method: 'POST',
+      headers: headers('idem-overlay-sec'),
+      body: JSON.stringify({ workstreamId: 'ws_extra' }),
+    });
+    // unfiledUrl: SECONDARY-only membership with no primary at all — the
+    // rare-but-real edge case where an Inbox item still carries chips.
+    await fetch(`${serverUrl}/v1/visits/${encodeURIComponent(unfiledUrl)}/memberships`, {
+      method: 'POST',
+      headers: headers('idem-overlay-unfiled'),
+      body: JSON.stringify({ workstreamId: 'ws_extra' }),
+    });
+
+    const projection = await fetch(`${serverUrl}/v1/visits/projection`, { headers: headers() });
+    const projBody = (await projection.json()) as {
+      data: {
+        byCanonicalUrl: Record<
+          string,
+          {
+            currentAttribution?: { workstreamId: string | null };
+            memberships?: { workstreamId: string; role: string }[];
+          }
+        >;
+      };
+    };
+    const primaryRecord = projBody.data.byCanonicalUrl[primaryUrl];
+    expect(primaryRecord?.currentAttribution?.workstreamId).toBe('ws_home');
+    // `/attribute` (the pre-multi-membership single-primary write path) does
+    // NOT itself emit a `workstream.membership.set` row — only the new
+    // additive `/memberships` route does (design doc §1's backfill for
+    // reconciling the two is a separate, explicitly one-time CLI step, not
+    // automatic). So the overlay here shows only the row this feature
+    // itself wrote, not `ws_home` — `currentAttribution` stays the
+    // authoritative primary answer either way.
+    expect(primaryRecord?.memberships?.map((m) => m.workstreamId)).toEqual(['ws_extra']);
+
+    const inbox = await fetch(`${serverUrl}/v1/visits/inbox`, { headers: headers() });
+    const inboxBody = (await inbox.json()) as {
+      data: { items: { canonicalUrl: string; memberships?: { workstreamId: string }[] }[] };
+    };
+    const unfiledItem = inboxBody.data.items.find((item) => item.canonicalUrl === unfiledUrl);
+    expect(unfiledItem?.memberships).toEqual([
+      expect.objectContaining({ workstreamId: 'ws_extra', role: 'secondary' }),
+    ]);
+    // Filed URLs never appear in Inbox regardless of membership overlay.
+    expect(inboxBody.data.items.some((item) => item.canonicalUrl === primaryUrl)).toBe(false);
+  });
+
   it('serves a durable opportunity id, stores the explicit outcome, and reads back a joined score', async () => {
     const canonicalUrl = 'https://coverage.test/served-page';
     await appendObservation({ seq: 1, url: canonicalUrl, tabSessionId: 'tses_coverage' });

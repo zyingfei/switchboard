@@ -273,3 +273,47 @@ export const primaryMembershipRow = (
   rows: readonly WorkstreamMembershipRow[],
 ): WorkstreamMembershipRow | undefined =>
   rows.find((row) => !row.deleted && row.role === 'primary');
+
+/**
+ * Fold ACTIVE membership rows for EVERY subject present in `events` at
+ * once — one bucketing pass over the raw membership-event set, then one
+ * cheap `foldWorkstreamMembership` call per subject over ONLY that
+ * subject's own bucket (never the full event set per subject). Built for
+ * list-view routes (e.g. `/v1/visits/inbox`, `/v1/visits/projection`) that
+ * need membership chips for many subjects from a single batched read —
+ * calling `foldWorkstreamMembership` once per item against the complete
+ * event list would be O(subjects × events).
+ */
+export const foldAllActiveMemberships = (
+  subjectKind: MembershipSubjectKind,
+  events: readonly AcceptedEvent[],
+): ReadonlyMap<string, readonly WorkstreamMembershipRow[]> => {
+  const bySubject = new Map<string, AcceptedEvent[]>();
+  for (const event of events) {
+    let subjectId: string | undefined;
+    if (event.type === WORKSTREAM_MEMBERSHIP_SET) {
+      if (isWorkstreamMembershipSetPayload(event.payload) && event.payload.subjectKind === subjectKind) {
+        subjectId = event.payload.subjectId;
+      }
+    } else if (event.type === WORKSTREAM_MEMBERSHIP_REMOVED) {
+      if (
+        isWorkstreamMembershipRemovedPayload(event.payload) &&
+        event.payload.subjectKind === subjectKind
+      ) {
+        subjectId = event.payload.subjectId;
+      }
+    }
+    if (subjectId === undefined) continue;
+    const bucket = bySubject.get(subjectId);
+    if (bucket === undefined) bySubject.set(subjectId, [event]);
+    else bucket.push(event);
+  }
+  const out = new Map<string, readonly WorkstreamMembershipRow[]>();
+  for (const [subjectId, subjectEvents] of bySubject) {
+    out.set(
+      subjectId,
+      activeMembershipRows(foldWorkstreamMembership(subjectKind, subjectId, subjectEvents)),
+    );
+  }
+  return out;
+};

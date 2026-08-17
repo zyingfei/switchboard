@@ -240,6 +240,44 @@ describe('InboxCard', () => {
     expect(slice.visible[0]?.tabSessionId).toBe('tses_fresh');
   });
 
+  it('renders membership chips and wires onAddMembership/onRemoveMembership through to MembershipChips', () => {
+    const onAttribute = vi.fn();
+    const onAddMembership = vi.fn();
+    const onRemoveMembership = vi.fn();
+    render(
+      <InboxCard
+        record={record({
+          currentAttribution: {
+            workstreamId: 'ws_security',
+            source: 'user_asserted',
+            observedAt: '2026-05-10T10:06:00.000Z',
+            clientEventId: 'evt-1',
+          },
+          memberships: [
+            { workstreamId: 'ws_security', role: 'primary', provenance: 'user-filed', acceptedAtMs: 1 },
+            {
+              workstreamId: 'ws_switchboard',
+              role: 'secondary',
+              provenance: 'user-filed',
+              acceptedAtMs: 2,
+            },
+          ],
+        })}
+        workstreams={workstreams}
+        onAttribute={onAttribute}
+        onAddMembership={onAddMembership}
+        onRemoveMembership={onRemoveMembership}
+      />,
+    );
+
+    expect(screen.getByText('Switchboard')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'Add to another workstream' }));
+    expect(onAddMembership).toHaveBeenCalledWith('tses_test');
+
+    fireEvent.click(screen.getByRole('button', { name: 'Remove from Switchboard' }));
+    expect(onRemoveMembership).toHaveBeenCalledWith('tses_test', 'ws_switchboard');
+  });
+
   it('hides file:// pages from the Inbox triage queue', () => {
     const records: TabSessionRecord[] = [
       record({

@@ -478,49 +478,108 @@ export const migrateLegacyToGeneration = (
  * Kill-switch downgrade reconciliation (D6 rollback). When the operator reverts
  * to legacy single-file mode (SIDETRACK_CONNECTIONS_DOUBLE_BUFFER=0), the store
  * opens `current.db`. But under double-buffer NO writer ever updates
- * `current.db` again — publishes only ever write `current.<gen>.db` + flip the
- * POINTER — so `current.db` is frozen at whatever it held when double-buffer
- * was first enabled. Serving it after generations advanced would silently
- * revert the graph to an arbitrarily-old state (the rollback-is-broken blocker).
+ * `current.db` again — publishes only ever write `current.<gen>.db` (in place,
+ * or via a fresh shadow + POINTER flip) — so `current.db` is frozen at whatever
+ * it held when double-buffer was first enabled. Serving it after generations
+ * advanced would silently revert the graph to an arbitrarily-old state (the
+ * rollback-is-broken blocker).
  *
  * Fix: on legacy open, if a POINTER exists and names a resident generation,
  * refresh `current.db` from that published gen (clonefile — ~0ms on APFS) BEFORE
  * the legacy handle opens it, so the downgrade serves the latest published
  * graph, not the stale seed. Idempotent + best-effort: if anything fails the
- * legacy open still proceeds against whatever `current.db` holds. Only ever
- * COPIES a published (checkpoint-TRUNCATE'd, quiescent) gen — never a shadow.
+ * legacy open still proceeds against whatever `current.db` holds.
+ *
+ * 2026-08-16 (in-place child-drain channel widening): two changes from the
+ * original clone-only-source invariant, both required now that the SAME
+ * generation id can receive many in-place publishes instead of the pointer
+ * always advancing to a fresh, already-checkpointed file:
+ *   1. Checkpoint-TRUNCATE the published generation HERE, under the SAME
+ *      cross-process publish lock every in-place writer holds during its own
+ *      write, before copying it. In-place publish defers its own
+ *      checkpoint (idle timer / every-N safety net — see
+ *      `inPlaceCheckpointIdleMs`/`inPlaceCheckpointEveryN`), so the main
+ *      `.db` file alone can be STALE relative to its own `-wal` sidecar;
+ *      the old clone+CAS-flip path never had this problem because every
+ *      published generation was ALREADY checkpoint-TRUNCATE'd before the
+ *      pointer ever named it. Under the lock, no concurrent in-place
+ *      publisher can land mid-checkpoint-mid-copy.
+ *   2. The staleness marker now fingerprints (genId, post-checkpoint mtime),
+ *      not genId alone. Genid alone was a valid freshness proof when a
+ *      generation's content never changed after publish (the old world);
+ *      under in-place publish the SAME genId's content changes across many
+ *      publishes, so an unchanged genId no longer implies an unchanged
+ *      `current.db` is still fresh.
+ *
+ * `openReadwrite` opens a readwrite handle for the checkpoint — mirrors
+ * `migrateLegacyToGeneration`'s existing seam (this module has no sqlite
+ * dependency of its own; the caller, which already loaded it, supplies one).
  *
  * Returns the gen id reconciled from, or null if there was nothing to reconcile
- * (no pointer, or current.db is already the published gen's clone).
+ * (no pointer, or current.db is already fresh for that generation's current
+ * content).
  */
-export const reconcileLegacyToPublished = (connectionsDir: string): string | null => {
-  const publishedGen = readPointer(connectionsDir);
-  if (publishedGen === null) return null;
-  const genPath = genFilePath(connectionsDir, publishedGen);
-  if (!existsSync(genPath)) return null;
-  const legacyPath = join(connectionsDir, LEGACY_DB_FILENAME);
-  // A marker records which gen current.db was last refreshed from, so a repeat
-  // downgrade on an unchanged pointer is a cheap no-op (no needless re-clone).
-  const markerPath = join(connectionsDir, 'current.db.reconciled-from');
-  try {
-    if (existsSync(legacyPath) && readFileSync(markerPath, 'utf8').trim() === publishedGen) {
-      return null;
+export const reconcileLegacyToPublished = (
+  connectionsDir: string,
+  openReadwrite: (path: string) => SqliteLikeDb,
+): string | null =>
+  withPublishLock(connectionsDir, () => {
+    // Re-resolve the pointer INSIDE the lock — the same discipline casPublish
+    // and #acquireInPlaceWriteHandle use — so a concurrent publish can never
+    // be raced: either we observe what it just wrote, or it serializes behind
+    // us (both hold this SAME lock).
+    const publishedGen = readPointer(connectionsDir);
+    if (publishedGen === null) return null;
+    const genPath = genFilePath(connectionsDir, publishedGen);
+    if (!existsSync(genPath)) return null;
+    try {
+      const db = openReadwrite(genPath);
+      try {
+        checkpointTruncate(db);
+      } finally {
+        db.close?.();
+      }
+    } catch {
+      // Best-effort: the copy below still runs against whatever the main
+      // file currently holds. A failed checkpoint only risks the legacy
+      // snapshot lagging by the writes still sitting in the source's WAL —
+      // never corruption (copyFileSync of the main file alone is always a
+      // valid, just possibly stale, SQLite database).
     }
-  } catch {
-    /* no marker yet — fall through and refresh */
-  }
-  try {
-    // Refresh current.db from the published gen. Remove stale sidecars first so
-    // the legacy open recreates its own -wal/-shm against the fresh main file.
-    safeUnlink(`${legacyPath}-wal`);
-    safeUnlink(`${legacyPath}-shm`);
-    copyFileSync(genPath, legacyPath);
-    writeFileSync(markerPath, publishedGen, { encoding: 'utf8', mode: 0o600 });
-    return publishedGen;
-  } catch {
-    return null; // best-effort — legacy open proceeds against existing current.db
-  }
-};
+    let sourceMtimeMs: number;
+    try {
+      sourceMtimeMs = statSync(genPath).mtimeMs;
+    } catch {
+      return null; // vanished mid-reconcile — nothing to copy
+    }
+    const legacyPath = join(connectionsDir, LEGACY_DB_FILENAME);
+    // A marker records (gen id, post-checkpoint mtime) so a repeat downgrade
+    // against genuinely unchanged content is a cheap no-op (no needless
+    // re-copy), while a repeat downgrade after MORE in-place publishes
+    // landed on the SAME gen id correctly re-copies.
+    const markerPath = join(connectionsDir, 'current.db.reconciled-from');
+    const fingerprint = `${publishedGen}@${String(sourceMtimeMs)}`;
+    try {
+      if (existsSync(legacyPath) && readFileSync(markerPath, 'utf8').trim() === fingerprint) {
+        return null;
+      }
+    } catch {
+      /* no marker yet — fall through and refresh */
+    }
+    try {
+      // Refresh current.db from the published gen. Remove stale sidecars first
+      // so the legacy open recreates its own -wal/-shm against the fresh main
+      // file (the source was just checkpoint-TRUNCATE'd above, so its own
+      // -wal/-shm are empty/near-empty and never need copying).
+      safeUnlink(`${legacyPath}-wal`);
+      safeUnlink(`${legacyPath}-shm`);
+      copyFileSync(genPath, legacyPath);
+      writeFileSync(markerPath, fingerprint, { encoding: 'utf8', mode: 0o600 });
+      return publishedGen;
+    } catch {
+      return null; // best-effort — legacy open proceeds against existing current.db
+    }
+  });
 
 /**
  * The child's shadow generation: clone the currently-published generation into
@@ -1011,23 +1070,46 @@ export const generationDbPath = (connectionsDir: string, genId: string): string 
   genFilePath(connectionsDir, genId);
 
 // ---------------------------------------------------------------------------
-// In-place scoped publish (2026-08-16) — see the "Storage-tier incremental
-// publish" design note in docs/plans/2026-08-15-foundation-program.md for
-// the full investigation, the empirical WAL-isolation verification, and the
-// reasoning behind every decision below. Summary: a scoped-delta write
-// (`replaceScopeRows`) or single-event overlay write
-// (`applyProjectionEventOverlay`) no longer clones the whole published
-// generation file just to apply an already-O(delta) SQL mutation — it opens
-// the CURRENT pointer's file `{ readwrite: true }` directly under this cross-
-// process lock and lets the caller's own existing `BEGIN IMMEDIATE`/
-// `COMMIT`/`ROLLBACK` block be the atomic unit for the mutation (see
-// snapshot.ts's `#acquireInPlaceWriteHandle` doc comment for why a literal
-// `SAVEPOINT` wasn't used). No new generation, no pointer flip, no GC. Kept
-// OFF this path entirely: full graph rewrites
-// (`putCurrent`/`writeSnapshotAndProgress` on a genuine content-signature
-// change), first-boot legacy migration, kill-switch downgrade reconciliation,
-// and any future structural schema migration — all of those still choose a
-// fresh generation deliberately via the existing clone+CAS-flip path.
+// In-place publish (2026-08-16, widened 2026-08-16 to the child-writer full-
+// rewrite channel) — see the "Storage-tier incremental publish" design note
+// in docs/plans/2026-08-15-foundation-program.md for the full investigation,
+// the empirical WAL-isolation verification, and the reasoning behind every
+// decision below. Summary: a scoped-delta write (`replaceScopeRows`), a
+// single-event overlay write (`applyProjectionEventOverlay`), OR a full
+// content-replace write (`putCurrent`/`writeSnapshotAndProgress`) no longer
+// clones the whole published generation file just to apply its SQL row
+// mutation — it opens the CURRENT pointer's file `{ readwrite: true }`
+// directly under this cross-process lock and lets the caller's own existing
+// `BEGIN IMMEDIATE`/`COMMIT`/`ROLLBACK` block be the atomic unit for the
+// mutation (see snapshot.ts's `#acquireInPlaceWriteHandle` doc comment for
+// why a literal `SAVEPOINT` wasn't used). No new generation, no pointer
+// flip, no GC — for EITHER writer role (`child-writer` or `parent-reader`),
+// since both call the same store methods.
+//
+// Widened from the original scoped/overlay-only scope: the initial cut
+// (PR #381) deliberately kept `putCurrent`/`writeSnapshotAndProgress` on
+// clone+flip. Live measurement afterward showed that decision left the
+// DOMINANT write channel uncovered — the reconcile child's "one full
+// rebuild reconciles thread_in_workstream edges" pass
+// (`connectionsMaterializer.ts`'s `catchUpDeferredThreadReconcile` →
+// `forceFullRebuildForThreadReconcile`) runs via `writeSnapshotAndProgress`
+// on essentially every real catch-up that touched thread/workstream
+// membership — i.e. routinely, not rarely — and every one of those was
+// still a full 437MB `copyFileSync`. The row-level mutation
+// `#writeCurrentRows` runs is the SAME shape (a `BEGIN IMMEDIATE`-wrapped
+// diff/upsert, no schema DDL) whether it targets a clone or the live
+// published file, so the same WAL-isolation proof that justified in-place
+// for scoped/overlay writes applies unchanged here — see the design note's
+// 2026-08-16 addendum. Kept OFF this path (the only remaining clone+flip
+// callers): the very first write to a fresh vault (no generation exists yet
+// to open in place — `#acquireInPlaceWriteHandle` naturally falls back),
+// `migrateLegacyToGeneration` (first-boot legacy migration), and
+// `reconcileLegacyToPublished` (kill-switch downgrade reconciliation) —
+// both of the latter run as their own dedicated clonefile operations,
+// structurally separate from any writer's publish path, and are untouched
+// by this change. Any future structural (non-`IF NOT EXISTS`) schema
+// migration would also need a fresh generation deliberately, same as
+// before.
 // ---------------------------------------------------------------------------
 
 /** `SIDETRACK_INPLACE_PUBLISH` — default ON (absent/non-`0`). `=0` reverts
@@ -1066,4 +1148,26 @@ export const generationExists = (connectionsDir: string, genId: string): boolean
   } catch {
     return false;
   }
+};
+
+/** Best-effort on-disk byte footprint of a generation — the main db file
+ *  plus its `-wal` sidecar (never throws; a missing file counts as 0).
+ *  Used ONLY for the audible `[publish.in-place]`/`[publish.clone]`
+ *  bytes-written diagnostic (a before/after diff around one publish's
+ *  critical section) — never load-bearing for correctness. Mirrors the
+ *  measurement `inPlacePublish.test.ts`'s write-volume case already uses. */
+export const generationByteFootprint = (connectionsDir: string, genId: string): number => {
+  const mainPath = genFilePath(connectionsDir, genId);
+  let bytes = 0;
+  try {
+    bytes += statSync(mainPath).size;
+  } catch {
+    /* generation vanished mid-measurement — best-effort, count 0 */
+  }
+  try {
+    bytes += statSync(`${mainPath}-wal`).size;
+  } catch {
+    /* no -wal sidecar (checkpointed/quiescent) — 0 is correct */
+  }
+  return bytes;
 };

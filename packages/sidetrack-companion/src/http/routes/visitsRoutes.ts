@@ -25,6 +25,11 @@ import { autoApplyUrlAttribution } from '../../urls/autoApply.js';
 import { URL_IGNORED } from '../../urls/events.js';
 import { serializeUrlProjection, urlInbox } from '../../urls/projection.js';
 import {
+  activeMembershipRows,
+  foldAllActiveMemberships,
+  foldWorkstreamMembership,
+  isWorkstreamMembershipRemovedPayload,
+  isWorkstreamMembershipSetPayload,
   membershipAggregateId,
   MEMBERSHIP_PROVENANCES,
   MEMBERSHIP_REMOVED_REASONS,
@@ -34,6 +39,7 @@ import {
   type MembershipRemovedReason,
   type MembershipRole,
   type WorkstreamMembershipRemovedPayload,
+  type WorkstreamMembershipRow,
   type WorkstreamMembershipSetPayload,
 } from '../../workstreams/membershipEvents.js';
 import {
@@ -45,7 +51,8 @@ import {
 } from '../../workstreams/suggestionEvents.js';
 
 import { HttpRouteError, RESOLVER_SIGNAL_EVENT_TYPES, aggregateIdForFeedbackEvent, baseVectorForAggregate, connectionsGraphSig, domainTombstoneSetFor, eventReadCoverageSig, invalidateResolveCaches, loadUrlProjection, objectRecord, optionalAttributionPolicyMode, optionalAttributionPolicyTelemetry, readBody, readEventsFromStoreOrLog, requireIdempotencyKey, requireVaultRoot, runIdempotent, serveResolveSwr } from '../routeSupport.js';
-import type { RouteDefinition } from '../routeSupport.js';
+import type { CompanionHttpConfig, RouteDefinition } from '../routeSupport.js';
+import type { EventLog } from '../../sync/eventLog.js';
 
 // Resolver-cache key discriminator (F3/F4). The persistent SQLite resolver
 // cache is keyed on (visit_id, snapshot_revision) and SURVIVES restart. Two
@@ -313,6 +320,48 @@ export const RESOLVER_EXPAND_EVENT_TYPES = [
   USER_ORGANIZED_ITEM,
 ] as const;
 
+// Multi-membership UI-visibility phase (docs/plans/2026-08-16-category-
+// flexibility-hyde.md, UI-visibility phase — "get shipped features into
+// the panel where the user already looks"). PR #376 shipped the write
+// paths (POST .../memberships, .../memberships/:id/remove,
+// .../suggestions/decline) plus the fold, but no read surface for a
+// filed item's SECONDARY memberships. This is that read surface —
+// additive over the existing single-primary `currentAttribution`, so a
+// reader that ignores it keeps working unchanged.
+const MEMBERSHIP_EVENT_TYPES = [WORKSTREAM_MEMBERSHIP_SET, WORKSTREAM_MEMBERSHIP_REMOVED] as const;
+
+export interface SerializedMembershipRow {
+  readonly workstreamId: string;
+  readonly role: MembershipRole;
+  readonly provenance: MembershipProvenance;
+  readonly acceptedAtMs: number;
+  readonly sourceOpportunityId?: string;
+}
+
+const serializeMembershipRow = (row: WorkstreamMembershipRow): SerializedMembershipRow => ({
+  workstreamId: row.workstreamId,
+  role: row.role ?? 'secondary',
+  provenance: row.provenance ?? 'user-filed',
+  acceptedAtMs: row.acceptedAtMs,
+  ...(row.sourceOpportunityId === undefined ? {} : { sourceOpportunityId: row.sourceOpportunityId }),
+});
+
+/** Every ACTIVE canonical-url membership row, batched in one read — the
+ * shape list-view routes (inbox/projection) overlay onto their items. */
+const loadAllUrlMemberships = async (
+  context: CompanionHttpConfig,
+  eventLog: EventLog,
+): Promise<ReadonlyMap<string, readonly WorkstreamMembershipRow[]>> =>
+  foldAllActiveMemberships(
+    'canonical-url',
+    await readEventsFromStoreOrLog(
+      context,
+      eventLog,
+      (event) => (MEMBERSHIP_EVENT_TYPES as readonly string[]).includes(event.type),
+      MEMBERSHIP_EVENT_TYPES,
+    ),
+  );
+
 export const visitsRoutesA: readonly RouteDefinition[] = [
   // -- Per-canonical-URL attribution surface --------------------------
   // The user-facing Inbox/Connections triages PAGES (canonical URLs),
@@ -332,12 +381,30 @@ export const visitsRoutesA: readonly RouteDefinition[] = [
           'Event log is not configured on this companion.',
         );
       }
-      const { projection, snapshotRevision } = await loadUrlProjection(context, context.eventLog);
+      const eventLog = context.eventLog;
+      const { projection, snapshotRevision } = await loadUrlProjection(context, eventLog);
+      const serialized = serializeUrlProjection(projection);
+      // Multi-membership overlay: SECONDARY workstream chips for filed item
+      // cards (docs/plans/2026-08-16-category-flexibility-hyde.md, UI-
+      // visibility phase). Additive field only — `currentAttribution` stays
+      // the single-primary answer every existing reader already uses.
+      const membershipsByUrl = await loadAllUrlMemberships(context, eventLog);
+      const byCanonicalUrl =
+        membershipsByUrl.size === 0
+          ? serialized.byCanonicalUrl
+          : Object.fromEntries(
+              Object.entries(serialized.byCanonicalUrl).map(([canonicalUrl, record]) => {
+                const memberships = membershipsByUrl.get(canonicalUrl);
+                return memberships === undefined || memberships.length === 0
+                  ? [canonicalUrl, record]
+                  : [canonicalUrl, { ...record, memberships: memberships.map(serializeMembershipRow) }];
+              }),
+            );
       return [
         200,
         {
           // PR #141 added a TTL cache here; superseded by Stage 5.2 R2.
-          data: serializeUrlProjection(projection),
+          data: { ...serialized, byCanonicalUrl },
           ...(snapshotRevision === null ? {} : { snapshotRevision }),
         },
       ];
@@ -360,7 +427,8 @@ export const visitsRoutesA: readonly RouteDefinition[] = [
       const offsetRaw = Number.parseInt(url.searchParams.get('offset') ?? '0', 10);
       const limit = Number.isFinite(limitRaw) && limitRaw > 0 ? Math.min(limitRaw, 200) : 50;
       const offset = Number.isFinite(offsetRaw) && offsetRaw > 0 ? offsetRaw : 0;
-      const { projection, snapshotRevision } = await loadUrlProjection(context, context.eventLog);
+      const eventLog = context.eventLog;
+      const { projection, snapshotRevision } = await loadUrlProjection(context, eventLog);
       const rawItems = urlInbox(projection, { limit, offset });
       // Title enrichment (url kind): overlay each visit's displayed
       // latestTitle where the raw title is structurally junk (empty /
@@ -369,9 +437,9 @@ export const visitsRoutesA: readonly RouteDefinition[] = [
       // lookup ⇒ raw items returned unchanged.
       const inboxLookup = await loadEnrichmentLookup(
         requireVaultRoot(context),
-        context.eventLog,
+        eventLog,
       );
-      const items =
+      const titled =
         inboxLookup === null
           ? rawItems
           : rawItems.map((item) => {
@@ -379,6 +447,21 @@ export const visitsRoutesA: readonly RouteDefinition[] = [
               return overlaid === item.latestTitle
                 ? item
                 : { ...item, ...(overlaid === undefined ? {} : { latestTitle: overlaid }) };
+            });
+      // Membership overlay: an Inbox item has no PRIMARY membership by
+      // definition (that's what makes it Inbox), but it may already carry
+      // SECONDARY memberships set via the additive /memberships route
+      // without ever being filed primary — rare, but a real reachable
+      // state, so chips render honestly here too.
+      const membershipsByUrl = await loadAllUrlMemberships(context, eventLog);
+      const items =
+        membershipsByUrl.size === 0
+          ? titled
+          : titled.map((item) => {
+              const memberships = membershipsByUrl.get(item.canonicalUrl);
+              return memberships === undefined || memberships.length === 0
+                ? item
+                : { ...item, memberships: memberships.map(serializeMembershipRow) };
             });
       return [
         200,
@@ -392,6 +475,56 @@ export const visitsRoutesA: readonly RouteDefinition[] = [
           ...(snapshotRevision === null ? {} : { snapshotRevision }),
         },
       ];
+    },
+  },
+  // Single-URL membership read — the GET counterpart to the additive
+  // .../memberships (set) / .../memberships/:id/remove routes below.
+  // On-demand detail-view fetch (a picker confirming current state before
+  // showing "add to workstream", or a card that wants a fresh read after
+  // its own mutation) — the list-view routes above overlay the SAME data
+  // batched for many URLs at once, so most card rendering never needs
+  // this route at all.
+  {
+    method: 'GET',
+    pattern: /^\/v1\/visits\/(?<canonicalUrl>[^/]+)\/memberships$/u,
+    authRequired: true,
+    handle: async (_request, _requestId, match, context) => {
+      if (context.eventLog === undefined) {
+        throw new HttpRouteError(
+          503,
+          'EVENT_LOG_UNAVAILABLE',
+          'Event log is not configured on this companion.',
+        );
+      }
+      const canonicalUrl = decodeURIComponent(match.canonicalUrl ?? '');
+      if (canonicalUrl.length === 0) {
+        throw new HttpRouteError(400, 'VALIDATION_ERROR', 'Validation failed.');
+      }
+      const eventLog = context.eventLog;
+      const events = await readEventsFromStoreOrLog(
+        context,
+        eventLog,
+        (event) => {
+          if (event.type === WORKSTREAM_MEMBERSHIP_SET) {
+            return (
+              isWorkstreamMembershipSetPayload(event.payload) &&
+              event.payload.subjectKind === 'canonical-url' &&
+              event.payload.subjectId === canonicalUrl
+            );
+          }
+          if (event.type === WORKSTREAM_MEMBERSHIP_REMOVED) {
+            return (
+              isWorkstreamMembershipRemovedPayload(event.payload) &&
+              event.payload.subjectKind === 'canonical-url' &&
+              event.payload.subjectId === canonicalUrl
+            );
+          }
+          return false;
+        },
+        [...MEMBERSHIP_EVENT_TYPES],
+      );
+      const rows = activeMembershipRows(foldWorkstreamMembership('canonical-url', canonicalUrl, events));
+      return [200, { data: { memberships: rows.map(serializeMembershipRow) } }];
     },
   },
   {

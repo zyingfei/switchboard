@@ -470,3 +470,67 @@ describe('guess-lanes — enriched provenance in why renders verbatim', () => {
     expect(screen.getByText('semantic match 0.64 · gist')).toBeInTheDocument();
   });
 });
+
+describe('guess-lanes — prototype-lane visibility (docs/plans/2026-08-16-category-flexibility-hyde.md)', () => {
+  const prototypeLanePopulated: readonly GuessLaneResult[] = [
+    {
+      lane: 'prototype',
+      candidates: [
+        { workstreamId: 'ws-1', score: 0.81, why: "matches 2 of 4 prototypes generated for 'Research'" },
+      ],
+    },
+  ];
+
+  it('renders the matched workstream\'s standing prototype status beneath the match why', () => {
+    const statusByWorkstream = new Map([
+      [
+        'ws-1',
+        {
+          workstreamId: 'ws-1',
+          prototypeCount: 3,
+          generatedAt: Date.now() - 2 * 60 * 60 * 1000,
+          evidenceCount: 12,
+          evidenceWatermark: '12:abc',
+          engine: 'apple-fm#reason=ok',
+          engineLabel: 'Apple Intelligence',
+          method: 'generated' as const,
+          methodNote: null,
+          whyNot: null,
+          whyNotDetail: null,
+        },
+      ],
+    ]);
+    render(
+      <GuessLanes
+        lanes={prototypeLanePopulated}
+        workstreams={workstreams}
+        prototypeStatusByWorkstream={statusByWorkstream}
+      />,
+    );
+    fireEvent.click(screen.getByText(/Guess lanes/u));
+    // The match `why` (verbatim companion text) and the standing status
+    // (this module's own formatting) both render, distinctly.
+    expect(screen.getByText("matches 2 of 4 prototypes generated for 'Research'")).toBeInTheDocument();
+    expect(screen.getByText(/3 prototypes · updated .* from 12 pages/)).toBeInTheDocument();
+  });
+
+  it('renders nothing extra when no status is known for the matched workstream', () => {
+    render(
+      <GuessLanes
+        lanes={prototypeLanePopulated}
+        workstreams={workstreams}
+        prototypeStatusByWorkstream={new Map()}
+      />,
+    );
+    fireEvent.click(screen.getByText(/Guess lanes/u));
+    expect(screen.getByText("matches 2 of 4 prototypes generated for 'Research'")).toBeInTheDocument();
+    expect(screen.queryByText(/prototypes · updated/)).toBeNull();
+  });
+
+  it('renders exactly as before (no extra line) when prototypeStatusByWorkstream is omitted', () => {
+    render(<GuessLanes lanes={prototypeLanePopulated} workstreams={workstreams} />);
+    fireEvent.click(screen.getByText(/Guess lanes/u));
+    expect(screen.getByText("matches 2 of 4 prototypes generated for 'Research'")).toBeInTheDocument();
+    expect(screen.queryByText(/prototypes · updated/)).toBeNull();
+  });
+});

@@ -47,6 +47,30 @@ export interface TabSessionPageEvidenceSummary {
   readonly vector?: TabSessionPageEvidenceVectorSummary;
 }
 
+// Multi-membership UI-visibility phase (docs/plans/2026-08-16-category-
+// flexibility-hyde.md — companion PR #376 shipped the write paths and the
+// `workstream.membership.set`/`.removed` fold; this is the read shape the
+// panel renders as chips). A row's `role` is 'primary' only for a subject's
+// SINGLE most-recent primary SET (fold-time invariant, mirrored from the
+// companion's `foldWorkstreamMembership`) — everything else is
+// 'secondary'. IMPORTANT: today `currentAttribution` (the pre-existing
+// single-primary field above) and `memberships` are two INDEPENDENT
+// sources until a one-time backfill runs — a page filed via the older
+// `/attribute` route will show a `currentAttribution` but may have ZERO
+// rows here. Readers must treat `currentAttribution` as the authoritative
+// primary and render `memberships` only for chips ADDITIONAL to it (filter
+// out any row whose workstreamId already equals the primary's).
+export const MEMBERSHIP_ROLES = ['primary', 'secondary'] as const;
+export type MembershipRole = (typeof MEMBERSHIP_ROLES)[number];
+
+export interface UrlMembershipRow {
+  readonly workstreamId: string;
+  readonly role: MembershipRole;
+  readonly provenance: string;
+  readonly acceptedAtMs: number;
+  readonly sourceOpportunityId?: string;
+}
+
 export interface TabSessionRecord {
   readonly tabSessionId: string;
   readonly openedAt: string;
@@ -61,6 +85,7 @@ export interface TabSessionRecord {
   readonly currentIgnored?: TabSessionIgnoredState;
   readonly attributionHistory: readonly TabSessionAttribution[];
   readonly pageEvidence?: TabSessionPageEvidenceSummary;
+  readonly memberships?: readonly UrlMembershipRow[];
 }
 
 export interface TabSessionProjection {
@@ -118,7 +143,10 @@ export type GuessLane =
   | 'content'
   // Lane 8 — the AI lane: the same query-time retrieval as 'content', asked
   // with the on-device gist ALONE. Present only when a gist exists.
-  | 'ai';
+  | 'ai'
+  // Lane 9 — the prototype lane: cosine match against offline-generated
+  // workstream prototypes (Apple FM, PR #377). Observe-only disclosure.
+  | 'prototype';
 
 export interface GuessLaneCandidate {
   readonly workstreamId: string;
@@ -254,6 +282,7 @@ export interface UrlVisitRecord {
   readonly currentIgnored?: UrlIgnoredState;
   readonly attributionHistory: readonly UrlAttribution[];
   readonly pageEvidence?: TabSessionPageEvidenceSummary;
+  readonly memberships?: readonly UrlMembershipRow[];
 }
 
 export interface UrlProjection {
@@ -319,6 +348,10 @@ const VALID_LANES: ReadonlySet<GuessLane> = new Set<GuessLane>([
   // trace of the loss. Every lane added to the GuessLane union MUST be added
   // here in the same change.
   'ai',
+  // Lane 9 — 'prototype' (PR #377). The companion disclosed this lane for a
+  // build before it was added here, and the panel silently dropped it —
+  // the exact 'ai'-lane failure mode the comment above documents.
+  'prototype',
 ]);
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>

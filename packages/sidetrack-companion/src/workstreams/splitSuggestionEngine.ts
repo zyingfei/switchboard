@@ -419,6 +419,12 @@ export const recomputeSuggestionCandidates = (
           keywordNameFor(sortedMembers, keywordsById) ?? structuralNameFor(sortedMembers, titleById),
         createdAtMs: matched?.createdAtMs ?? now,
         updatedAtMs: now,
+        // Decline memory is sticky across recomputes, matched the same
+        // Jaccard-overlap way `consecutiveStableCount`/`createdAtMs` carry
+        // forward — a user who declined this cluster must not see it
+        // resurface just because the next recompute re-fingerprints it.
+        dismissed: matched?.dismissed ?? false,
+        dismissedAtMs: matched?.dismissedAtMs ?? null,
       };
       freshCandidates.push(record);
       if (emitted && !wasEmitted) newlyEmitted.push(record);

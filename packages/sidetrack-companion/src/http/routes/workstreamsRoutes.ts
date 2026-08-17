@@ -9,13 +9,24 @@ import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 
 import { defaultAllowedTools, readTrust, writeTrust } from '../../auth/workstreamTrust.js';
+import { appleFmStatus } from '../../enrichment/appleFmEngine.js';
+import { loadGistLookup } from '../../enrichment/contentEnrichment.js';
 import { scanVaultForLinkedNotes } from '../../vault/linkback.js';
 import { WorkstreamHasChildrenError } from '../../vault/writer.js';
-import { WORKSTREAM_DELETED, WORKSTREAM_UPSERTED } from '../../workstreams/events.js';
+import { WORKSTREAM_DELETED, WORKSTREAM_PROTOTYPE_GENERATED, WORKSTREAM_UPSERTED } from '../../workstreams/events.js';
 import { projectWorkstream } from '../../workstreams/projection.js';
+import { foldLatestPrototypeGenerations } from '../../workstreams/prototypeGeneration.js';
+import { gatherWorkstreamEvidence, workstreamEvidenceLanguage, type WorkstreamEvidenceItem } from '../../workstreams/prototypeEvidence.js';
+import { computeWorkstreamPrototypeStatus } from '../../workstreams/prototypeStatus.js';
+import {
+  createSuggestionCandidateStore,
+  NEW_CATEGORY_SCOPE_ID,
+  SUGGESTION_CANDIDATE_KINDS,
+  type SuggestionCandidateKind,
+} from '../../workstreams/suggestionCandidateStore.js';
 import { workstreamCreateSchema, workstreamExportSchema, workstreamTrustPutSchema, workstreamUpdateSchema } from '../schemas.js';
 
-import { HttpRouteError, readAggregateEventsServeStale, ROUTE_CACHE_TTL_MS, mutationResponse, readBody, readEventsFromStoreOrLog, readVaultMarkdown, requireVaultRoot, requireWorkstreamTrust, routeCache, routeInFlight } from '../routeSupport.js';
+import { HttpRouteError, objectRecord, readAggregateEventsServeStale, ROUTE_CACHE_TTL_MS, mutationResponse, readBody, readEventsFromStoreOrLog, readVaultMarkdown, requireVaultRoot, requireWorkstreamTrust, routeCache, routeInFlight } from '../routeSupport.js';
 import type { RouteDefinition } from '../routeSupport.js';
 
 const cachedRoute = async (
@@ -373,6 +384,174 @@ export const workstreamsRoutes: readonly RouteDefinition[] = [
       }
       const notes = await scanVaultForLinkedNotes(context.vaultRoot);
       return [200, { items: notes.filter((note) => note.workstreamId === match.workstreamId) }];
+    },
+  },
+  // UI-visibility phase (docs/plans/2026-08-16-category-flexibility-hyde.md,
+  // "very little visibility about how hyDE works") — per-workstream
+  // prototype-lane status, read-only. NO new computation: folds the SAME
+  // WORKSTREAM_PROTOTYPE_GENERATED events prototypeGeneration.ts's own
+  // background tick already writes, joined against the SAME evidence
+  // gatherer + Apple FM probe that tick already calls. Every workstream
+  // that either has current evidence or has ever generated is included, so
+  // a workstream that fell below the floor after prototypes were deleted
+  // (impossible today, but future-proof) still reports honestly.
+  {
+    method: 'GET',
+    pattern: /^\/v1\/workstreams\/prototypes\/status$/,
+    authRequired: true,
+    handle: async (_request, _requestId, _match, context) => {
+      if (context.eventLog === undefined) {
+        throw new HttpRouteError(
+          503,
+          'EVENT_LOG_UNAVAILABLE',
+          'Event log is not configured on this companion.',
+        );
+      }
+      const eventLog = context.eventLog;
+      const evidenceByWorkstream =
+        context.connectionsStore === undefined
+          ? new Map<string, readonly WorkstreamEvidenceItem[]>()
+          : await gatherWorkstreamEvidence(
+              context.connectionsStore,
+              await loadGistLookup(requireVaultRoot(context), eventLog).catch(() => null),
+            ).catch(() => new Map<string, readonly WorkstreamEvidenceItem[]>());
+      const generationEvents = await readEventsFromStoreOrLog(
+        context,
+        eventLog,
+        (event) => event.type === WORKSTREAM_PROTOTYPE_GENERATED,
+        [WORKSTREAM_PROTOTYPE_GENERATED],
+      );
+      const lastByWorkstream = foldLatestPrototypeGenerations(generationEvents);
+      const appleFm = await appleFmStatus().catch(() => undefined);
+      const workstreamIds = new Set([...evidenceByWorkstream.keys(), ...lastByWorkstream.keys()]);
+      const statuses = [...workstreamIds]
+        .sort()
+        .map((workstreamId) => {
+          const items = evidenceByWorkstream.get(workstreamId) ?? [];
+          return computeWorkstreamPrototypeStatus(
+            workstreamId,
+            items.length,
+            workstreamEvidenceLanguage(items) === 'en',
+            lastByWorkstream.get(workstreamId),
+            appleFm,
+          );
+        });
+      return [200, { data: { statuses } }];
+    },
+  },
+  // Split / new-category suggestion read surface (design doc §4) — ONE
+  // route for BOTH kinds the store already discriminates
+  // (`suggestionCandidateStore.ts`'s `kind: 'split' | 'new-category'`, PR
+  // #376), so a caller doesn't need to know the internal `__unfiled__`
+  // scope sentinel: `kind=split` requires `workstreamId` (the scope IS
+  // that workstream's own evidence); `kind=new-category` ignores
+  // `workstreamId` and always reads the fixed unfiled-pool scope. Only
+  // candidates that are BOTH `emitted` (stability-gated) AND not
+  // `dismissed` (declined) are ever returned — never a still-forming or
+  // declined one. The engine (splitSuggestionEngine.ts) is wired and
+  // tested but not yet fed live evidence in production — see PR #376's
+  // landing note §8 — so this route HONESTLY returns an empty array until
+  // a future recompute pass populates the store; it is a real read
+  // surface, not a placeholder, and starts working the moment that
+  // recompute is wired in.
+  {
+    method: 'GET',
+    pattern: /^\/v1\/workstreams\/suggestions$/,
+    authRequired: true,
+    handle: async (request, _requestId, _match, context) => {
+      const url = new URL(request.url ?? '/v1/workstreams/suggestions', 'http://internal');
+      const rawKind = url.searchParams.get('kind');
+      if (!(SUGGESTION_CANDIDATE_KINDS as readonly string[]).includes(rawKind ?? '')) {
+        throw new HttpRouteError(
+          400,
+          'VALIDATION_ERROR',
+          'Validation failed.',
+          `kind query param must be one of ${SUGGESTION_CANDIDATE_KINDS.join(', ')}.`,
+        );
+      }
+      const kind = rawKind as SuggestionCandidateKind;
+      const workstreamId = url.searchParams.get('workstreamId') ?? undefined;
+      if (kind === 'split' && (workstreamId === undefined || workstreamId.length === 0)) {
+        throw new HttpRouteError(
+          400,
+          'VALIDATION_ERROR',
+          'Validation failed.',
+          'workstreamId query param is required when kind=split.',
+        );
+      }
+      const scopeId = kind === 'new-category' ? NEW_CATEGORY_SCOPE_ID : (workstreamId as string);
+      const store = await createSuggestionCandidateStore(requireVaultRoot(context));
+      try {
+        const candidates = store
+          .candidatesFor(scopeId, kind)
+          .filter((candidate) => candidate.emitted && !candidate.dismissed)
+          .slice()
+          .sort((a, b) => b.updatedAtMs - a.updatedAtMs)
+          .map((candidate) => ({
+            kind,
+            scopeId: candidate.scopeId,
+            fingerprint: candidate.fingerprint,
+            memberIds: candidate.memberIds,
+            memberCount: candidate.memberIds.length,
+            suggestedName: candidate.structuralName,
+            updatedAt: candidate.updatedAtMs,
+          }));
+        return [200, { data: { candidates } }];
+      } finally {
+        store.close();
+      }
+    },
+  },
+  // Decline a split/new-category suggestion candidate — the whole-cluster
+  // counterpart to the per-URL `POST /v1/visits/:url/suggestions/decline`
+  // (PR #376): that route declines "this URL into this EXISTING
+  // workstream"; this one declines "this proposed NEW grouping, which has
+  // no workstream yet." Sticky (`dismissCandidate`) — the same fingerprint
+  // never resurfaces even across future recomputes, matching the "per-
+  // scope decline memory means it never recurs" requirement for the other
+  // suggestion surfaces in this feature.
+  {
+    method: 'POST',
+    pattern: /^\/v1\/workstreams\/suggestions\/decline$/,
+    authRequired: true,
+    handle: async (request, _requestId, _match, context) => {
+      const body = objectRecord(await readBody(request));
+      const rawKind = body?.['kind'];
+      if (!(SUGGESTION_CANDIDATE_KINDS as readonly string[]).includes(rawKind as string)) {
+        throw new HttpRouteError(
+          400,
+          'VALIDATION_ERROR',
+          'Validation failed.',
+          `Body must contain kind as one of ${SUGGESTION_CANDIDATE_KINDS.join(', ')}.`,
+        );
+      }
+      const kind = rawKind as SuggestionCandidateKind;
+      const fingerprint = body?.['fingerprint'];
+      if (typeof fingerprint !== 'string' || fingerprint.length === 0) {
+        throw new HttpRouteError(
+          400,
+          'VALIDATION_ERROR',
+          'Validation failed.',
+          'Body must contain fingerprint as a non-empty string.',
+        );
+      }
+      const workstreamId = body?.['workstreamId'];
+      if (kind === 'split' && (typeof workstreamId !== 'string' || workstreamId.length === 0)) {
+        throw new HttpRouteError(
+          400,
+          'VALIDATION_ERROR',
+          'Validation failed.',
+          'Body must contain workstreamId as a non-empty string when kind is "split".',
+        );
+      }
+      const scopeId = kind === 'new-category' ? NEW_CATEGORY_SCOPE_ID : (workstreamId as string);
+      const store = await createSuggestionCandidateStore(requireVaultRoot(context));
+      try {
+        const dismissed = store.dismissCandidate(scopeId, kind, fingerprint, Date.now());
+        return [201, { data: { dismissed } }];
+      } finally {
+        store.close();
+      }
     },
   },
 ];

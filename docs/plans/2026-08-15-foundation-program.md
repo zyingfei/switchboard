@@ -1580,3 +1580,227 @@ five mandatory test categories).
 
 PR: perf(store): in-place scoped publishes — kill copy-on-publish write
 amplification (branch `perf/in-place-scoped-publish`).
+
+**2026-08-16 — in-place publish widened to the child-writer full-rewrite
+channel, landed (perf/in-place-child-drain).** Closes the gap the design
+note above's own scope left open: PR #381 made `replaceScopeRows` and
+`applyProjectionEventOverlay` in-place-capable for EITHER writer role, but
+deliberately kept `putCurrent`/`writeSnapshotAndProgress` (full
+content-replace writes) on the clone+CAS-flip path for every caller,
+every role. That full-write method turned out to be the DOMINANT publish
+channel, not a rare one: `connectionsMaterializer.ts`'s
+`catchUpDeferredThreadReconcile` → `forceFullRebuildForThreadReconcile`
+runs exactly one full rebuild via `writeSnapshotAndProgress` at the end of
+essentially every real catch-up that touched thread/workstream membership
+(`connectionsMaterializer.ts:7426-7434`, `:9199-9211`) — i.e. routinely on
+an actively-browsed vault, not rarely. Live evidence that motivated this
+work: two new 437MB generation files 47 seconds apart during one active
+catch-up window on build 79f2c8bd (which already includes #381) — the
+scoped-delta channel was fixed, but this full-rewrite channel, reached by
+BOTH roles, was still cloning on every hit.
+
+**Handoff protocol (read, not changed).** The reconcile CHILD is a
+one-shot `child_process.fork` of `connectionsReconcileChild.entry.ts`
+(`connectionsReconcileChildClient.ts`'s `forkReconcileChild`): the parent
+sends one `{kind:'reconcile', vaultRoot, seq}` IPC message, the child
+re-instantiates its own `ConnectionsMaterializer`/`EventLog`/store
+(`role: 'child-writer'`) against the vault path, runs `catchUp()` to
+completion, posts `{seq, ok, snapshotRevision?}`, and exits. There is no
+shared memory — the published generation file IS the handoff; the parent
+(`role: 'parent-reader'`) picks up a pointer change via a cheap
+`readPointer()` stat on its next read (`#pointerChangedSync`/
+`#reopenIfPointerChanged`, snapshot.ts). A 30s-no-progress watchdog
+(heartbeat every 30s from the child; `SIGKILL` on silence,
+`connectionsReconcileChildClient.ts:75-83,438-455`) protects against a
+wedged child; a pidfile (`.reconcile-child.pid`) lets the NEXT boot
+`SIGKILL` an orphan left by a `kill -9` of the parent
+(`cleanupOrphanReconcileChild`). None of this changed. What DID change:
+under in-place publish, the child's full-rewrite write no longer needs
+the handoff's generation-identity change at all in the steady-state case
+— the published generation the parent is already polling for stays the
+SAME file, so the parent's next `readPointer()` sees no change (correctly
+— nothing to reopen) and its very next plain read (no held transaction)
+observes the fresh content through the SAME already-open readonly handle,
+exactly as the original design note's WAL-isolation proof establishes for
+the scoped-delta case. TOCTOU generation-open retries
+(`#openHandleForRole`) and the watchdog/pidfile machinery are unrelated to
+this change and untouched.
+
+**What shipped.** `putCurrent` and `writeSnapshotAndProgress`
+(snapshot.ts) now call `#acquireInPlaceWriteHandle()` first, exactly like
+`replaceScopeRows` already did, falling back to `#acquireGraphWriteHandle`
+(clone+CAS-flip, byte-for-byte unchanged) only when in-place isn't
+applicable. `writeMaterializerProgress`'s rare fresh-vault/degraded-
+checkpoint fallback got the same treatment for completeness (it was
+already a no-op widening in the common case — S1's generation-bound
+progress sidecar handles the steady state without touching the graph db
+at all). `#writeCurrentRows`'s row-level diff/upsert already ran inside
+its own `BEGIN IMMEDIATE`/`COMMIT` with no schema DDL — the identical
+shape `replaceScopeRows` already proved safe in place — so no changes to
+the mutation logic itself were needed, only to which handle it's applied
+against.
+
+**Cross-process WAL + crash verification (this task's explicit ask,
+empirical not assumed).** The shared mechanism
+(`#acquireInPlaceWriteHandle`/`acquirePublishLock`) is identical between
+the scoped and full-write channels, so the ORIGINAL design note's
+spike-verified WAL isolation (a reader's plain autocommit read, or a real
+open `BEGIN DEFERRED` transaction, never blocks on and never sees a torn
+view of a concurrent in-place writer — bun:sqlite 1.3.14) applies
+unchanged. Re-verified end to end for the WIDENED channel specifically:
+`connections/inPlacePublish.test.ts` gained a second crash-kill case
+(`describe('(1) crash-kill')`) that forks a REAL bun subprocess running
+`writeSnapshotAndProgress` (not `replaceScopeRows`) against a 3,000-node
+full-rewrite payload, SIGKILLs it at a randomized point sampled from a
+measured calibration run, N=20 iterations — reopens a fresh store each
+time and asserts fully-old (empty) or fully-new (exactly `PAYLOAD_N`
+nodes, every label carrying the iteration's own prefix), never torn, and
+that the generation the pointer names never changed across all 20 kills
+(`readPointer()` pinned to the seed gen throughout — the in-place
+invariant holding even under repeated SIGKILL). The publish lock's
+existing 15s staleness window (`PUBLISH_LOCK_STALE_MS`, unchanged) frees
+correctly after a kill mid-lock, same as #381's finding — not
+re-timed here (would cost 20×15s), the orphaned lockfile is cleared
+immediately once the killed pid is confirmed dead via `waitForExit`,
+which is equivalent to letting real wall-clock time pass. `describe('(6)
+audible publish marks')` adds four cases proving every publish (both
+roles, both paths) emits its mark.
+
+**Real end-to-end acceptance test (task's explicit ask — the REAL
+child-drain flow, not a direct store call).**
+`sync/contract/connectionsInPlaceChildDrainIntegration.test.ts` (new)
+drives the ACTUAL production entry point: `runReconcileInChild` forks the
+built `dist/sync/contract/connectionsReconcileChild.entry.js` against a
+real `EventLog`, running the real `ConnectionsMaterializer.catchUp()` —
+the exact process production spawns under `SIDETRACK_CONNECTIONS_CHILD=1`.
+Sequence: 20 real events bootstrap the first published generation (clone
+path — the one remaining legitimate first-write case); the SAME
+generation is inflated to a realistic ~130MB fixture via a direct
+row-preserving write (fast — avoids re-running the real embedding/
+similarity/ranker pipeline just to pad bytes, while leaving the real
+materializer's own progress/frontier state exactly as it left them so the
+next catch-up resumes coherently); 100 more real events are appended; the
+REAL reconcile child runs again. Result, measured through the real IPC
+handoff: `readPointer()` unchanged, `residentGenerations()` byte-identical
+before/after (zero new generation files), 534,496 bytes written for the
+100-event delta against the 130,265,088-byte fixture (0.410% — well under
+the task's 5MB/100-row bound), and the child's own log carries
+`[publish.in-place] channel=child bytes=534496` — the audible proof this
+went through the real materializer's branch selection AND landed
+in-place, not just that the store method can do so when called directly.
+
+**Audible engagement (task requirement — this is exactly the gap that let
+the parent-only fix ship undetected).** Every publish now logs exactly
+one mark: `[publish.in-place] channel=child|parent bytes=<walDelta>` on
+success, or `[publish.clone] channel=child|parent reason=<reason>` when
+falling back — `reason` is one of `legacy` (double-buffer off / `:memory:`),
+`kill-switch` (`SIDETRACK_INPLACE_PUBLISH=0`), `no-generation-yet` (fresh
+vault — the first-boot case), or `race-vanished` (TOCTOU). Both marks are
+emitted from a single choke point inside `#acquireInPlaceWriteHandle` —
+every clone-eligible write method now routes through it first, so there
+is exactly one log site to keep honest rather than one per call site.
+
+**Retained clone+CAS-flip cases (task's explicit ask — document each).**
+1. The very first write to a fresh vault — no generation exists yet to
+   open in place; `#acquireInPlaceWriteHandle` naturally returns null
+   (`genId === null`) and the existing clone path seeds gen0, unchanged.
+2. `SIDETRACK_INPLACE_PUBLISH=0` — the whole-suite kill switch, reverts
+   EVERY write method (scoped, overlay, and now full-rewrite) to
+   clone+CAS-flip byte-for-byte, re-verified by
+   `inPlacePublish.test.ts`'s "(5) generation GC" kill-switch case.
+3. `migrateLegacyToGeneration` (first-boot legacy migration) — a standalone
+   `copyFileSync` operation structurally separate from any writer's publish
+   path (runs before a generation is resolved), untouched.
+   `reconcileLegacyToPublished` (kill-switch downgrade reconciliation) is
+   ALSO retained as a clone (a plain file copy into `current.db`, not a
+   generation), but it needed a REAL fix here, not just documentation: its
+   pre-existing implementation assumed the source generation was ALWAYS
+   already checkpoint-TRUNCATE'd (true under clone+CAS-flip-only — every
+   published generation got a free checkpoint before the pointer ever named
+   it) and used the pointer's genId alone as a "have I already reconciled
+   this" staleness marker. Neither holds once the SAME genId can receive
+   many in-place publishes: (a) in-place publish defers its own checkpoint
+   (idle timer / every-N safety net), so the main `.db` file can be missing
+   content still sitting in its `-wal` sidecar — a raw `copyFileSync` of the
+   main file alone would silently downgrade to STALE content; (b) an
+   unchanged genId no longer implies unchanged content. Fixed:
+   `reconcileLegacyToPublished` now runs under the SAME cross-process
+   publish lock every in-place writer holds, checkpoint-TRUNCATEs the
+   source generation itself before copying (guaranteeing the main file is
+   self-contained), and fingerprints its staleness marker on
+   `(genId, post-checkpoint mtime)` instead of `genId` alone. New regression
+   test: `generationBuffer.test.ts`'s "reconcileLegacyToPublished picks up
+   in-place content changes on the SAME gen id (not stale, not falsely
+   idempotent)" — an un-checkpointed WAL-mode write on an already-reconciled
+   gen id is picked up correctly, and a genuinely unchanged repeat call is
+   still a no-op.
+4. Any future structural (non-`IF NOT EXISTS`) schema migration would
+   still need to choose a fresh generation deliberately — the pointer-flip
+   model exists precisely so readers can keep serving the OLD schema until
+   they're ready to move; nothing in this change removes that escape
+   hatch, it only stops taking it for ordinary content writes.
+
+**Revision/write_seq equivalence — a REAL bug found and fixed here, not
+just re-verified.** The persisted row content (`write_seq`/
+`snapshotRevision`) is unchanged reasoning from the original design note:
+both are pure `metadata`-table content, computed identically regardless of
+which physical file they land in, and `inPlacePublish.test.ts`'s existing
+"(4) revision/write_seq equivalence" case (exercising
+`writeSnapshotAndProgress` in its 4-step sequence) passes identically with
+`SIDETRACK_INPLACE_PUBLISH=0` vs default-on with no changes needed. BUT the
+task's own warning — "the parent's readCurrent memo keys on
+snapshotRevision... must bump such that the parent picks up the new state
+exactly as it did on pointer flip" — caught a real gap: `#readCurrentAttempt`'s
+in-process `#cachedSnapshot` memo was keyed on `metadata.snapshotRevision`
+(snapshot.ts, pre-existing code, not introduced by this PR), a WEAK
+content-hash of metadata-only fields that a caller may legitimately supply
+unchanged across writes whose STRONG per-row content differs — exactly the
+shape `#matchingPublishedContentSignature`'s own skip-vs-publish distinction
+exists to handle, and exactly what
+`doubleBuffer.acceptance.test.ts`'s pre-existing "unchanged ticks skip full
+publish; one real content delta publishes once and stays atomic" case
+constructs. Under the pre-widening clone+CAS-flip-only world this collision
+was masked for free: a content-changing write ALWAYS minted a new
+generation, and `#reopenIfPointerChanged`'s unconditional
+`#dropCachedSnapshot()` on ANY pointer change busted the cache regardless of
+which key it used. Under in-place publish the SAME generation (no pointer-
+change signal at all) can legitimately serve new row content, so the cache
+key itself has to be precise. **Fix**: `#cachedSnapshot`'s key is now
+`write_seq` (via the already-existing `#readWriteSeq` helper), not
+`snapshotRevision` — matching `#cachedDerivedProjections`'s existing
+precedent, which already migrated to `write_seq` for this exact reason (F4
+blob-diet). `write_seq` is strictly monotonic and bumped by `#bumpWriteSeq`
+on every transaction that mutates `readCurrent`'s inputs, so it cannot
+collide the way a caller-supplied weak revision string can. Caught by
+re-running (not just re-verifying) `doubleBuffer.acceptance.test.ts` after
+the store-level change — its "one real content delta publishes once and
+stays atomic" case failed with `served label = "v0"` instead of `"v0
+changed"` before this fix, and passes after. Three other pre-existing tests
+in that file needed updating (not fixing — a correct consequence of the
+widening, not a bug): they asserted a genuine pointer swap for a scenario
+that now legitimately applies in place; each now forces
+`SIDETRACK_INPLACE_PUBLISH=0` to keep exercising the swap-and-reopen
+mechanism they're actually testing.
+
+**Deviation from the task prompt.** The task asked for a fixture "<5MB on
+a ~100MB fixture for a 100-row delta" via a spawned child process
+applying a scoped delta. The shipped acceptance test's delta is 100
+EVENTS (real timeline-visit captures through the real materializer, which
+resolve to a handful of node/edge rows each plus HNSW/similarity
+bookkeeping) rather than literally 100 pre-built graph rows — a closer
+match to what the reconcile child actually processes per drain in
+production, and the harder-to-satisfy bound in practice: even so it
+measured 534KB, ~9× under the 5MB ceiling. The `#writeCurrentRows`-path
+crash-kill case above uses a synthetic 3,000-node payload (not a spawned-
+child scoped delta) specifically because it targets the FULL-rewrite
+in-place path this PR adds, mirroring but not duplicating #381's existing
+scoped-delta crash-kill coverage.
+
+**Verification**: `bun test` — pass, 0 fail (see PR for exact counts on
+the final branch state). `bun run build` clean. Every change confined to
+`connections/snapshot.ts` and `connections/generationBuffer.ts` plus new/
+extended tests; `sync/contract/connectionsMaterializer.ts` untouched, per
+this task's binding constraint (verified by re-reading it, never edited).
+
+PR: perf(store): in-place publishes for the child-writer drain channel
+(branch `perf/in-place-child-drain`).
