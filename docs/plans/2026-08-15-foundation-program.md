@@ -2069,3 +2069,129 @@ writes).
 
 PR: perf(store): diff-aware putCurrent — O(changed-rows) WAL writes per
 publish (branch `perf/diff-aware-putcurrent`).
+
+**2026-08-17 — resolver acceptance harness + 64-bit EC digest +
+candidate-window truncation mark (test/resolver-acceptance-harness).**
+Task #32, three parts; closure evidence for task #24 (the week's resolver
+work: hub-subgraph budgets 08-16 above, event-candidate-resolve indexing,
+resolver-cache F3/F4 keying).
+
+*EC-digest widening.* `eventCandidateCacheRevision`'s `stableHash`
+(http/routes/visitsRoutes.ts) was a single-pass 32-bit FNV-1a — the SOLE
+cache identity for the folded event-candidate URL set, so a 32-bit
+collision was a silent WRONG cache hit, not just a slow miss. Widened to
+64-bit: two independent 32-bit FNV-1a passes (same prime, two different,
+unrelated offset-basis seeds) concatenated into 16 lowercase hex chars.
+Still dependency-free (no crypto import), still deterministic, still
+order-/duplicate-invariant on the URL set (unchanged upstream sort+dedup).
+No migration: old rows keyed under the prior 8-char digest simply miss
+once — the revision string is a different length for the same logical
+input, so it can never collide with a new-format key — and the miss
+re-populates the cache under the new key on the next read.
+
+*Candidate-window truncation mark.* The bounded
+`SIDETRACK_RESOLVER_CANDIDATE_TIMELINE_WINDOW` read
+(`timelineEventsForCandidateGeneration`, http/server.ts) silently dropped
+everything past the window with zero signal. Added a throttled (30s,
+mirrors `[resolver.subgraph.truncated]`'s window) `console.warn`:
+`[resolver.candidate-window.truncated] url=… window=N`, firing when the
+read returns exactly `window` rows (the same "hit the cap" proxy a LIMIT
+query allows without a second COUNT query on the hot path). `url=` carries
+the batch's missed event-candidate targets (capped to 3 + a "+N more"
+suffix) since this read serves a whole batch, not one seed. Both changes
+stayed out of `connections/snapshot.ts` per this task's binding
+constraint — the call site threading (`missedEventCandidateTargets`
+through to the read) lives entirely in `http/server.ts`.
+
+*Acceptance harness* (the substance) —
+`packages/sidetrack-companion/scripts/resolver-acceptance.ts`. A checked-in
+CLI, run manually (never auto-run against a live vault): copies `--vault`
+into TWO of its own working copies (APFS `cp -Rc`, falling back to `cp -R`),
+starts a real companion process on each (ephemeral port, ordinary
+`bun <file> --vault --port` on `src/cli.ts` directly — no dist/ build
+dependency, no stale-buildSha footgun), and drives real HTTP resolves
+against them. Instance A (production budgets) records a manifest (vault
+identity via streamed sha256 + size on the event-store/connections db,
+event/node/edge/candidate-url counts via direct sqlite reads, enabled
+lanes from env, machine class, bun version) then runs N cold resolves, N
+warm repeats, and M event-candidate resolves, timing every call.
+Instance B (`SIDETRACK_RESOLVER_SUBGRAPH_NODE_BUDGET` /
+`EDGE_BUDGET` / `HUB_DEGREE_CAP` / `CANDIDATE_TIMELINE_WINDOW` all `=0`,
+i.e. unlimited) resolves the same N cold-probe URLs once each on its OWN
+independent copy — decision drift is instance A's cold decision vs
+instance B's decision per URL. **Two independent copies, not one instance
+with an env flip, is load-bearing**: `resolverCacheRevision` keys on
+`(snapshotRevision, arm[, state])` only, never the structural budgets, so
+running both regimes against the same copy would let instance B silently
+serve back instance A's cached (production-budget) answer, making every
+drift comparison a false negative.
+
+Two sqlite-path discoveries worth recording (found by verifying against
+real data before trusting the numbers, not by reading the schema once):
+node/edge counts (`connections_scope_nodes`/`connections_scope_edges`) DO
+live in the generation-swapped file, so the harness resolves the active
+generation via `connections/generationBuffer.ts`'s already-exported
+`readPointer`/`generationDbPath` (read-only import, no edits to that
+file) rather than guessing a fixed path. The resolver cache does NOT: per
+`SqliteConnectionsStore`'s own D3 comment, `connections_resolver_cache`
+lives in a separate, fixed-path `resolver-cache.db`, never
+generation-swapped — an initial version of the harness pointed at the
+generation file instead (same table name exists there too, empty, from a
+different open path) and silently reported `before=0 after=0` for every
+run until cross-checked directly against both files on the real vault
+copy.
+
+*Real-vault run (closure evidence, task #24).* One run against a fresh
+`cp -Rc` clone of `~/.sidetrack-vault-test` (3.1GB; live daily+test
+companions untouched throughout, confirmed by PID before/after) to
+`/tmp`, `--cold 30 --event-candidates 10`, total wall clock 74.8s (well
+under the 10-minute budget):
+
+| class | n | p50 | p95 | p99 | max |
+|---|---|---|---|---|---|
+| cold | 30 | 207.2ms | 514.9ms | 531.8ms | 531.8ms |
+| warm | 30 | 10.7ms | 12.6ms | 23.7ms | 23.7ms |
+| eventCandidate | 10 | 590.0ms | 1074.6ms | 1074.6ms | 1074.6ms |
+
+Manifest: events=249,276 nodes=19,821 edges=113,423 candidateUrls=4,044.
+Event-loop stalls: count=2, totalBlockedMs=844, maxBlockedMs=553.
+Resolver-cache rows: before=25 after=55 (delta=30, matching 30 cold
+resolves each landing one new/updated key — the 30 warm repeats hit the
+same keys, no new rows). Truncation marks: subgraph=2, candidateWindow=0.
+**Acceptance bar: warm <300ms (10.7ms p50 — well clear) and cold <1.5s
+(207.2ms p50, 531.8ms max — well clear). Both PASS.**
+
+Decision drift: 30 compared, 2 differing (6.7%) —
+`https://news.ycombinator.com/?p=3` and a LinkedIn post permalink, both
+plausible high-fan-in hub pages. Not zero, but explained: the subgraph-
+truncation count for the same run is also 2, consistent with (not proven
+identical to, the throttled log doesn't carry per-URL identity) the
+structural budgets actually trimming these two URLs' subgraphs enough to
+flip the winning workstream — i.e. the drift measures real, non-zero cost
+from the 1200/4000/400/20k budgets landed 08-16, concentrated on hub
+pages, not a uniform tax on every resolve.
+
+*Tests.* `visitsRoutes.test.ts`: widened digest shape (16 hex chars) +
+new "two halves are independent" check; existing order-/duplicate-
+invariance and distinct-set tests pass unmodified (the folded-suffix
+helper in `http/visitsRoutes.test.ts` derives its expected suffix from the
+real function, so it never hard-coded the old 8-char width).
+`server.candidateWindowTruncation.test.ts` (new): fires on cap-hit,
+silent under cap, silent on the store-null/merged-filter path, throttled
+across two calls, and caps+summarizes the logged url list — via a minimal
+`EventStore` stub (`readMostRecentByType`/`forEachChunkOfTypes` only), no
+full HTTP scaffold needed. `scripts/resolver-acceptance.test.ts` (new):
+unit coverage for `percentile`/`latencyStatsOf`/`stratifiedSample`/
+`parseArgs`/`renderTable`, plus an end-to-end smoke test that spawns the
+real script against a tiny freshly-`mkdir`'d empty vault directory
+(0 candidate URLs — exercises the harness's own orchestration: two real
+companion boots/shutdowns, manifest building against absent tables,
+log-scanning, well-formed JSON) and asserts on the written report. Full
+`bun test` (398 files) and `npm run build` clean; one unrelated flaky fail
+on a loaded machine (`eventLog.test.ts`'s append-index-prewarm timing
+test, pre-existing, passes clean in isolation — not touched by this PR).
+`src/sync/contract/connectionsMaterializer.ts` and
+`src/connections/snapshot.ts` untouched.
+
+PR: test(resolver): acceptance harness + 64-bit ec digest + candidate-window
+truncation mark (branch `test/resolver-acceptance-harness`).
