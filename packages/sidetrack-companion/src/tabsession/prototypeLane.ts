@@ -54,6 +54,8 @@ import {
   scorePageAgainstProfile,
   type PrototypeKeywordProfile,
 } from '../workstreams/prototypeKeywordProfile.js';
+import { pageWorkstreamScore, resolveLateInteractionTopK } from '../workstreams/sentenceInteraction.js';
+import { splitPageIntoSentences } from '../workstreams/sentenceSplit.js';
 
 // ---- env flag ---------------------------------------------------------
 
@@ -142,6 +144,17 @@ export interface PrototypeLaneStore {
   }[];
   getPrototypeKeywordIdf?(): ReadonlyMap<string, number>;
   getPrototypeKeywordProfile?(workstreamId: string): PrototypeKeywordProfile | undefined;
+  /** Sentence vectors (§12) — batched read scoped to the small,
+   *  already-bounded set of prototypeIds THIS lane's own whole-vector KNN
+   *  just returned (never a full-table scan). Optional: a store/fixture
+   *  that predates §12 simply omits it, and this lane's vector side stays
+   *  on its pre-§12 pooled/whole-vector KNN score unchanged — the "keep the
+   *  single-vector path as fallback when sentence vectors are absent"
+   *  contract the design directive requires. */
+  getSentenceVectorsForOwners?(
+    ownerKind: 'page' | 'prototype',
+    ownerIds: readonly string[],
+  ): ReadonlyMap<string, readonly { readonly embedding: Float32Array }[]>;
 }
 
 export type PrototypeLaneEmbed = (text: string) => Promise<Float32Array | undefined>;
@@ -175,6 +188,10 @@ interface WorkstreamAggregate {
   vectorBest: number;
   medoidBest: number;
   generatedBest: number;
+  /** Distinct prototypeIds this workstream had a KNN hit for — the
+   *  candidate set §12's sentence-vector lookup is scoped to (never a
+   *  full-table scan; see PrototypeLaneStore.getSentenceVectorsForOwners). */
+  readonly prototypeIds: Set<string>;
 }
 
 const newAggregate = (workstreamId: string): WorkstreamAggregate => ({
@@ -183,6 +200,7 @@ const newAggregate = (workstreamId: string): WorkstreamAggregate => ({
   vectorBest: 0,
   medoidBest: 0,
   generatedBest: 0,
+  prototypeIds: new Set(),
 });
 
 export interface BuildPrototypeLaneInput {
@@ -258,7 +276,70 @@ export const buildPrototypeLane = async (
     if (sim > agg.vectorBest) agg.vectorBest = sim;
     if (hit.angle === 'medoid' && sim > agg.medoidBest) agg.medoidBest = sim;
     if (hit.angle === 'synthetic-sibling' && sim > agg.generatedBest) agg.generatedBest = sim;
+    agg.prototypeIds.add(hit.prototypeId);
     perWorkstream.set(hit.workstreamId, agg);
+  }
+
+  // ---- sentence-level late interaction (§12, "the attention of sentence
+  // matters") ---------------------------------------------------------
+  //
+  // This page's OWN sentences (title + gist, up to resolveSentenceSplitMax)
+  // are embedded HERE, at serve time — the one exception to "no serve-time
+  // embedding beyond the page's own sentences" this whole phase is scoped
+  // to (design directive item 5). The TARGET side (candidate workstreams'
+  // prototype sentence vectors) is NEVER embedded here — only read back,
+  // already persisted at prototype-generation time (workstreams/
+  // prototypeGeneration.ts), scoped to the small set of prototypeIds this
+  // lane's own whole-vector KNN already surfaced (no full-table scan).
+  //
+  // FALLBACK, EXPLICIT: a workstream with no sentence-level score computed
+  // (store predates §12, this page split to zero sentences, or none of its
+  // hit prototypes have sentence vectors yet — e.g. mid-backfill) keeps its
+  // pre-§12 pooled `vectorBest` score, completely unchanged. Sentence-level
+  // scoring only ever REPLACES the vector component when both sides
+  // genuinely have sentence vectors to compare.
+  const sentenceScoreByWorkstream = new Map<string, number>();
+  if (input.store.getSentenceVectorsForOwners !== undefined && input.embed !== undefined) {
+    const pageSentences = splitPageIntoSentences(input.title, gist);
+    if (pageSentences.length > 0) {
+      const embed = input.embed;
+      const embedded = await Promise.all(
+        pageSentences.map(async (sentence) => {
+          try {
+            return await embed(sentence.text);
+          } catch {
+            return undefined;
+          }
+        }),
+      );
+      const pageSentenceVectors = embedded.filter((v): v is Float32Array => v !== undefined);
+      if (pageSentenceVectors.length > 0) {
+        const candidatePrototypeIds = [...new Set(hits.map((hit) => hit.prototypeId))];
+        let sentenceRowsByPrototype: ReadonlyMap<string, readonly { readonly embedding: Float32Array }[]>;
+        try {
+          sentenceRowsByPrototype = input.store.getSentenceVectorsForOwners('prototype', candidatePrototypeIds);
+        } catch {
+          sentenceRowsByPrototype = new Map();
+        }
+        if (sentenceRowsByPrototype.size > 0) {
+          const topK = resolveLateInteractionTopK();
+          for (const [workstreamId, agg] of perWorkstream) {
+            const targetVectors: Float32Array[] = [];
+            for (const prototypeId of agg.prototypeIds) {
+              const rows = sentenceRowsByPrototype.get(prototypeId);
+              if (rows === undefined) continue;
+              for (const row of rows) targetVectors.push(row.embedding);
+            }
+            if (targetVectors.length > 0) {
+              sentenceScoreByWorkstream.set(
+                workstreamId,
+                pageWorkstreamScore(pageSentenceVectors, targetVectors, topK),
+              );
+            }
+          }
+        }
+      }
+    }
   }
 
   // ---- keyword-profile blend (v2 §11) -----------------------------------
@@ -282,25 +363,30 @@ export const buildPrototypeLane = async (
   const blendedByWorkstream = new Map<string, number>();
   for (const [workstreamId, agg] of perWorkstream) {
     const keywordResult = keywordScoreByWorkstream.get(workstreamId);
+    // §12 — sentence-level score REPLACES the pooled vector score when
+    // available for this workstream; otherwise the pre-§12 pooled
+    // `vectorBest` is used unchanged (the documented fallback).
+    const vectorComponent = sentenceScoreByWorkstream.get(workstreamId) ?? agg.vectorBest;
     blendedByWorkstream.set(
       workstreamId,
-      blendVectorAndKeywordScore(agg.vectorBest, keywordResult?.score ?? 0, keywordWeight),
+      blendVectorAndKeywordScore(vectorComponent, keywordResult?.score ?? 0, keywordWeight),
     );
   }
 
-  // ---- per-source prequential (v2 §11) — measurement, not disclosure ----
+  // ---- per-source prequential (v2 §11 + §12) — measurement, not
+  // disclosure ----
   // Fires regardless of the contrast-margin outcome below: an honest-empty
   // disclosure to the user does not mean each SOURCE has nothing to say —
   // the whole point of measuring per-source precision is to find out
-  // whether medoid/generated/keyword alone would have been right, even on
-  // pages where the BLEND was too close to call. AWAITED (not fire-and-
-  // forget like server.ts's batch-level recordLanePredictions): this write
-  // is one small local JSONL append (a few dozen bytes, one syscall), not a
-  // network call or another KNN query — cheap enough that correctness
-  // (never losing a measurement row to a process-exit race) outweighs the
-  // sub-millisecond latency add. Never throws (recordPerSourcePredictions
-  // catches internally).
-  await recordPerSourcePredictions(input, perWorkstream, keywordScoreByWorkstream);
+  // whether medoid/generated/keyword/sentence/pooled alone would have been
+  // right, even on pages where the BLEND was too close to call. AWAITED
+  // (not fire-and-forget like server.ts's batch-level
+  // recordLanePredictions): this write is one small local JSONL append (a
+  // few dozen bytes, one syscall), not a network call or another KNN query
+  // — cheap enough that correctness (never losing a measurement row to a
+  // process-exit race) outweighs the sub-millisecond latency add. Never
+  // throws (recordPerSourcePredictions catches internally).
+  await recordPerSourcePredictions(input, perWorkstream, keywordScoreByWorkstream, sentenceScoreByWorkstream);
 
   // ---- contrast-margin gate (v2 §11) ------------------------------------
   const contrastCandidates: ContrastCandidate[] = [...blendedByWorkstream.entries()].map(
@@ -318,7 +404,12 @@ export const buildPrototypeLane = async (
     // hyde.md) — plain-language `why`, not the ML term "prototype": the
     // client already shows the matched workstream's NAME beside this
     // string (guess-lane-name), so this doesn't repeat it.
-    const vectorWhy = `close to ${String(agg.count)} example${agg.count === 1 ? '' : 's'} generated for this workstream (${agg.vectorBest.toFixed(2)})`;
+    // §12 — the disclosed number reflects whichever score actually decided
+    // this candidate's rank (sentence-level when available, pooled
+    // otherwise) rather than always showing the pooled number even when a
+    // different one was used to rank it.
+    const disclosedVectorScore = sentenceScoreByWorkstream.get(c.workstreamId) ?? agg.vectorBest;
+    const vectorWhy = `close to ${String(agg.count)} example${agg.count === 1 ? '' : 's'} generated for this workstream (${disclosedVectorScore.toFixed(2)})`;
     const keywordWhy =
       keywordResult === undefined
         ? null
@@ -335,27 +426,34 @@ export const buildPrototypeLane = async (
 
 /**
  * Best-effort per-source predictions — the measurement that lets a future
- * promotion decide the medoid/generated/keyword blend by PRECISION, not
- * judgment (the brief's explicit requirement, §11 item 4). Reuses
+ * promotion decide the medoid/generated/keyword/sentence/pooled blend by
+ * PRECISION, not judgment (§11 item 4, extended by §12 item 4: "extend the
+ * existing prequential per-source tagging with 'sentence' vs 'pooled'
+ * provenance, same idiom as medoid|generated|keyword"). Reuses
  * lanePrequential.ts's generic raw-record writer (bypasses the GuessLane
- * wire-contract union entirely — these three composite ids are never
- * disclosed in `result.lanes`, only measured). No-op when
- * canonicalUrl/vaultRoot are absent (ready-to-splice — see this module's
- * header). Never throws (recordRawLanePredictions itself never rejects).
+ * wire-contract union entirely — these composite ids are never disclosed in
+ * `result.lanes`, only measured). No-op when canonicalUrl/vaultRoot are
+ * absent (ready-to-splice — see this module's header). Never throws
+ * (recordRawLanePredictions itself never rejects).
  */
 const recordPerSourcePredictions = async (
   input: BuildPrototypeLaneInput,
   perWorkstream: ReadonlyMap<string, WorkstreamAggregate>,
   keywordScoreByWorkstream: ReadonlyMap<string, { readonly score: number }>,
+  sentenceScoreByWorkstream: ReadonlyMap<string, number>,
 ): Promise<void> => {
   if (input.canonicalUrl === undefined || input.vaultRoot === undefined) return;
   const nowMs = Date.now();
   const records: LanePredictionRecord[] = [];
 
-  // Union of both maps — a workstream can win the KEYWORD sub-prediction
+  // Union of every map — a workstream can win the KEYWORD sub-prediction
   // with zero vector hits at all (it never entered `perWorkstream`), and
-  // the three sources must be measured independently of each other.
-  const candidateIds = new Set<string>([...perWorkstream.keys(), ...keywordScoreByWorkstream.keys()]);
+  // every source must be measured independently of every other.
+  const candidateIds = new Set<string>([
+    ...perWorkstream.keys(),
+    ...keywordScoreByWorkstream.keys(),
+    ...sentenceScoreByWorkstream.keys(),
+  ]);
 
   const pushWinner = (lane: string, scoreFor: (workstreamId: string) => number): void => {
     let bestId: string | null = null;
@@ -375,6 +473,11 @@ const recordPerSourcePredictions = async (
   pushWinner('prototype:medoid', (id) => perWorkstream.get(id)?.medoidBest ?? 0);
   pushWinner('prototype:generated', (id) => perWorkstream.get(id)?.generatedBest ?? 0);
   pushWinner('prototype:keyword', (id) => keywordScoreByWorkstream.get(id)?.score ?? 0);
+  // §12 — 'pooled' is the pre-§12 whole-vector KNN score (agg.vectorBest),
+  // renamed here from an implicit "the only vector source" to an explicit
+  // measured alternative now that 'sentence' exists to compare it against.
+  pushWinner('prototype:pooled', (id) => perWorkstream.get(id)?.vectorBest ?? 0);
+  pushWinner('prototype:sentence', (id) => sentenceScoreByWorkstream.get(id) ?? 0);
 
   if (records.length === 0) return;
   await recordRawLanePredictions(input.vaultRoot, records).catch(() => undefined);

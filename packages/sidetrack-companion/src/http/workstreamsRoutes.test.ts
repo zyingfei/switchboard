@@ -180,6 +180,8 @@ describe('workstreams routes — UI-visibility phase', () => {
             updatedAtMs: 2_000,
             dismissed: false,
             dismissedAtMs: null,
+            cohesion: 0,
+            externalBest: null,
           },
           {
             scopeId: 'ws_research',
@@ -193,6 +195,8 @@ describe('workstreams routes — UI-visibility phase', () => {
             updatedAtMs: 1_500,
             dismissed: false,
             dismissedAtMs: null,
+            cohesion: 0,
+            externalBest: null,
           },
         ]);
       } finally {
@@ -241,6 +245,8 @@ describe('workstreams routes — UI-visibility phase', () => {
             updatedAtMs: 3_000,
             dismissed: false,
             dismissedAtMs: null,
+            cohesion: 0,
+            externalBest: null,
           },
         ]);
       } finally {
@@ -319,6 +325,8 @@ describe('workstreams routes — UI-visibility phase', () => {
             updatedAtMs: 2_000,
             dismissed: false,
             dismissedAtMs: null,
+            cohesion: 0,
+            externalBest: null,
           },
         ]);
       } finally {

@@ -110,6 +110,7 @@ import { sweepOrphanGenerations } from '../connections/generationBuffer.js';
 import { schedulePrototypeGenerationLoop } from '../workstreams/prototypeGeneration.js';
 import { scheduleSuggestionRecomputeLoop } from '../workstreams/suggestionRecomputeLane.js';
 import { scheduleKeywordBackfillLoop } from '../enrichment/keywordBackfillLane.js';
+import { scheduleSentenceVectorBackfillLoop } from '../enrichment/sentenceVectorBackfillLane.js';
 import { createVaultWatcher, type VaultChangeEvent, type VaultWatcher } from '../vault/watcher.js';
 import { createVaultWriter } from '../vault/writer.js';
 import { COMPANION_VERSION } from '../version.js';
@@ -787,6 +788,21 @@ export const startCompanion = async (
     // discipline).
     const disposeKeywordBackfill = scheduleKeywordBackfillLoop(baseEventLog, options.vaultPath);
     teardown.push(disposeKeywordBackfill);
+
+    // Sentence-vector backfill (docs/plans/2026-08-16-category-flexibility-
+    // hyde.md §12 — "the attention of sentence matters"). Same non-blocking
+    // shape as the keyword backfill immediately above: opens (reuses) the
+    // shared recall-v2 store handle after a short startup delay, and the
+    // lane's own self-scheduling loop (backlog-aware fast/idle cadence)
+    // takes over from there. Env-gated (SIDETRACK_SENTENCE_BACKFILL, default
+    // ON); disposer pushed to teardown[] AND stopped explicitly pre-drain
+    // below (#374 lane-stop discipline), same as disposeKeywordBackfill.
+    const disposeSentenceVectorBackfill = scheduleSentenceVectorBackfillLoop(
+      baseEventLog,
+      connectionsStore,
+      options.vaultPath,
+    );
+    teardown.push(disposeSentenceVectorBackfill);
 
     // Reproject on startup if the projector logic has changed since
     // the last run. Writes a `_BAC/.projector-version` sentinel so
@@ -1922,6 +1938,10 @@ export const startCompanion = async (
         // discipline): a lane left ticking past close() is still a live
         // timer + live SQLite handles outliving the "shut down" process.
         disposeKeywordBackfill();
+        // Same rationale as disposeKeywordBackfill immediately above — not
+        // an event-log-appending lane, stopped explicitly anyway (#374
+        // lane-stop discipline).
+        disposeSentenceVectorBackfill();
         if (collectorFramework !== null) {
           try {
             await collectorFramework.close();

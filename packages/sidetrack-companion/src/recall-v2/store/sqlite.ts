@@ -22,6 +22,9 @@ import { RECALL_MODEL } from '../../recall/modelManifest.js';
 
 import type {
   RecallStore,
+  SentenceVectorInput,
+  SentenceVectorOwnerKind,
+  SentenceVectorRow,
   StoreDocument,
   StoreDocumentChunk,
   StoreFtsHit,
@@ -143,6 +146,28 @@ CREATE TABLE IF NOT EXISTS prototype_keyword_profile (
 );
 CREATE INDEX IF NOT EXISTS prototype_keyword_profile_workstream
   ON prototype_keyword_profile(workstream_id);
+
+-- Sentence vectors (docs/plans/2026-08-16-category-flexibility-hyde.md §12
+-- -- "the attention of sentence matters"). See store/types.ts's
+-- SentenceVectorRow header for why this is a plain JSON column rather than a
+-- second vec0 table, and why it is a NEW table rather than reusing
+-- documents_chunks (that table's owner is a docs.entity_id FK; a sentence-
+-- vector owner is a canonicalUrl for a page's gist, universal regardless of
+-- recall-v2 body-indexing coverage, or a prototypeId, which has no docs
+-- row at all). owner_kind is the additive "kind/namespace column"; the
+-- (owner_kind, owner_id, sentence_index) composite key mirrors
+-- documents_chunks' (document_entity_id, chunk_index) shape.
+CREATE TABLE IF NOT EXISTS sentence_vectors (
+  owner_kind      TEXT NOT NULL,
+  owner_id        TEXT NOT NULL,
+  sentence_index  INTEGER NOT NULL,
+  source          TEXT NOT NULL,
+  text            TEXT NOT NULL,
+  embedding_json  TEXT NOT NULL,
+  created_at      INTEGER NOT NULL,
+  PRIMARY KEY (owner_kind, owner_id, sentence_index)
+);
+CREATE INDEX IF NOT EXISTS sentence_vectors_owner ON sentence_vectors(owner_kind, owner_id);
 
 CREATE VIRTUAL TABLE IF NOT EXISTS docs_fts USING fts5(
   title, body, url_tokens, host,
@@ -899,6 +924,19 @@ class SqliteRecallStore implements RecallStore {
         }
       }
     }
+    // Sentence vectors (§12) are keyed by prototypeId, which changes every
+    // regeneration (prototypeId embeds the evidence watermark) — without
+    // this cleanup, every past generation's sentence rows would accumulate
+    // forever, unreachable (their prototypeId is never queried again once
+    // this workstream's standing set moves on). Best-effort, matching this
+    // method's own vec-delete discipline above.
+    for (const { id } of ids) {
+      try {
+        this.db.prepare("DELETE FROM sentence_vectors WHERE owner_kind = 'prototype' AND owner_id = ?").run(id);
+      } catch (err) {
+        console.warn('[recall-v2] prototype sentence vector delete failed:', err);
+      }
+    }
     this.db.prepare('DELETE FROM prototypes WHERE workstream_id = ?').run(workstreamId);
   }
 
@@ -1068,6 +1106,200 @@ class SqliteRecallStore implements RecallStore {
       if (row.displayKeyword.length > 0) displayKeyword.set(row.conceptId, row.displayKeyword);
     }
     return { weights, displayKeyword };
+  }
+
+  // ---- sentence vectors (§12) --------------------------------------------
+  // See SCHEMA's sentence_vectors comment + types.ts's SentenceVectorRow
+  // header for the full rationale (plain JSON column, new owner-kind-scoped
+  // table). No sqlite-vec dependency here at all — every read/write goes
+  // through this table only, so these methods work even when vecAvailable
+  // is false (a vault whose sqlite-vec extension failed to load can still
+  // backfill/read sentence vectors; only the UNRELATED whole-vector KNN
+  // paths degrade in that case).
+
+  replaceSentenceVectors(
+    ownerKind: SentenceVectorOwnerKind,
+    ownerId: string,
+    sentences: readonly SentenceVectorInput[],
+  ): void {
+    this.db.exec('BEGIN');
+    try {
+      this.db
+        .prepare('DELETE FROM sentence_vectors WHERE owner_kind = ? AND owner_id = ?')
+        .run(ownerKind, ownerId);
+      if (sentences.length > 0) {
+        const insert = this.db.prepare(`
+          INSERT INTO sentence_vectors
+            (owner_kind, owner_id, sentence_index, source, text, embedding_json, created_at)
+          VALUES (?, ?, ?, ?, ?, ?, ?)
+        `);
+        const createdAt = Date.now();
+        for (const sentence of sentences) {
+          insert.run(
+            ownerKind,
+            ownerId,
+            sentence.sentenceIndex,
+            sentence.source,
+            sentence.text,
+            JSON.stringify(Array.from(sentence.embedding)),
+            createdAt,
+          );
+        }
+      }
+      this.db.exec('COMMIT');
+    } catch (err) {
+      this.db.exec('ROLLBACK');
+      console.warn('[recall-v2] sentence vector replace failed:', err);
+    }
+  }
+
+  deleteSentenceVectors(ownerKind: SentenceVectorOwnerKind, ownerId: string): void {
+    try {
+      this.db
+        .prepare('DELETE FROM sentence_vectors WHERE owner_kind = ? AND owner_id = ?')
+        .run(ownerKind, ownerId);
+    } catch (err) {
+      console.warn('[recall-v2] sentence vector delete failed:', err);
+    }
+  }
+
+  private static parseSentenceRow(row: {
+    readonly ownerKind: string;
+    readonly ownerId: string;
+    readonly sentenceIndex: number;
+    readonly source: string;
+    readonly text: string;
+    readonly embeddingJson: string;
+  }): SentenceVectorRow {
+    let embedding: Float32Array;
+    try {
+      const parsed: unknown = JSON.parse(row.embeddingJson);
+      embedding = Array.isArray(parsed) ? Float32Array.from(parsed as number[]) : new Float32Array(0);
+    } catch {
+      embedding = new Float32Array(0);
+    }
+    return {
+      ownerKind: row.ownerKind === 'prototype' ? 'prototype' : 'page',
+      ownerId: row.ownerId,
+      sentenceIndex: row.sentenceIndex,
+      source: row.source,
+      text: row.text,
+      embedding,
+    };
+  }
+
+  getSentenceVectors(
+    ownerKind: SentenceVectorOwnerKind,
+    ownerId: string,
+  ): readonly SentenceVectorRow[] {
+    try {
+      const rows = this.db
+        .prepare(
+          `SELECT owner_kind AS ownerKind, owner_id AS ownerId, sentence_index AS sentenceIndex,
+                  source, text, embedding_json AS embeddingJson
+           FROM sentence_vectors WHERE owner_kind = ? AND owner_id = ?
+           ORDER BY sentence_index`,
+        )
+        .all(ownerKind, ownerId) as {
+        ownerKind: string;
+        ownerId: string;
+        sentenceIndex: number;
+        source: string;
+        text: string;
+        embeddingJson: string;
+      }[];
+      return rows.map((row) => SqliteRecallStore.parseSentenceRow(row));
+    } catch (err) {
+      console.warn('[recall-v2] sentence vector read failed:', err);
+      return [];
+    }
+  }
+
+  getSentenceVectorsForOwners(
+    ownerKind: SentenceVectorOwnerKind,
+    ownerIds: readonly string[],
+  ): ReadonlyMap<string, readonly SentenceVectorRow[]> {
+    const out = new Map<string, SentenceVectorRow[]>();
+    if (ownerIds.length === 0) return out;
+    try {
+      // Chunk the IN-list defensively — every real caller passes a small,
+      // already-bounded id set (prototypeLane.ts's KNN-narrowed candidate
+      // prototypeIds, or suggestionRecomputeLane.ts's evidence-pool
+      // canonicalUrls), but a single SQLite statement has a default
+      // ~999-parameter ceiling and this method must never throw on an
+      // unexpectedly large caller-supplied list.
+      const CHUNK_SIZE = 400;
+      for (let i = 0; i < ownerIds.length; i += CHUNK_SIZE) {
+        const chunk = ownerIds.slice(i, i + CHUNK_SIZE);
+        const placeholders = chunk.map(() => '?').join(',');
+        const rows = this.db
+          .prepare(
+            `SELECT owner_kind AS ownerKind, owner_id AS ownerId, sentence_index AS sentenceIndex,
+                    source, text, embedding_json AS embeddingJson
+             FROM sentence_vectors WHERE owner_kind = ? AND owner_id IN (${placeholders})
+             ORDER BY owner_id, sentence_index`,
+          )
+          .all(ownerKind, ...chunk) as {
+          ownerKind: string;
+          ownerId: string;
+          sentenceIndex: number;
+          source: string;
+          text: string;
+          embeddingJson: string;
+        }[];
+        for (const row of rows) {
+          const parsed = SqliteRecallStore.parseSentenceRow(row);
+          const existing = out.get(parsed.ownerId);
+          if (existing === undefined) out.set(parsed.ownerId, [parsed]);
+          else existing.push(parsed);
+        }
+      }
+    } catch (err) {
+      console.warn('[recall-v2] sentence vector batch read failed:', err);
+    }
+    return out;
+  }
+
+  allSentenceVectorOwnerIds(ownerKind: SentenceVectorOwnerKind): ReadonlySet<string> {
+    try {
+      const rows = this.db
+        .prepare('SELECT DISTINCT owner_id AS ownerId FROM sentence_vectors WHERE owner_kind = ?')
+        .all(ownerKind) as { ownerId: string }[];
+      return new Set(rows.map((r) => r.ownerId));
+    } catch (err) {
+      console.warn('[recall-v2] sentence vector owner-id read failed:', err);
+      return new Set();
+    }
+  }
+
+  sentenceVectorsByWorkstream(): ReadonlyMap<string, readonly Float32Array[]> {
+    const out = new Map<string, Float32Array[]>();
+    try {
+      const rows = this.db
+        .prepare(
+          `SELECT p.workstream_id AS workstreamId, sv.embedding_json AS embeddingJson
+           FROM sentence_vectors sv
+           JOIN prototypes p ON p.prototype_id = sv.owner_id
+           WHERE sv.owner_kind = 'prototype'`,
+        )
+        .all() as { workstreamId: string; embeddingJson: string }[];
+      for (const row of rows) {
+        let embedding: Float32Array;
+        try {
+          const parsed: unknown = JSON.parse(row.embeddingJson);
+          embedding = Array.isArray(parsed) ? Float32Array.from(parsed as number[]) : new Float32Array(0);
+        } catch {
+          continue;
+        }
+        if (embedding.length === 0) continue;
+        const existing = out.get(row.workstreamId);
+        if (existing === undefined) out.set(row.workstreamId, [embedding]);
+        else existing.push(embedding);
+      }
+    } catch (err) {
+      console.warn('[recall-v2] sentence vectors by workstream read failed:', err);
+    }
+    return out;
   }
 
   close(): void {

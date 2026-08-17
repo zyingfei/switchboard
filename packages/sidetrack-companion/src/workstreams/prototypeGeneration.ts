@@ -97,6 +97,7 @@ import {
   buildKeywordProfilesForWorkstreams,
   type KeywordLookupDeps,
 } from './prototypeKeywordProfileBuild.js';
+import { splitIntoSentences } from './sentenceSplit.js';
 
 // ---- env gating ----------------------------------------------------------
 
@@ -630,6 +631,22 @@ export interface PrototypeStore {
     readonly cosineDistance: number;
     readonly angle?: 'medoid' | 'synthetic-sibling';
   }[];
+  /** Sentence vectors (§12) — optional, same "fixture predating this phase
+   *  still satisfies the interface, real store always implements it"
+   *  contract as replacePrototypeKeywordProfiles below. Absent -> this
+   *  module simply never persists prototype sentence vectors, and every
+   *  downstream reader (tabsession/prototypeLane.ts) degrades to its
+   *  documented single-vector fallback. */
+  replaceSentenceVectors?(
+    ownerKind: 'page' | 'prototype',
+    ownerId: string,
+    sentences: readonly {
+      readonly sentenceIndex: number;
+      readonly source: string;
+      readonly text: string;
+      readonly embedding: Float32Array;
+    }[],
+  ): void;
   /** v2 keyword-profile signal (§11) — optional on the interface so a
    *  fixture/store that predates it still satisfies PrototypeStore; the
    *  real recall-v2 SqliteRecallStore always implements it. */
@@ -672,6 +689,68 @@ export interface WorkstreamGenerationResult {
  */
 const prototypeClientEventId = (prototypeId: string): string =>
   `prototype:${createHash('sha256').update(prototypeId).digest('hex').slice(0, 32)}`;
+
+// ---- sentence vectors (§12) — prototype-text side ---------------------
+//
+// Prototype text (a medoid's excerpt or a generated sibling) has no
+// separate "title" the way a page does — SYNTHETIC_SIBLING_PROMPT already
+// asks for a short excerpt-register text, so it is split with the plain
+// sentence splitter (no title composition) into up to
+// resolveSentenceSplitMax() sentences.
+
+interface PrototypeSentenceRow {
+  readonly prototypeId: string;
+  readonly text: string;
+  readonly angle: 'medoid' | 'synthetic-sibling';
+}
+
+const embedAndPersistPrototypeSentences = async (
+  rows: readonly PrototypeSentenceRow[],
+  embed: EmbedFn,
+  store: PrototypeStore,
+): Promise<void> => {
+  if (store.replaceSentenceVectors === undefined || rows.length === 0) return;
+  const flat: { readonly prototypeId: string; readonly sentenceIndex: number; readonly text: string; readonly angle: 'medoid' | 'synthetic-sibling' }[] = [];
+  for (const row of rows) {
+    splitIntoSentences(row.text).forEach((text, sentenceIndex) => {
+      flat.push({ prototypeId: row.prototypeId, sentenceIndex, text, angle: row.angle });
+    });
+  }
+  if (flat.length === 0) {
+    // Every row's text produced zero sentences (below the min-length floor)
+    // — still clear any STALE sentence rows a prior generation may have
+    // left for these exact prototypeIds (a fresh prototypeId per
+    // regeneration makes this a rare edge, but a re-run against an
+    // unchanged id — e.g. a retried tick — must not leave orphaned data).
+    for (const row of rows) store.replaceSentenceVectors('prototype', row.prototypeId, []);
+    return;
+  }
+  let vectors: readonly Float32Array[];
+  try {
+    vectors = await embed(flat.map((item) => item.text));
+  } catch {
+    return; // best-effort — never blocks prototype generation itself
+  }
+  if (vectors.length !== flat.length) return;
+
+  const byPrototypeId = new Map<
+    string,
+    { readonly sentenceIndex: number; readonly source: string; readonly text: string; readonly embedding: Float32Array }[]
+  >();
+  flat.forEach((item, index) => {
+    const list = byPrototypeId.get(item.prototypeId) ?? [];
+    list.push({
+      sentenceIndex: item.sentenceIndex,
+      source: item.angle,
+      text: item.text,
+      embedding: vectors[index]!,
+    });
+    byPrototypeId.set(item.prototypeId, list);
+  });
+  for (const row of rows) {
+    store.replaceSentenceVectors('prototype', row.prototypeId, byPrototypeId.get(row.prototypeId) ?? []);
+  }
+};
 
 export const generatePrototypesForWorkstream = async (
   input: {
@@ -763,6 +842,9 @@ export const generatePrototypesForWorkstream = async (
   // Replace the workstream's ENTIRE standing set with this batch — the
   // served copy is always exactly the latest generation, never a mix of
   // watermarks (see sqlite.ts's deletePrototypesForWorkstream doc comment).
+  // This ALSO clears every stale sentence-vector row for the workstream's
+  // PRIOR prototype ids (see sqlite.ts's deletePrototypesForWorkstream —
+  // prototypeId embeds the watermark, so old ids would otherwise leak).
   deps.store.deletePrototypesForWorkstream(input.workstreamId);
   for (const row of rows) {
     deps.store.upsertPrototype(
@@ -779,6 +861,19 @@ export const generatePrototypesForWorkstream = async (
       },
       row.vec,
     );
+  }
+
+  // Sentence vectors (§12) — split + embed every produced prototype's TEXT
+  // at generation time (same cadence as the whole-vector embed above, which
+  // only fires past this tick's dirty-marking debounce, so this stays
+  // bounded per the same discipline). ONE batched embed call across every
+  // row in this batch (cost discipline — not one embed call per prototype),
+  // mirroring embedCandidatePool's own "embed once, reuse" shape. Best-
+  // effort: a store that predates §12 (replaceSentenceVectors undefined) or
+  // an embed failure never blocks prototype generation itself — the medoid/
+  // generation tiers above have already landed by this point regardless.
+  if (deps.store.replaceSentenceVectors !== undefined) {
+    await embedAndPersistPrototypeSentences(rows, deps.embed, deps.store);
   }
 
   const medoidCount = rows.filter((r) => r.angle === 'medoid').length;

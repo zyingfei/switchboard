@@ -495,6 +495,21 @@ export const workstreamsRoutes: readonly RouteDefinition[] = [
             memberCount: candidate.memberIds.length,
             suggestedName: candidate.structuralName,
             updatedAt: candidate.updatedAtMs,
+            // §12 calibrated new-category score (docs/plans/2026-08-16-
+            // category-flexibility-hyde.md §12, USER DESIGN DIRECTIVE
+            // 2026-08-17 item (a)): `score` IS `cohesion` — the same
+            // [0,1] cosine-shaped units as an existing-workstream lane's
+            // blended candidate score, so the UI can honestly render
+            // "more like each other (0.74) than any existing list (0.55)"
+            // by comparing this number directly against a lane score,
+            // never a separately-calibrated one. `externalBest` is served
+            // alongside for that comparison string; null means no
+            // external comparison data was available this round (store
+            // predates §12, or no member has sentence vectors yet — the
+            // margin gate's liberal-default case).
+            score: candidate.cohesion,
+            cohesion: candidate.cohesion,
+            externalBest: candidate.externalBest,
           }));
         return [200, { data: { candidates } }];
       } finally {

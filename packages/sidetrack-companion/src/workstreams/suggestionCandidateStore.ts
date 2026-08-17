@@ -47,6 +47,24 @@ export interface SuggestionCandidateRecord {
   // not reset by recompute.
   readonly dismissed: boolean;
   readonly dismissedAtMs: number | null;
+  // §12 calibrated new-category score (docs/plans/2026-08-16-category-
+  // flexibility-hyde.md §12, USER DESIGN DIRECTIVE 2026-08-17 item (a)):
+  // "AI-assisted NEW-category suggestions must carry scores COMPARABLE to
+  // the existing similarity signals — same units." `cohesion` is this
+  // candidate's mean pairwise late-interaction score among its OWN
+  // members (splitSuggestionEngine.ts's computeClusterCohesion) — this is
+  // ALSO the number the GET route serves as the candidate's `score`, same
+  // [0,1] cosine-shaped units as tabsession/prototypeLane.ts's blended
+  // candidate score, so "create new (0.74)" is honestly comparable to
+  // "file into existing (0.55)". `externalBest` is the best any single
+  // member scores against any OTHER existing workstream's prototype
+  // sentence vectors (computeExternalBest) — null when no comparison data
+  // was available this round (store predates §12, or no member has
+  // sentence vectors yet — see the engine's own doc comment), in which
+  // case the emit-rule margin gate never blocks emission (liberal
+  // default, per the directive).
+  readonly cohesion: number;
+  readonly externalBest: number | null;
 }
 
 export interface SuggestionCandidateStore {
@@ -192,6 +210,8 @@ interface CandidateRow {
   readonly updated_at_ms: number;
   readonly dismissed: number;
   readonly dismissed_at_ms: number | null;
+  readonly cohesion: number | null;
+  readonly external_best: number | null;
 }
 
 const toRecord = (
@@ -217,6 +237,12 @@ const toRecord = (
     updatedAtMs: row.updated_at_ms,
     dismissed: row.dismissed === 1,
     dismissedAtMs: row.dismissed_at_ms,
+    // §12 — pre-migration rows have NULL cohesion (column default); 0 is a
+    // safe, honest floor (no cohesion could be computed for a row created
+    // before this feature existed) rather than surfacing NULL through the
+    // typed contract.
+    cohesion: row.cohesion ?? 0,
+    externalBest: row.external_best,
   };
 };
 
@@ -240,10 +266,22 @@ export const createSuggestionCandidateStore = async (
   if (!candidateColumns.some((column) => column.name === 'dismissed_at_ms')) {
     db.exec('ALTER TABLE suggestion_candidate ADD COLUMN dismissed_at_ms INTEGER');
   }
+  // §12 calibrated new-category score — same guarded ADD COLUMN idiom as
+  // the decline-memory columns above. NULL default (not 0) distinguishes
+  // "computed before §12 existed" from "computed, cohesion genuinely 0" —
+  // toRecord maps a NULL cohesion to 0 (a safe floor) but keeps
+  // externalBest's NULL-ness through the typed contract (null = "no
+  // external comparison data this round", the margin-gate bypass).
+  if (!candidateColumns.some((column) => column.name === 'cohesion')) {
+    db.exec('ALTER TABLE suggestion_candidate ADD COLUMN cohesion REAL');
+  }
+  if (!candidateColumns.some((column) => column.name === 'external_best')) {
+    db.exec('ALTER TABLE suggestion_candidate ADD COLUMN external_best REAL');
+  }
 
   const selectCandidates = db.query(
     `SELECT fingerprint, member_ids_json, consecutive_stable_count, emitted, structural_name,
-            created_at_ms, updated_at_ms, dismissed, dismissed_at_ms
+            created_at_ms, updated_at_ms, dismissed, dismissed_at_ms, cohesion, external_best
      FROM suggestion_candidate WHERE scope_id = ? AND kind = ?
      ORDER BY fingerprint`,
   );
@@ -263,8 +301,8 @@ export const createSuggestionCandidateStore = async (
   const insertCandidate = db.query(
     `INSERT INTO suggestion_candidate
        (scope_id, kind, fingerprint, member_ids_json, consecutive_stable_count, emitted,
-        structural_name, created_at_ms, updated_at_ms, dismissed, dismissed_at_ms)
-     VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
+        structural_name, created_at_ms, updated_at_ms, dismissed, dismissed_at_ms, cohesion, external_best)
+     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`,
   );
   const updateDismissed = db.query(
     `UPDATE suggestion_candidate SET dismissed = 1, dismissed_at_ms = ?
@@ -322,6 +360,8 @@ export const createSuggestionCandidateStore = async (
           candidate.updatedAtMs,
           candidate.dismissed ? 1 : 0,
           candidate.dismissedAtMs,
+          candidate.cohesion,
+          candidate.externalBest,
         );
       }
       upsertScope.run(scopeId, kind, revisionId, Date.now());

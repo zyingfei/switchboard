@@ -19,6 +19,12 @@ export interface SplitEvidenceJoin {
   readonly conceptIdsForUrl?: (canonicalUrl: string) => readonly string[] | undefined;
   readonly keywordsForUrl?: (canonicalUrl: string) => readonly string[] | undefined;
   readonly embeddingForUrl?: (canonicalUrl: string) => Float32Array | undefined;
+  /** §12 sentence vectors (recall-v2's sentence_vectors table, owner_kind
+   *  'page') — same optional-join shape as the others; omitted or absent
+   *  for a given URL means hybridSimilarity's vector term falls back to
+   *  pooled cosine for that item, per sentenceInteraction.ts's documented
+   *  fallback contract. */
+  readonly sentenceEmbeddingsForUrl?: (canonicalUrl: string) => readonly Float32Array[] | undefined;
 }
 
 /** Bounds one workstream's evidence pool before it reaches the engine's O(n²)
@@ -38,12 +44,14 @@ export const suggestionEvidenceFromWorkstreamItems = (
     const conceptIds = join.conceptIdsForUrl?.(item.canonicalUrl);
     const keywords = join.keywordsForUrl?.(item.canonicalUrl);
     const embedding = join.embeddingForUrl?.(item.canonicalUrl) ?? new Float32Array(0);
+    const sentenceEmbeddings = join.sentenceEmbeddingsForUrl?.(item.canonicalUrl);
     const evidenceItem: SuggestionEvidenceItem = {
       id: item.canonicalUrl,
       embedding,
       ...(item.title === null ? {} : { title: item.title }),
       ...(conceptIds === undefined ? {} : { conceptIds }),
       ...(keywords === undefined ? {} : { keywords }),
+      ...(sentenceEmbeddings === undefined ? {} : { sentenceEmbeddings }),
     };
     return evidenceItem;
   });

@@ -182,6 +182,44 @@ describe('runSuggestionRecomputeCycle — production wiring for BOTH kinds', () 
     }
   });
 
+  sqliteIt('§12 — gatherExistingWorkstreamSentenceVectors is threaded into every scope\'s cohesion/externalBest', async () => {
+    const store = await makeStore();
+    try {
+      const axis = (index: number): Float32Array => {
+        const v = new Float32Array(4);
+        v[index] = 1;
+        return v;
+      };
+      // 'new-category' — a single cohesive cluster is enough to qualify
+      // (unlike 'split', which needs >=2 sub-groups; a single homogeneous
+      // group there is the negative control and correctly emits nothing).
+      const unfiled = group('inbox', 5, 'concept-astronomy').map((item) => ({
+        ...item,
+        sentenceEmbeddings: [axis(0)],
+      }));
+      let gatherCalls = 0;
+      const deps: SuggestionRecomputeLaneDeps = {
+        gatherSplitEvidenceByWorkstream: async () => new Map(),
+        gatherNewCategoryEvidence: async () => unfiled,
+        gatherExistingWorkstreamSentenceVectors: async () => {
+          gatherCalls += 1;
+          return new Map([['ws-other', [axis(3)]]]); // near-orthogonal — weak match
+        },
+        store,
+      };
+      await runSuggestionRecomputeCycle(deps);
+      // Called exactly ONCE for the whole cycle, not once per scope.
+      expect(gatherCalls).toBe(1);
+      const candidates = store.candidatesFor('__unfiled__', 'new-category');
+      expect(candidates.length).toBeGreaterThan(0);
+      const candidate = candidates[0]!;
+      expect(candidate.cohesion).toBeCloseTo(1, 5);
+      expect(candidate.externalBest).toBeCloseTo(0, 5);
+    } finally {
+      store.close();
+    }
+  });
+
   sqliteIt('isolates a failure in one scope — the rest of the cycle still runs', async () => {
     const store = await makeStore();
     try {

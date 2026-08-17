@@ -1164,7 +1164,12 @@ const finalizeBatchResolveResults = async (
       results[canonicalUrl]!.fusedCandidates.length === 0 &&
       results[canonicalUrl]!.decision.gate?.reason === 'no-candidates'
     ) {
-      const hint = await newLabelHintForPage(vaultRoot, canonicalUrl);
+      // §12 refinement — see newLabelHintForPage's own doc comment. Reads
+      // the prototype lane's result from the SAME per-URL result object
+      // appendPrototypeLane just wrote a few lines above; no second lookup.
+      const prototypeLane = results[canonicalUrl]!.lanes?.find((lane) => lane.lane === 'prototype');
+      const prototypeLaneHasConfidentMatch = (prototypeLane?.candidates.length ?? 0) > 0;
+      const hint = await newLabelHintForPage(vaultRoot, canonicalUrl, { prototypeLaneHasConfidentMatch });
       if (hint !== null) {
         results[canonicalUrl] = { ...results[canonicalUrl]!, newLabelHint: hint };
       }

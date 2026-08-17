@@ -98,6 +98,9 @@ export interface UnfiledEvidenceJoin {
   /** Optional — see module header. Omitted means every item's embedding is
    *  empty and hybridSimilarity runs on concept-Jaccard alone. */
   readonly embeddingForUrl?: (canonicalUrl: string) => Float32Array | undefined;
+  /** §12 sentence vectors — same optional-join shape as splitEvidence.ts's
+   *  matching field; see that module's doc comment. */
+  readonly sentenceEmbeddingsForUrl?: (canonicalUrl: string) => readonly Float32Array[] | undefined;
 }
 
 /**
@@ -118,12 +121,14 @@ export const suggestionEvidenceFromUnfiled = (
     const conceptIds = join.conceptIdsForUrl?.(item.canonicalUrl);
     const keywords = join.keywordsForUrl?.(item.canonicalUrl);
     const embedding = join.embeddingForUrl?.(item.canonicalUrl) ?? new Float32Array(0);
+    const sentenceEmbeddings = join.sentenceEmbeddingsForUrl?.(item.canonicalUrl);
     const evidenceItem: SuggestionEvidenceItem = {
       id: item.canonicalUrl,
       embedding,
       ...(item.title === null ? {} : { title: item.title }),
       ...(conceptIds === undefined ? {} : { conceptIds }),
       ...(keywords === undefined ? {} : { keywords }),
+      ...(sentenceEmbeddings === undefined ? {} : { sentenceEmbeddings }),
     };
     return evidenceItem;
   });

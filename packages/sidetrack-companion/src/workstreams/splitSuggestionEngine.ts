@@ -48,6 +48,7 @@ import {
 import { conceptJaccard } from '../enrichment/keywordConcepts.js';
 import { DEFAULT_TOPIC_COSINE_THRESHOLD } from '../producers/topic-revision.js';
 import { jaccard, normalizeTokens } from '../suggestions/tokens.js';
+import { pageWorkstreamScore, resolveLateInteractionTopK, symmetricSentenceScore } from './sentenceInteraction.js';
 import type {
   SuggestionCandidateKind,
   SuggestionCandidateRecord,
@@ -182,6 +183,19 @@ export interface SuggestionEvidenceItem {
    *  processed it. Used ONLY for cluster naming (keywordNameFor) — never for
    *  scoring, which reads conceptIds instead. */
   readonly keywords?: readonly string[];
+  /** Sentence vectors (§12, "the attention of sentence matters") for this
+   *  item's title+gist, when the sentence-vector backfill lane
+   *  (enrichment/sentenceVectorBackfillLane.ts) has processed it. Additive:
+   *  absent (or empty) on either side of a pair ⇒ hybridSimilarity's vector
+   *  term falls back to the pre-existing pooled cosine, byte-identical to
+   *  before this phase — see vectorSimilarityFor below. NOT the same signal
+   *  as `embedding` being present: a page can have sentence vectors (from
+   *  its gist) with NO doc-level `embedding` at all (recall-v2 body-vector
+   *  coverage is only ~16% of pages per the keyword-clustering PR's own
+   *  measurement; the sentence-vector backfill lane is decoupled from that
+   *  coverage gap entirely, since it works off gists, not extracted body
+   *  content) — see hasVectorSignal below. */
+  readonly sentenceEmbeddings?: readonly Float32Array[];
 }
 
 export interface RecomputeSuggestionCandidatesOptions {
@@ -199,6 +213,17 @@ export interface RecomputeSuggestionCandidatesOptions {
    *  and therefore withheld from newlyEmitted (population-scoped decline
    *  memory — see suggestionCandidateStore.ts's declineCandidate). */
   readonly declineConceptOverlapThreshold?: number;
+  /** §12 calibrated new-category score — the top-k for BOTH cohesion and
+   *  external-best (defaults to resolveLateInteractionTopK() — the SAME env
+   *  knob every other late-interaction call site in this feature area
+   *  shares). */
+  readonly lateInteractionTopK?: number;
+  /** §12 — margin cohesion must clear over externalBest before a candidate
+   *  is allowed to emit (defaults to resolveSuggestionMargin()). Only
+   *  applied when externalBest is non-null for a given candidate — see
+   *  RecomputeSuggestionCandidatesInput.existingWorkstreamSentenceVectors's
+   *  doc comment for why a null externalBest never blocks emission. */
+  readonly suggestionMargin?: number;
 }
 
 export interface RecomputeSuggestionCandidatesInput {
@@ -209,6 +234,18 @@ export interface RecomputeSuggestionCandidatesInput {
   readonly revisionId: string;
   readonly now?: () => number;
   readonly options?: RecomputeSuggestionCandidatesOptions;
+  /** §12 — every EXISTING workstream's prototype sentence vectors, keyed by
+   *  workstreamId (recall-v2/store/sqlite.ts's sentenceVectorsByWorkstream,
+   *  gathered ONCE per (slow, idle-cadence) recompute cycle by the caller —
+   *  see suggestionRecomputeLane.ts). Used for computeExternalBest ONLY;
+   *  clustering itself (hybridSimilarity/densityConnectedComponents) is
+   *  unaffected. OPTIONAL AND LIBERAL BY DEFAULT: omitted, or a scope+kind
+   *  where no cluster member has its own sentence vectors yet, means
+   *  externalBest is null for every candidate this round and the §12
+   *  margin gate never blocks emission — a vault mid-backfill (see
+   *  enrichment/sentenceVectorBackfillLane.ts) behaves exactly like a
+   *  pre-§12 vault, not a vault that suddenly stops emitting suggestions. */
+  readonly existingWorkstreamSentenceVectors?: ReadonlyMap<string, readonly Float32Array[]>;
 }
 
 export interface RecomputeSuggestionCandidatesResult {
@@ -238,27 +275,68 @@ const cosineSimilarity = (left: Float32Array, right: Float32Array): number => {
   return dot / (Math.sqrt(leftNorm) * Math.sqrt(rightNorm));
 };
 
+const hasSentenceVectors = (item: SuggestionEvidenceItem): boolean =>
+  item.sentenceEmbeddings !== undefined && item.sentenceEmbeddings.length > 0;
+
+/** True when a pair has SOME comparable vector signal — either a usable
+ *  pooled embedding on BOTH sides, or usable sentence vectors on BOTH
+ *  sides (§12). The two signals are independent: a page can carry sentence
+ *  vectors from its gist with no pooled doc-level embedding at all (see
+ *  SuggestionEvidenceItem.sentenceEmbeddings's doc comment). */
+const vectorSignalUsable = (left: SuggestionEvidenceItem, right: SuggestionEvidenceItem): boolean =>
+  (hasNonZeroVector(left.embedding) && hasNonZeroVector(right.embedding)) ||
+  (hasSentenceVectors(left) && hasSentenceVectors(right));
+
 /**
- * Hybrid similarity for one evidence pair — blends embedding cosine with
- * concept-Jaccard over gist keywords. FORMULA, in priority order:
+ * The vector-term score for one pair (§12) — sentence-level late
+ * interaction (symmetricSentenceScore) when BOTH sides carry sentence
+ * vectors, else the pre-existing pooled cosine (cosineSimilarity,
+ * UNCHANGED — same self-normalizing function, not sentenceInteraction.ts's
+ * pre-normalized-input assumption, so this is byte-identical to the
+ * pre-§12 pooled path for every caller that never populates
+ * sentenceEmbeddings), else 0. This is the ONE place hybridSimilarity's
+ * vector term is computed — both call sites below (the two-vector-usable
+ * branch and the vector-only branch) go through it, so a pair's sentence-
+ * vs-pooled choice can never drift between them.
+ */
+const vectorSimilarityFor = (
+  left: SuggestionEvidenceItem,
+  right: SuggestionEvidenceItem,
+  k: number = resolveLateInteractionTopK(),
+): number => {
+  if (hasSentenceVectors(left) && hasSentenceVectors(right)) {
+    return symmetricSentenceScore(left.sentenceEmbeddings!, right.sentenceEmbeddings!, k);
+  }
+  if (hasNonZeroVector(left.embedding) && hasNonZeroVector(right.embedding)) {
+    return cosineSimilarity(left.embedding, right.embedding);
+  }
+  return 0;
+};
+
+/**
+ * Hybrid similarity for one evidence pair — blends the vector term (§12:
+ * sentence-level late interaction where available, else pooled cosine —
+ * see vectorSimilarityFor) with concept-Jaccard over gist keywords.
+ * FORMULA, in priority order:
  *
- *   1. BOTH items carry a usable (non-zero-length, non-all-zero) embedding
- *      AND both carry a `conceptIds` field:
- *        similarity = (1 - weight) * cosine + weight * conceptJaccard
- *   2. Only concept-ids are usable (either embedding missing/zero — the
- *      "zero vector coverage" case, e.g. recall-v2 has not embedded this
- *      page yet):
+ *   1. BOTH items carry usable vector signal (per vectorSignalUsable) AND
+ *      both carry a `conceptIds` field:
+ *        similarity = (1 - weight) * vectorSimilarityFor + weight * conceptJaccard
+ *   2. Only concept-ids are usable (no usable vector signal on one or both
+ *      sides — the "zero vector coverage" case, e.g. recall-v2 has not
+ *      embedded this page yet AND no sentence vectors exist yet):
  *        similarity = conceptJaccard
- *      The embedding term is DROPPED here, not zero-weighted — a missing
+ *      The vector term is DROPPED here, not zero-weighted — a missing
  *      signal must not silently dilute the one signal that IS available
- *      (folding in an implicit cosine=0 would understate every pair's
+ *      (folding in an implicit score=0 would understate every pair's
  *      similarity by a `weight`-sized fraction for no evidential reason).
- *   3. Only embeddings are usable (neither item carries `conceptIds` —
+ *   3. Only the vector term is usable (neither item carries `conceptIds` —
  *      the keyword layer has not processed either page):
- *        similarity = cosine
- *      Identical to the module's pre-keyword-layer behavior — this is what
- *      makes the change additive rather than a rescoring of every existing
- *      caller.
+ *        similarity = vectorSimilarityFor
+ *      Identical to the module's pre-keyword-layer behavior when neither
+ *      side has sentence vectors — this is what makes both the keyword
+ *      layer AND the §12 sentence layer additive rather than a rescoring
+ *      of every existing caller.
  *   4. Neither is usable: similarity = 0 (same as the original
  *      cosineSimilarity's zero-vector floor).
  *
@@ -270,15 +348,15 @@ export const hybridSimilarity = (
   right: SuggestionEvidenceItem,
   weight: number = DEFAULT_KEYWORD_CLUSTER_WEIGHT,
 ): number => {
-  const vectorsUsable = hasNonZeroVector(left.embedding) && hasNonZeroVector(right.embedding);
+  const vectorsUsable = vectorSignalUsable(left, right);
   const conceptsUsable = left.conceptIds !== undefined && right.conceptIds !== undefined;
   if (conceptsUsable) {
     const jac = conceptJaccard(left.conceptIds ?? [], right.conceptIds ?? []);
     if (!vectorsUsable) return jac;
-    const cos = cosineSimilarity(left.embedding, right.embedding);
+    const cos = vectorSimilarityFor(left, right);
     return (1 - weight) * cos + weight * jac;
   }
-  if (vectorsUsable) return cosineSimilarity(left.embedding, right.embedding);
+  if (vectorsUsable) return vectorSimilarityFor(left, right);
   return 0;
 };
 
@@ -367,6 +445,102 @@ const isSuppressedByDecline = (
   return false;
 };
 
+// ---------------------------------------------------------------------------
+// §12 calibrated new-category score (docs/plans/2026-08-16-category-
+// flexibility-hyde.md §12, USER DESIGN DIRECTIVE 2026-08-17 items (a)+(3)).
+// ---------------------------------------------------------------------------
+
+export const SUGGESTION_MARGIN_ENV = 'SIDETRACK_SUGGESTION_MARGIN';
+// "default small, e.g. 0.05" — the SAME numeric value as
+// prototypeContrastMargin.ts's CONTRAST_MARGIN_MIN, a deliberate echo (not
+// a re-export — the two margins protect different decisions, prototype-lane
+// disclosure vs. suggestion-candidate emission, and must stay
+// independently tunable) of the "small enough that a genuinely distinctive
+// case clears it, large enough to catch a genuine near-tie" judgment call.
+export const DEFAULT_SUGGESTION_MARGIN = 0.05;
+
+/** Parse SIDETRACK_SUGGESTION_MARGIN — a >=0 float. "0 = emit on any
+ *  positive margin — keep liberal" per the directive: 0 is a VALID,
+ *  meaningful value here (not treated as "unset"), unlike this module's
+ *  other env resolvers where 0 sometimes means "disabled" — so the
+ *  fallback-to-default check is `raw === undefined || raw === ''` only,
+ *  never `!parsed`. Negative/garbage falls back to the default. */
+export const resolveSuggestionMargin = (): number => {
+  const raw = process.env[SUGGESTION_MARGIN_ENV];
+  if (raw === undefined || raw === '') return DEFAULT_SUGGESTION_MARGIN;
+  const parsed = Number.parseFloat(raw);
+  if (!Number.isFinite(parsed) || parsed < 0) return DEFAULT_SUGGESTION_MARGIN;
+  return parsed;
+};
+
+/**
+ * Cohesion — mean pairwise late-interaction score among a candidate
+ * cluster's OWN members, using vectorSimilarityFor (sentence-level where
+ * available, else pooled cosine, else 0 — the SAME primitive
+ * hybridSimilarity's vector term uses, deliberately NOT the concept-Jaccard
+ * blend: the directive asks for "the SAME late-interaction metric" for both
+ * cohesion and external-best, and late interaction is fundamentally a
+ * vector-space notion). A single-member "cluster" (never actually reached
+ * by recomputeSuggestionCandidates's own minClusterMembers floor, but
+ * defensive) has no pair to average and returns 0.
+ */
+export const computeClusterCohesion = (
+  members: readonly SuggestionEvidenceItem[],
+  k: number = resolveLateInteractionTopK(),
+): number => {
+  if (members.length < 2) return 0;
+  let sum = 0;
+  let count = 0;
+  for (let i = 0; i < members.length; i += 1) {
+    for (let j = i + 1; j < members.length; j += 1) {
+      sum += vectorSimilarityFor(members[i]!, members[j]!, k);
+      count += 1;
+    }
+  }
+  return count === 0 ? 0 : sum / count;
+};
+
+/**
+ * External-best — the single largest late-interaction score any cluster
+ * member gets against any OTHER existing workstream's prototype sentence
+ * vectors (pageWorkstreamScore, top-k mean of max-per-member-sentence — the
+ * SAME primitive tabsession/prototypeLane.ts's own sentence-level scoring
+ * uses). `excludeWorkstreamId` is the scope's OWN workstreamId for a
+ * 'split' candidate (comparing a sub-cluster against the workstream it is
+ * being split FROM would be circular — the question is "does this look more
+ * like some OTHER list", not "does it still resemble its parent");
+ * undefined for 'new-category' (unfiled evidence has no own workstream to
+ * exclude).
+ *
+ * Returns null — NOT 0 — when no comparison was possible (no
+ * `existingWorkstreamSentenceVectors` supplied, or no cluster member
+ * carries sentence vectors yet): null is the caller's signal to skip the
+ * margin gate entirely, distinct from a genuine "compared, and scored
+ * (near-)zero against everything" 0.
+ */
+export const computeExternalBest = (
+  members: readonly SuggestionEvidenceItem[],
+  existingWorkstreamSentenceVectors: ReadonlyMap<string, readonly Float32Array[]> | undefined,
+  excludeWorkstreamId: string | undefined,
+  k: number = resolveLateInteractionTopK(),
+): number | null => {
+  if (existingWorkstreamSentenceVectors === undefined || existingWorkstreamSentenceVectors.size === 0) {
+    return null;
+  }
+  let best: number | null = null;
+  for (const member of members) {
+    const sentences = member.sentenceEmbeddings;
+    if (sentences === undefined || sentences.length === 0) continue;
+    for (const [workstreamId, targetVectors] of existingWorkstreamSentenceVectors) {
+      if (workstreamId === excludeWorkstreamId) continue;
+      if (targetVectors.length === 0) continue;
+      const score = pageWorkstreamScore(sentences, targetVectors, k);
+      if (best === null || score > best) best = score;
+    }
+  }
+  return best;
+};
+
 /**
  * Recompute (or skip, if untouched) the split/new-category candidates for
  * one scope. Pure with respect to `evidence`/`revisionId`; all persistence
@@ -397,8 +571,15 @@ export const recomputeSuggestionCandidates = (
   const keywordClusterWeight = input.options?.keywordClusterWeight ?? resolveKeywordClusterWeight();
   const declineConceptOverlapThreshold =
     input.options?.declineConceptOverlapThreshold ?? DEFAULT_DECLINE_CONCEPT_OVERLAP_THRESHOLD;
+  const lateInteractionTopK = input.options?.lateInteractionTopK ?? resolveLateInteractionTopK();
+  const suggestionMargin = input.options?.suggestionMargin ?? resolveSuggestionMargin();
+  // §12 — excludes a 'split' candidate's OWN scope (its parent workstream)
+  // from external-best comparison (see computeExternalBest's doc comment);
+  // 'new-category' evidence has no own workstream to exclude.
+  const externalMatchExcludeWorkstreamId = input.kind === 'split' ? input.scopeId : undefined;
   const now = (input.now ?? Date.now)();
   const previous = store.candidatesFor(input.scopeId, input.kind);
+  const evidenceById = new Map(input.evidence.map((item) => [item.id, item] as const));
 
   // Cold-start floor: below this, don't even attempt clustering. Still
   // persist the (empty) computation so dirty-marking short-circuits next
@@ -463,7 +644,30 @@ export const recomputeSuggestionCandidates = (
         declinedConceptSets,
         declineConceptOverlapThreshold,
       );
-      const emitted = stable && !suppressed;
+      // §12 calibrated new-category score — computed for EVERY candidate
+      // (not only ones that pass the other gates) so the persisted
+      // record/GET route can always disclose both numbers, even for a
+      // candidate withheld by stability/decline.
+      const clusterMembers = sortedMembers.flatMap((memberId) => {
+        const item = evidenceById.get(memberId);
+        return item === undefined ? [] : [item];
+      });
+      const cohesion = computeClusterCohesion(clusterMembers, lateInteractionTopK);
+      const externalBest = computeExternalBest(
+        clusterMembers,
+        input.existingWorkstreamSentenceVectors,
+        externalMatchExcludeWorkstreamId,
+        lateInteractionTopK,
+      );
+      // Sticky, same rule `stable` already applies via `wasEmitted`: an
+      // ALREADY-emitted candidate is never retroactively un-emitted by a
+      // later recompute finding a worse margin (a later recompute could
+      // easily see a stronger external match simply because MORE
+      // workstreams now have prototypes — that is not evidence the
+      // original suggestion was wrong). The margin gate only applies to a
+      // candidate's FIRST transition into `emitted`.
+      const marginOk = wasEmitted || externalBest === null || cohesion > externalBest + suggestionMargin;
+      const emitted = stable && !suppressed && marginOk;
       const record: SuggestionCandidateRecord = {
         scopeId: input.scopeId,
         kind: input.kind,
@@ -471,6 +675,8 @@ export const recomputeSuggestionCandidates = (
         memberIds: sortedMembers,
         consecutiveStableCount,
         emitted,
+        cohesion,
+        externalBest,
         structuralName:
           keywordNameFor(sortedMembers, keywordsById) ?? structuralNameFor(sortedMembers, titleById),
         createdAtMs: matched?.createdAtMs ?? now,
