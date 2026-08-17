@@ -1803,3 +1803,428 @@ flakes observed — including the new route-level integration test, which
 depends on real sqlite-vec + a real in-process HTTP server and was run
 several times back-to-back specifically to rule out timing flakiness before
 landing.
+
+## 12. Sentence-level late interaction + lane-calibrated new-category cohesion (2026-08-17)
+
+**Why this landed — two independently-verified failure modes, one root
+cause.** §11's own landing note names both symptoms explicitly: (a) the
+pineapple-cake incident — a food page's "Xindongyang Pineapple Cake"
+terminology landed in an ML workstream's prototype set, because a single
+noise sentence embedded into the SAME pooled vector as the workstream's real
+content, with nothing to separate "the actual topic" from "one throwaway
+aside"; (b) the day-one 0.82-everywhere tie — three unrelated workstreams
+scored a near-identical ~0.82 because meta-register prototype prose is
+generically close to every tech page in pooled-cosine space. §11 treated
+these as two SEPARATE problems and shipped two separate, partial fixes:
+`prototypeMedoids.ts`'s P90 outlier exclusion (structural, catches (a) only
+when the offending item is a full MEDOID candidate, not a stray sentence
+inside an otherwise-good excerpt) and `prototypeContrastMargin.ts`'s
+margin-over-mean gate (behavioral, catches (b) by refusing to disclose a
+near-tie, but doesn't make the underlying scores any less blurred). The USER
+DESIGN DIRECTIVE (2026-08-17) names the actual shared root cause: **single-
+vector-per-gist pooling**. Averaging a whole gist+title into ONE embedding
+before comparing anything is what let a noise sentence drag a good match
+down (nothing separated it from the real content once pooled) and what let
+several generic sentences drag an unrelated match up (their genericness
+survives pooling exactly because pooling erases the sentence-level
+distinction between "this is what the page is about" and "this is boilerplate
+register"). This phase's fix operates one level down from both prior
+patches: split before comparing, then let a max/top-k operation — not a
+mean — do the aggregating, so a single sentence (good or bad) can never
+silently blend into an average that misrepresents the page.
+
+**§1 — sentence splitting.** `workstreams/sentenceSplit.ts` (pure, no I/O):
+`splitIntoSentences` is a deterministic, CJK-aware splitter — CJK terminators
+(`。！？`) end a sentence immediately (no trailing space required, unlike
+ASCII), an ASCII terminator (`.!?`) ends a sentence only when followed by
+whitespace/EOF (so "3.14" and "U.S." mid-sentence don't fragment on every
+period — deliberately not abbreviation-aware, just "no split without a
+following space"), and a bare newline is always a boundary. Sentences below
+`SENTENCE_MIN_CHARS` (3) are dropped as noise; sentences above
+`resolveSentenceMaxChars()` (`SIDETRACK_SENTENCE_MAX_CHARS`, default 240) are
+truncated, never dropped. Capped at `resolveSentenceSplitMax()`
+(`SIDETRACK_SENTENCE_SPLIT_MAX`, default 6) — the brief's exact "≤6
+sentences per page, env-tunable." `splitPageIntoSentences(title, gist)`
+composes a page's TITLE as its own single unsplit sentence (a title is
+already one unit) followed by the gist's own sentences, bounded together at
+the same cap — the brief's "gist(+title as its own sentence)" literally.
+
+**§2 — late-interaction scoring.** `workstreams/sentenceInteraction.ts`
+(pure): `pageWorkstreamScore(source, target, k)` is a ColBERT-style max-sim
+late interaction at the sentence granularity this feature already produces —
+for each SOURCE sentence, the MAX cosine similarity against ANY target
+sentence; the page-level score is the MEAN of the TOP-`k` of those
+per-sentence maxes (`resolveLateInteractionTopK()`,
+`SIDETRACK_LATE_INTERACTION_TOP_K`, default 2 — the brief's `k=2`), not the
+mean over every source sentence. Top-k-mean, not max, and not mean-over-all,
+is what actually fixes both incidents at once: a MAX-over-max-sim (k=1, no
+averaging) would be sensitive to a single lucky match; a mean-over-ALL
+source-sentence-maxes reproduces exactly the pineapple-cake/tie shape one
+level down (one bad or one generic sentence still gets averaged in). Top-k
+answers "how many of this page's sentences are STRONGLY matched, ignoring
+the rest" — the noise sentence's low max-sim simply falls outside the top-k.
+`symmetricSentenceScore` is the order-independent form (average of both
+directions) for PEER comparisons (two pages, for clustering) where
+`pageWorkstreamScore`'s query-vs-pool asymmetry doesn't apply.
+`bestAvailableVectorScore` is the ONE shared fallback rule every call site
+below reuses: sentence-level when BOTH sides carry sentence vectors, else
+plain pooled cosine, else 0 — "keep the single-vector path as fallback when
+sentence vectors absent for either side," literally.
+
+**§3 — persistence: additive `sentence_vectors` table, not the existing
+chunk-vector machinery literally.** The brief asked to "persist via the
+recall-v2 store's existing chunk-vector machinery... a new kind/namespace
+column if needed." Read literally that means `documents_chunks`/
+`documents_chunks_vec` — rejected after inspection: that table's owner is a
+HARD FK to `docs.entity_id` (a specific recall-v2-indexed document row), and
+recall-v2 body-vector coverage is only ~16% of pages (the keyword-clustering
+PR's own measurement) — tying sentence vectors to that FK would silently
+inherit the same coverage gap this whole feature exists partly to route
+around (a page can have a rich GIST with zero recall-v2 body indexing at
+all). Instead: a NEW additive table, `sentence_vectors`
+(`recall-v2/store/sqlite.ts`), same STRUCTURAL idiom as
+`documents_chunks`/`documents_chunks_vec` and `prototypes`/`prototype_vec`
+(a metadata+text side, delete-then-insert replace-by-owner, additive to an
+existing per-vault sqlite-vec-bearing database) but keyed by
+`(owner_kind, owner_id, sentence_index)` where `owner_kind` IS the "new
+kind/namespace column" the brief asked for (`'page'` — owner_id =
+canonicalUrl, universal regardless of doc-vector coverage — or `'prototype'`
+— owner_id = prototypeId, which has no `docs` row at all).
+
+**Second deviation, stated plainly, same posture as §11's own documented
+one.** §11's `embedCandidatePool` already established: "reading raw vector
+VALUES back out of a sqlite-vec vec0 table is not a pattern this codebase
+uses anywhere today (every existing caller only ever reads back a MATCH
+distance, never the stored vector)." Every late-interaction call site below
+needs the RAW vectors back to run max/top-k scoring in application code over
+an already-bounded small set (≤6 page sentences × a handful of candidate
+prototypes' sentences) — never a fresh ANN search. So `sentence_vectors`
+stores each embedding as a plain JSON TEXT column (the SAME
+`JSON.stringify(Array.from(vec))` shape `upsertVector`/`upsertChunkVector`/
+`upsertPrototype` already use for the WRITE side), read back via ordinary
+`SELECT`, NOT a second `vec0` virtual table. This stays inside the codebase's
+proven read pattern instead of adding new, unverified vec0 read surface for
+zero benefit (a KNN index buys nothing over a handful of always-bounded
+rows). Five new store methods (`replaceSentenceVectors`,
+`deleteSentenceVectors`, `getSentenceVectors`, `getSentenceVectorsForOwners`
+— batched, IN-list, chunked at 400 defensively — and
+`sentenceVectorsByWorkstream` — a single JOIN across `sentence_vectors` and
+`prototypes`, the bulk form the calibration score needs), all OPTIONAL on
+`RecallStore` (same "fixture predating this phase still satisfies the
+interface" contract `deleteDocumentsByHostFamily`/`getPrototypeKeywordIdf`
+already establish elsewhere in this file).
+`deletePrototypesForWorkstream` additionally now sweeps stale sentence rows
+for the prototypeIds it just deleted — a prototypeId embeds its generation's
+evidence watermark, so without this cleanup every past regeneration's
+sentence rows would accumulate forever, unreachable.
+
+**§4 — where sentence vectors get produced.** Two paths, deliberately
+different in shape:
+
+- PROTOTYPE texts (medoid + generated), inline at generation time.
+  `workstreams/prototypeGeneration.ts`'s `generatePrototypesForWorkstream`,
+  immediately after its existing `upsertPrototype` loop, calls
+  `embedAndPersistPrototypeSentences`: split every produced prototype's TEXT
+  (no title — a prototype has none), batch-embed the WHOLE regeneration
+  batch's sentences in ONE `embed()` call (cost discipline — one round trip
+  per workstream-tick, not one per prototype), persist via
+  `store.replaceSentenceVectors('prototype', prototypeId, ...)`. Gated
+  behind the SAME debounce prototype generation already runs under (dirty-
+  marking, ≥5-new-evidence-or-14-days), so this is bounded by construction,
+  not a new lane. Best-effort: a store predating §12
+  (`replaceSentenceVectors === undefined`) or a failed embed never blocks
+  prototype generation itself — the medoid/generation tiers have already
+  landed by that point regardless.
+- PAGE gists, via a new bounded backfill lane.
+  `enrichment/sentenceVectorBackfillLane.ts` — SAME idiom as
+  `keywordBackfillLane.ts`, deliberately: self-scheduling (fast poll while
+  backlog remains, slow poll once empty; `SIDETRACK_SENTENCE_BACKFILL`,
+  default ON), a bounded batch per cycle (`batchCap=20`,
+  `cycleIntervalMs=2s`, `idleIntervalMs=60s`), persisted progress (observability
+  only — `allSentenceVectorOwnerIds('page')` is a trivial exact-existence
+  check, same "no lifecycle state machine needed" property
+  `keywordBackfillLane.ts`'s own header claims for its `hasIndexed`). Candidate
+  source is the connections snapshot's WHOLE `urlProjection` (title+gist),
+  filed AND unfiled alike — a SUPERSET of `gatherWorkstreamEvidence`
+  (filed-only) and `gatherUnfiledEvidence` (unfiled-only), because BOTH
+  `splitSuggestionEngine.ts` scopes need sentence vectors for their own
+  evidence pool. Env-capped, most-recent-first
+  (`SIDETRACK_SENTENCE_BACKFILL_POPULATION_CAP`, default 2000). A
+  deterministic-failure quarantine (`maxAttemptsPerPage=3`, NO cooldown
+  decay — same "a gist's text never changes on its own, so 3 failures fail
+  it forever" reasoning `keywordBackfillLane.ts`'s own config documents) — a
+  page whose title+gist genuinely splits to zero sentences (below the
+  min-length floor) is expected to hit this path and correctly stop being
+  offered, not spin forever. A REAL addition over `keywordBackfillLane.ts`'s
+  own design, borrowed from `backgroundEmbeddingLane.ts`'s 90-min-soak
+  lesson: an optional `isEmbedderReady` warmup gate — pause hard (no
+  candidates offered, no attempts burned) until the embedder child reports
+  ready, so this lane cannot repeat that exact inertness failure mode.
+  Wired into `runtime/companion.ts` right after the keyword-backfill
+  scheduler, same non-blocking startup-delay shape, same explicit
+  pre-drain stop (#374 lane-stop discipline) — it is not an event-log-
+  appending lane so it cannot itself cause the SIGTERM-hang `awaitIdle()`
+  failure mode that discipline exists for, but a lane left ticking past
+  `close()` is still a live timer outliving the process.
+
+**§5 — three serve/compute-time call sites, one shared fallback contract.**
+Every site below degrades to its documented pre-§12 behavior, byte-for-byte,
+whenever sentence vectors are absent on either side of a comparison —
+verified explicitly by dedicated fallback tests at each site, not merely
+asserted in a comment.
+
+- (a) `tabsession/prototypeLane.ts`'s vector side. After the existing
+  whole-vector KNN (`queryPrototypeVector`) narrows candidate workstreams,
+  the page's OWN sentences (title+gist, ≤6) are embedded HERE, at SERVE
+  TIME — the one deliberate exception to "no serve-time embedding beyond
+  the page's own sentences" (item 5), since the query side must always be
+  fresh. The TARGET side (candidate workstreams' prototype sentence
+  vectors) is NEVER embedded at serve time — only read back via
+  `getSentenceVectorsForOwners('prototype', ...)`, scoped to the small,
+  already-KNN-bounded set of prototypeIds the whole-vector pass just
+  surfaced (never a full-table scan). When a workstream has sentence data,
+  its late-interaction score REPLACES `vectorBest` in the blend (and in the
+  disclosed why-string's number, so what's shown matches what actually
+  ranked it); otherwise the pre-§12 pooled score is used, unchanged. The
+  reproduced-then-fixed fixture
+  (`prototypeLane.test.ts`, "reproduces the day-one pooled tie, then fixes
+  it"): two workstreams tied at pooled sim≈0.82 (the exact day-one shape);
+  WITHOUT sentence vectors the tie survives (contrast-margin honest-empty,
+  reproducing the bug); WITH sentence vectors — one prototype's sentences
+  exactly matching the page's own, the other's orthogonal, at the SAME
+  pooled score — sentence-level scoring discriminates the real match
+  cleanly (score >0.9, no tie).
+- (b) `workstreams/splitSuggestionEngine.ts`'s pairwise clustering distance.
+  `hybridSimilarity`'s vector term now runs through `vectorSimilarityFor`:
+  `symmetricSentenceScore` when both evidence items carry
+  `sentenceEmbeddings`, else the ORIGINAL self-normalizing `cosineSimilarity`
+  (deliberately NOT `sentenceInteraction.ts`'s pre-normalized-input
+  `cosine()` — a real regression risk was caught here: existing/future test
+  fixtures using non-unit-length synthetic vectors would silently get a
+  DIFFERENT number under the pre-normalized assumption; keeping the pooled
+  fallback on the module's own pre-existing normalizing function makes it
+  byte-identical to the pre-§12 calculation, verified by a dedicated
+  non-unit-vector fixture test). `vectorsUsable` (the top-level gate
+  deciding whether hybridSimilarity even has a vector signal to blend) now
+  also fires when BOTH sides carry sentence vectors even with a ZERO pooled
+  embedding — a genuine coverage win, not just a scoring refinement: a page
+  can have sentence vectors from its GIST with no recall-v2 body-level
+  embedding at all, since the backfill lane above is decoupled from that
+  ~16%-coverage gap entirely.
+- (c) `tabsession/newLabelHint.ts`'s no-confident-pick refinement — an
+  INDIRECT integration, stated as a design decision rather than a direct
+  call into `sentenceInteraction.ts` (worth naming plainly, since the brief
+  listed this as a direct use site). `newLabelHintForPage` gains an
+  optional `prototypeLaneHasConfidentMatch` flag; `server.ts`'s
+  `finalizeBatchResolveResults` computes it from the SAME per-URL result
+  `appendPrototypeLane` just wrote a few lines above (no second lookup) and
+  suppresses the "start a new category" hint when true. The reasoning:
+  `laneCorroboration.ts`/`laneFallback.ts` hardcode their lane set to
+  `['content','ai']`, so the prototype lane is STRUCTURALLY unable to
+  influence the fusion decision that put a page into "genuinely no
+  confident pick" — meaning a confident, now-sentence-aware prototype-lane
+  match on that SAME page is independent evidence the structural lanes
+  never had access to. Re-prompting "create a new category" on a page a
+  sentence-aware match already resembles an EXISTING workstream would be
+  actively misleading, not merely unhelpful — this is the smallest,
+  lowest-risk of the three integration points, and stays that way on
+  purpose: `newLabelHint.ts`'s own header states "NO clustering, NO LLM
+  call, NO new store," and this change adds none of those, only reads a
+  boolean already computed by a sibling lane in the same request.
+
+**§6 — calibrated new-category score (directive item (a) + item 3).** The
+directive: "AI-assisted NEW-category suggestions must carry scores
+COMPARABLE to the existing similarity signals — same units, so 'create new
+(0.74)' can honestly beat 'file into existing (0.55)'." Two new PURE
+functions in `splitSuggestionEngine.ts`, both using the SAME late-
+interaction metric (deliberately NOT the concept-Jaccard blend
+`hybridSimilarity` uses for clustering — cohesion/external-best are a
+calibration signal, not a clustering signal, and must stay in the
+vector-space units a lane score is already in):
+
+- `computeClusterCohesion(members, k)` — mean PAIRWISE late-interaction
+  score among a candidate cluster's own members (`vectorSimilarityFor` per
+  pair — sentence-level where available, pooled cosine fallback). THIS
+  number is what the GET route serves as the candidate's `score` — same
+  [0,1] cosine-shaped units as `prototypeLane.ts`'s blended candidate
+  score, satisfying "comparable... same units" literally, not by
+  convention.
+- `computeExternalBest(members, existingWorkstreamSentenceVectors,
+  excludeWorkstreamId, k)` — the single largest score any cluster member
+  gets against any OTHER existing workstream's prototype sentence vectors
+  (`pageWorkstreamScore`, the SAME primitive `prototypeLane.ts`'s serve-time
+  scoring uses). `excludeWorkstreamId` is the scope's OWN workstreamId for a
+  'split' candidate (comparing a sub-cluster against the workstream it is
+  being split FROM would be circular — verified by a dedicated exclusion
+  fixture); undefined for 'new-category' (no own workstream to exclude).
+  Returns `null` — NOT 0 — when no comparison was possible (no
+  `existingWorkstreamSentenceVectors` supplied this cycle, or no cluster
+  member has sentence vectors yet): null is the signal to SKIP the margin
+  gate entirely, the mechanism that makes the whole feature liberal-by-
+  default during backfill.
+
+Both persisted as additive columns on `suggestion_candidate`
+(`cohesion REAL`, `external_best REAL`, guarded `ALTER TABLE ADD COLUMN`,
+same idiom the decline-memory columns already established) — `cohesion`
+NULL-migrates to 0 (a safe floor for a pre-§12 row), `externalBest` keeps its
+NULL-ness through the typed contract. `RecomputeSuggestionCandidatesInput`
+gains an optional `existingWorkstreamSentenceVectors` map, gathered ONCE PER
+CYCLE (not per scope) by `suggestionRecomputeLane.ts` via
+`sentenceVectorsByWorkstream()` — verified by a dedicated test asserting the
+gather function fires exactly once across a whole cycle. Both evidence
+adapters (`splitEvidence.ts`, `unfiledEvidence.ts`) gained an optional
+`sentenceEmbeddingsForUrl` join, populated by `suggestionRecomputeLane.ts`'s
+`buildDeps` via a BATCHED `getSentenceVectorsForOwners('page', ids)` call
+scoped to the ALREADY-CAPPED evidence set (never the raw pre-cap
+population — the population caps `SPLIT_EVIDENCE_PER_WORKSTREAM_CAP`/
+`resolveUnfiledPopulationCap()` already bound this exact class of concern;
+fetching sentence vectors for items that would be dropped by the cap anyway
+would be pure waste on a large vault).
+
+**§7 — the emit-rule margin, liberal by construction.** `emitted` gains one
+more AND-condition: `marginOk = wasEmitted || externalBest === null ||
+cohesion > externalBest + resolveSuggestionMargin()`
+(`SIDETRACK_SUGGESTION_MARGIN`, default 0.05 — the SAME numeric judgment
+call as `prototypeContrastMargin.ts`'s `CONTRAST_MARGIN_MIN`, a deliberate
+echo not a re-export, since the two margins gate different decisions and
+must stay independently tunable; "0 = emit on any positive margin" is
+handled as a VALID value, not "unset," matching the directive exactly). Two
+liberal-by-default properties, both load-bearing and both verified by
+dedicated tests: (1) `externalBest === null` — no comparison data this
+round — bypasses the gate entirely, so a vault mid-backfill (most pages
+without sentence vectors yet) behaves EXACTLY like a pre-§12 vault, never a
+vault that suddenly stops emitting suggestions; (2) `wasEmitted` — sticky,
+mirroring how `stable` already treats a prior emission — means the margin
+gate only ever applies to a candidate's FIRST transition into `emitted`; an
+ALREADY-emitted candidate is never retroactively un-emitted by a LATER
+recompute that happens to find a stronger external match (a later recompute
+naturally sees more comparison data simply because more workstreams have
+accrued prototypes by then — that is not evidence the original suggestion
+was wrong, and un-emitting it would be exactly the kind of UI flicker
+`declineMemory.ts`'s whole design already treats as unacceptable elsewhere
+in this program).
+
+**§8 — the GET route.** `http/routes/workstreamsRoutes.ts`'s
+`GET /v1/workstreams/suggestions` now serves `score` (= `cohesion`),
+`cohesion`, and `externalBest` on every candidate — the directive's own
+target string, "more like each other (0.74) than any existing list (0.55)",
+is literally `cohesion.toFixed(2)` vs. `externalBest.toFixed(2)` once a UI
+wants to render it (out of scope here — this PR is the data layer, per the
+concurrent-branch "small READ routes" precedent §11 already followed for
+this same route).
+
+**§9 — per-source counters, extended.** `tabsession/prototypeLane.ts`'s
+existing medoid/generated/keyword per-source prequential predictions
+(§11 item 4) gain two more composite lane ids, same idiom, same
+`recordRawLanePredictions` mechanism: `'prototype:pooled'` (the pre-§12
+whole-vector KNN score, `agg.vectorBest` — renamed from an implicit
+"the only vector source" to an explicit measured alternative now that a
+second one exists) and `'prototype:sentence'` (the new late-interaction
+score). A dedicated fixture proves the two are measured INDEPENDENTLY, not
+just relabeled: one workstream wins `'prototype:pooled'` on raw cosine
+alone (no sentence data at all), a DIFFERENT workstream — with weaker
+pooled similarity but an exact sentence-level match — wins
+`'prototype:sentence'`, both landing in the same real
+`lane-prequential.jsonl` file from one `buildPrototypeLane` call.
+
+**§10 — cost discipline (directive item 5).** Sentence embedding multiplies
+vector count ~4-6× as flagged; every multiplication point is independently
+bounded: `resolveSentenceSplitMax()` caps sentences per page/prototype at 6;
+the backfill lane's `batchCap`/population-cap bound the offline side; the
+serve-time page-sentence embed is the ONLY embedding that happens on a
+request path, and it is the page's own ≤6 sentences, ONE batch of `Promise
+.all` calls through the SAME per-text embed-cache read-through
+`buildContentLaneDeps` already established (each sentence still benefits
+from the shared (model, sha256(text)) cache); every TARGET-side read (a
+candidate's or an existing workstream's prototype sentence vectors) is a
+plain SQL read of ALREADY-PERSISTED data, never a fresh embed. Embed-lane
+writes stay O(work): `replaceSentenceVectors` is a bounded delete-then-
+insert per owner, same shape every other replace-by-owner method in this
+store already uses, never an O(vault) rewrite.
+
+**Tests** (all new/rewritten, `bun test`): `sentenceSplit.test.ts` (23) —
+en+zh determinism, title-as-own-sentence composition, abbreviation/decimal
+non-fragmentation, truncation-not-dropping, env-knob fallback.
+`sentenceInteraction.test.ts` (16) — the pineapple-cake fixture (a noise
+target sentence does not poison the score; a noise SOURCE sentence is
+excluded by top-k, not averaged in — both compared numerically against
+what naive mean-pooling would have produced), a generic-sentence tie
+fixture (pooled scoring ties two workstreams via a shared "boilerplate"
+axis, sentence-level discriminates), symmetry, and the fallback contract.
+`sentenceVectorBackfillLane.test.ts` (10) — boundedness, idempotence
+(`allSentenceVectorOwnerIds` re-check), permanent quarantine for a
+zero-sentence page, the embedder-warmup pause, cross-instance progress
+resumption, single-batch-embed-per-page. `prototypeGeneration.test.ts`
+(+4) — sentence vectors persisted per produced prototype (medoid AND
+generated), stale sentence rows cleared on regeneration, a pre-§12 store
+fixture skipped without error, a failing sentence-embed never blocks
+prototype generation itself. `prototypeLane.test.ts` (+4) — the
+reproduced-then-fixed day-one tie (above), the per-workstream fallback when
+only SOME hit prototypes have sentence vectors, the whole-lane fallback for
+a pre-§12 store, and the independent-measurement per-source-prediction
+fixture. `splitSuggestionEngine.test.ts` (+16) — `hybridSimilarity`'s
+sentence-preferred/pooled-fallback/byte-identical-normalization tests,
+`computeClusterCohesion`/`computeExternalBest` pure-function tests
+(including the split-candidate own-scope exclusion), `resolveSuggestionMargin`
+env parsing, and the full cohesion-vs-external-best emit-rule suite: a
+cohesive group with a WEAK existing match emits carrying both scores; the
+SAME group with a STRONG existing match does not emit; `externalBest: null`
+when no comparison data exists (liberal, backfill-safe default); an
+already-emitted candidate stays emitted despite a later stronger match
+(sticky); a split candidate's own scope is excluded from external-best.
+`suggestionRecomputeLane.test.ts` (+1) — `gatherExistingWorkstreamSentenceVectors`
+fires exactly once per cycle and its result reaches every scope's
+persisted cohesion/externalBest. `newLabelHint.test.ts` (+2) — suppressed
+when `prototypeLaneHasConfidentMatch: true`; unaffected (identical to
+pre-§12 behavior) when false/undefined.
+
+**Full suite.** `bun test`: **3772 pass / 8 skip / 0 fail** across 3780
+tests, 412 files (168s) — 141 more passing tests and 11 more files than the
+pre-§12 baseline (3631/401), matching this phase's own new/changed test
+count. `npm run build` (`tsc -p tsconfig.build.json`) clean. This phase's
+own new/changed suites (listed above, ~171 tests across 10 files) were run
+together and individually, repeatedly, on a loaded machine — clean every
+time, no flakes observed. `bunx tsc --noEmit -p tsconfig.json` (the
+broader, non-build typecheck) carries a pre-existing ~201-line baseline
+(confirmed via `git stash` against a clean `main` checkout before this
+phase's changes) — almost entirely `Cannot find module 'bun:test'` under
+that config's stricter module resolution, affecting every `*.test.ts` file
+in the package, not something this phase introduced or could fix without
+touching shared tsconfig — plus one pre-existing `event.payload` narrowing
+gap in `prototypeGeneration.test.ts` at a line this phase never touched.
+This phase's own new files trip the identical `bun:test`-under-`tsconfig
+.json` baseline pattern and nothing else; `npm run build`'s actual gate
+(`tsconfig.build.json`) is unaffected.
+
+**Files changed.** NEW — `workstreams/sentenceSplit.ts`+`.test.ts`,
+`workstreams/sentenceInteraction.ts`+`.test.ts`,
+`enrichment/sentenceVectorBackfillLane.ts`+`.test.ts`. MODIFIED —
+`recall-v2/store/types.ts` (`SentenceVectorOwnerKind`/`SentenceVectorInput`/
+`SentenceVectorRow` + five optional `RecallStore` methods),
+`recall-v2/store/sqlite.ts` (`sentence_vectors` table + the five methods +
+`deletePrototypesForWorkstream`'s stale-sentence-row sweep),
+`workstreams/prototypeGeneration.ts` (`embedAndPersistPrototypeSentences`,
+wired into `generatePrototypesForWorkstream`),
+`workstreams/prototypeGeneration.test.ts`,
+`tabsession/prototypeLane.ts` (sentence-level vector-side scoring +
+`prototype:pooled`/`prototype:sentence` per-source predictions),
+`tabsession/prototypeLane.test.ts`, `workstreams/splitSuggestionEngine.ts`
+(`vectorSimilarityFor`, `computeClusterCohesion`, `computeExternalBest`,
+`resolveSuggestionMargin`, the emit-rule margin gate),
+`workstreams/splitSuggestionEngine.test.ts`,
+`workstreams/suggestionCandidateStore.ts` (additive `cohesion`/
+`external_best` columns), `workstreams/suggestionCandidateStore.test.ts`,
+`workstreams/suggestionRecomputeLane.ts`
+(`gatherExistingWorkstreamSentenceVectors`, sentence-vector joins in
+`buildDeps`), `workstreams/suggestionRecomputeLane.test.ts`,
+`workstreams/splitEvidence.ts`/`unfiledEvidence.ts` (additive
+`sentenceEmbeddingsForUrl` join field), `tabsession/newLabelHint.ts`
+(`prototypeLaneHasConfidentMatch` suppression), `tabsession/
+newLabelHint.test.ts`, `http/server.ts` (threads the suppression flag from
+the same per-URL result `appendPrototypeLane` just wrote),
+`http/routes/workstreamsRoutes.ts` (GET route serves `score`/`cohesion`/
+`externalBest`), `http/workstreamsRoutes.test.ts` (fixture updates for the
+two new required fields), `runtime/companion.ts` (wires
+`scheduleSentenceVectorBackfillLoop`, same non-blocking + explicit-stop
+shape as the keyword backfill immediately above it). NOT touched, as
+scoped: `sync/contract/connectionsMaterializer.ts`.

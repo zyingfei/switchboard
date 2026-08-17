@@ -258,6 +258,157 @@ describe('buildPrototypeLane — keyword-profile blend', () => {
   });
 });
 
+// ---- sentence-level late interaction (§12, "the attention of sentence
+// matters") ---------------------------------------------------------------
+
+describe('buildPrototypeLane — sentence-level scoring (§12)', () => {
+  // Small orthonormal axes so cosine similarity is exact: axis 0 = the
+  // page's TITLE sentence, axis 1 = the page's GIST sentence, axis 2 =
+  // "unrelated" (everything else, including the whole-vector query text —
+  // irrelevant here since storeWithHitsAndSentences ignores the `vec` arg
+  // entirely, same as storeWithHits).
+  const TITLE_TEXT = 'DuckDB Notes';
+  const GIST_TEXT = 'DuckDB is a fast in-process database.';
+  const axis = (index: number): Float32Array => {
+    const v = new Float32Array(3);
+    v[index] = 1;
+    return v;
+  };
+  const perSentenceEmbed = async (text: string): Promise<Float32Array> => {
+    if (text === TITLE_TEXT) return axis(0);
+    if (text === GIST_TEXT) return axis(1);
+    return axis(2);
+  };
+
+  const storeWithHitsAndSentences = (
+    hits: readonly Hit[],
+    sentenceVectorsByPrototypeId: ReadonlyMap<string, readonly Float32Array[]>,
+  ): PrototypeLaneStore => ({
+    vectorBackendAvailable: true,
+    queryPrototypeVector: () => hits,
+    getSentenceVectorsForOwners: (_ownerKind, ownerIds) => {
+      const out = new Map<string, readonly { readonly embedding: Float32Array }[]>();
+      for (const ownerId of ownerIds) {
+        const vectors = sentenceVectorsByPrototypeId.get(ownerId);
+        if (vectors !== undefined) out.set(ownerId, vectors.map((embedding) => ({ embedding })));
+      }
+      return out;
+    },
+  });
+
+  it('reproduces the day-one pooled tie, then fixes it: sentence-level scoring discriminates a real match from a fake one at the SAME pooled similarity', async () => {
+    // Both workstreams tie on POOLED (whole-vector) cosine — the exact
+    // day-one shape (prototypeContrastMargin.test.ts's own reproduction).
+    const hits: readonly Hit[] = [
+      { prototypeId: 'p-a', workstreamId: 'ws-a', cosineDistance: 0.6, angle: 'medoid' }, // sim ~0.82
+      { prototypeId: 'p-b', workstreamId: 'ws-b', cosineDistance: 0.6, angle: 'medoid' }, // sim ~0.82 — a TIE
+    ];
+
+    // WITHOUT sentence vectors at all (store predates §12 / mid-backfill):
+    // the pooled tie survives untouched — the day-one bug, reproduced.
+    const poolOnlyLane = await buildPrototypeLane({
+      title: TITLE_TEXT,
+      gist: GIST_TEXT,
+      store: storeWithHits(hits),
+      embed: perSentenceEmbed,
+      embedderUsable: true,
+    });
+    expect(poolOnlyLane.candidates).toEqual([]);
+    expect(poolOnlyLane.emptyReason).toContain('no clearly closer workstream');
+
+    // WITH sentence vectors: ws-a's prototype (p-a) sentences EXACTLY match
+    // the page's own two sentences; ws-b's prototype (p-b) sentences are
+    // both the unrelated axis — a real match vs. a fake one at an IDENTICAL
+    // pooled score, exactly the shape sentence-level attention exists to
+    // discriminate.
+    const sentenceVectors = new Map<string, readonly Float32Array[]>([
+      ['p-a', [axis(0), axis(1)]],
+      ['p-b', [axis(2), axis(2)]],
+    ]);
+    const sentenceLane = await buildPrototypeLane({
+      title: TITLE_TEXT,
+      gist: GIST_TEXT,
+      store: storeWithHitsAndSentences(hits, sentenceVectors),
+      embed: perSentenceEmbed,
+      embedderUsable: true,
+    });
+    expect(sentenceLane.emptyReason).toBeUndefined();
+    expect(sentenceLane.candidates[0]?.workstreamId).toBe('ws-a');
+    expect(sentenceLane.candidates[0]?.score).toBeGreaterThan(0.9);
+  });
+
+  it('falls back to the pooled score when a candidate workstream has NO sentence vectors for its hit prototypes', async () => {
+    const hits: readonly Hit[] = [
+      { prototypeId: 'p-a', workstreamId: 'ws-a', cosineDistance: 0.6, angle: 'medoid' },
+    ];
+    // ws-a's own prototype has sentence vectors, but the store call for a
+    // DIFFERENT (never-hit) prototype id returns nothing for it — proving
+    // the fallback is per-workstream, not all-or-nothing.
+    const store = storeWithHitsAndSentences(hits, new Map());
+    const lane = await buildPrototypeLane({
+      title: TITLE_TEXT,
+      gist: GIST_TEXT,
+      store,
+      embed: perSentenceEmbed,
+      embedderUsable: true,
+    });
+    // Pooled cosineDistance 0.6 -> sim ~0.82, unchanged from the pre-§12
+    // pooled-only path.
+    expect(lane.candidates[0]?.score).toBeCloseTo(0.82, 2);
+  });
+
+  it('falls back to the pooled path entirely when the store predates §12 (no getSentenceVectorsForOwners)', async () => {
+    const hits: readonly Hit[] = [
+      { prototypeId: 'p-a', workstreamId: 'ws-a', cosineDistance: 0.6, angle: 'medoid' },
+    ];
+    const lane = await buildPrototypeLane({
+      title: TITLE_TEXT,
+      gist: GIST_TEXT,
+      store: storeWithHits(hits), // no getSentenceVectorsForOwners at all
+      embed: perSentenceEmbed,
+      embedderUsable: true,
+    });
+    expect(lane.candidates[0]?.score).toBeCloseTo(0.82, 2);
+  });
+
+  it('records prototype:sentence and prototype:pooled as INDEPENDENTLY measured per-source predictions', async () => {
+    const vaultRoot = await mkdtemp(join(tmpdir(), 'sidetrack-prototype-lane-sentence-prequential-'));
+    try {
+      const hits: readonly Hit[] = [
+        { prototypeId: 'p-a', workstreamId: 'ws-pooled-winner', cosineDistance: 0, angle: 'medoid' }, // sim 1.0, no sentence vectors
+        { prototypeId: 'p-b', workstreamId: 'ws-sentence-winner', cosineDistance: 0.9, angle: 'medoid' }, // sim ~0.6 pooled, but exact sentence match
+      ];
+      const sentenceVectors = new Map<string, readonly Float32Array[]>([
+        ['p-b', [axis(0), axis(1)]],
+      ]);
+      await buildPrototypeLane({
+        title: TITLE_TEXT,
+        gist: GIST_TEXT,
+        store: storeWithHitsAndSentences(hits, sentenceVectors),
+        embed: perSentenceEmbed,
+        embedderUsable: true,
+        canonicalUrl: 'https://a.test/1',
+        vaultRoot,
+      });
+      const raw = await readFile(lanePrequentialPath(vaultRoot), 'utf8');
+      const lines = raw
+        .split('\n')
+        .filter((l) => l.length > 0)
+        .map((l) => JSON.parse(l) as LanePredictionRecord);
+      const byLane = new Map(lines.map((l) => [l.l, l.w]));
+      // pooled: ws-pooled-winner has the higher RAW cosine (sim 1.0 vs 0.6).
+      expect(byLane.get('prototype:pooled')).toBe('ws-pooled-winner');
+      // sentence: ws-sentence-winner's prototype sentences exactly match the
+      // page's own sentences (score 1.0); ws-pooled-winner has NO sentence
+      // vectors at all (score 0) — sentence-level correctly picks the OTHER
+      // workstream, proving the two sources are measured independently.
+      expect(byLane.get('prototype:sentence')).toBe('ws-sentence-winner');
+    } finally {
+      await rm(vaultRoot, { recursive: true, force: true });
+    }
+  });
+});
+
 // ---- per-source prequential recording (v2 §11) ---------------------------
 
 describe('buildPrototypeLane — per-source prequential recording', () => {

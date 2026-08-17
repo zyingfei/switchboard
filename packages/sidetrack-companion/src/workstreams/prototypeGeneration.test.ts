@@ -547,3 +547,156 @@ describe('generatePrototypesForWorkstream — end-to-end with a fake engine + fa
     expect(result.generatedCount).toBe(PROTOTYPE_GENERATION_COUNT_MATURE);
   });
 });
+
+// ---- sentence vectors (§12) — persisted at generation time --------------
+
+interface SentenceVectorCall {
+  readonly ownerKind: 'page' | 'prototype';
+  readonly ownerId: string;
+  readonly sentences: readonly { readonly sentenceIndex: number; readonly source: string; readonly text: string }[];
+}
+
+const fakePrototypeStoreWithSentences = (): PrototypeStore & {
+  readonly rows: Map<string, { readonly workstreamId: string; readonly generatedText: string; readonly angle?: 'medoid' | 'synthetic-sibling' }>;
+  readonly sentenceCalls: SentenceVectorCall[];
+} => {
+  const rows = new Map<string, { readonly workstreamId: string; readonly generatedText: string; readonly angle?: 'medoid' | 'synthetic-sibling' }>();
+  const sentenceCalls: SentenceVectorCall[] = [];
+  return {
+    rows,
+    sentenceCalls,
+    vectorBackendAvailable: true,
+    upsertPrototype(row) {
+      rows.set(row.prototypeId, {
+        workstreamId: row.workstreamId,
+        generatedText: row.generatedText,
+        ...(row.angle === undefined ? {} : { angle: row.angle }),
+      });
+    },
+    deletePrototypesForWorkstream(workstreamId) {
+      for (const [id, row] of rows) {
+        if (row.workstreamId === workstreamId) rows.delete(id);
+      }
+    },
+    listPrototypesForWorkstream(workstreamId) {
+      return [...rows.entries()]
+        .filter(([, row]) => row.workstreamId === workstreamId)
+        .map(([prototypeId, row]) => ({
+          prototypeId,
+          generatedText: row.generatedText,
+          generatorModelId: 'apple-fm#reason=ok',
+          method: 'generated' as const,
+          generatedAt: 0,
+          evidenceWatermark: '',
+          ...(row.angle === undefined ? {} : { angle: row.angle }),
+        }));
+    },
+    allPrototypeWorkstreamIds() {
+      return new Set([...rows.values()].map((r) => r.workstreamId));
+    },
+    queryPrototypeVector() {
+      return [];
+    },
+    replaceSentenceVectors(ownerKind, ownerId, sentences) {
+      sentenceCalls.push({
+        ownerKind,
+        ownerId,
+        sentences: sentences.map((s) => ({ sentenceIndex: s.sentenceIndex, source: s.source, text: s.text })),
+      });
+    },
+  };
+};
+
+describe('generatePrototypesForWorkstream — sentence vectors (§12) persisted at generation time', () => {
+  let vaultRoot: string;
+  let eventLog: EventLog;
+
+  beforeEach(async () => {
+    vaultRoot = await mkdtemp(join(tmpdir(), 'sidetrack-prototype-sentences-'));
+    const replica = await loadOrCreateReplica(vaultRoot);
+    eventLog = createEventLog(vaultRoot, replica);
+  });
+
+  afterEach(async () => {
+    await rm(vaultRoot, { recursive: true, force: true });
+  });
+
+  it('splits + embeds every produced prototype text and calls replaceSentenceVectors per prototype', async () => {
+    const store = fakePrototypeStoreWithSentences();
+    const client = fakeClient(true, () => 'A generated sibling excerpt in different words.');
+    const multiSentenceItems: readonly WorkstreamEvidenceItem[] = ENGLISH_ITEMS.map((entry, i) =>
+      i === 0
+        ? { ...entry, gist: 'First claim about KV caches. Second claim about memory usage.' }
+        : entry,
+    );
+    const result = await generatePrototypesForWorkstream(
+      { workstreamId: 'ws-sentences', items: multiSentenceItems, last: undefined, nowMs: 1000, count: 4 },
+      { eventLog, embed: fakeEmbed, store, client },
+    );
+    expect(result.outcome).toBe('regenerated');
+    // One replaceSentenceVectors call per produced prototype (medoid + generated).
+    expect(store.sentenceCalls.length).toBe(store.rows.size);
+    expect(store.sentenceCalls.every((call) => call.ownerKind === 'prototype')).toBe(true);
+    // The multi-sentence medoid's excerpt split into 2 sentences.
+    const multiSentenceCall = store.sentenceCalls.find((call) => call.sentences.length > 1);
+    expect(multiSentenceCall).toBeDefined();
+    expect(multiSentenceCall!.sentences[0]!.text).toContain('First claim');
+    expect(multiSentenceCall!.sentences[1]!.text).toContain('Second claim');
+  });
+
+  it('regeneration clears the PRIOR generation batch\'s sentence rows via deletePrototypesForWorkstream (owner ids differ per watermark)', async () => {
+    const store = fakePrototypeStoreWithSentences();
+    const client = fakeClient(true);
+    await generatePrototypesForWorkstream(
+      { workstreamId: 'ws-regen', items: ENGLISH_ITEMS, last: undefined, nowMs: 1000, count: 4 },
+      { eventLog, embed: fakeEmbed, store, client },
+    );
+    const firstBatchCalls = store.sentenceCalls.length;
+    expect(firstBatchCalls).toBeGreaterThan(0);
+    const priorEvents = await eventLog.readMerged();
+    const last = foldLatestPrototypeGenerations(priorEvents).get('ws-regen');
+    const grown = [
+      ...ENGLISH_ITEMS,
+      item('https://a.test/6', { gist: 'A sixth piece of evidence to force regeneration.' }),
+      item('https://a.test/7', { gist: 'A seventh piece of evidence to force regeneration.' }),
+      item('https://a.test/8', { gist: 'An eighth piece of evidence to force regeneration.' }),
+      item('https://a.test/9', { gist: 'A ninth piece of evidence to force regeneration.' }),
+      item('https://a.test/10', { gist: 'A tenth piece of evidence to force regeneration.' }),
+    ];
+    await generatePrototypesForWorkstream(
+      { workstreamId: 'ws-regen', items: grown, last, nowMs: 2000, count: 4 },
+      { eventLog, embed: fakeEmbed, store, client },
+    );
+    // A fresh batch of replaceSentenceVectors calls landed for the NEW
+    // prototypeIds (each regeneration's ids embed the evidence watermark, so
+    // they never collide with the prior batch's ids).
+    expect(store.sentenceCalls.length).toBeGreaterThan(firstBatchCalls);
+  });
+
+  it('a store without replaceSentenceVectors (pre-§12 fixture) is skipped without error', async () => {
+    const store = fakePrototypeStore(); // the ORIGINAL fixture — no replaceSentenceVectors
+    const client = fakeClient(true);
+    const result = await generatePrototypesForWorkstream(
+      { workstreamId: 'ws-legacy-store', items: ENGLISH_ITEMS, last: undefined, nowMs: 1000, count: 4 },
+      { eventLog, embed: fakeEmbed, store, client },
+    );
+    expect(result.outcome).toBe('regenerated');
+  });
+
+  it('a failing embed for sentences never blocks prototype generation itself', async () => {
+    const store = fakePrototypeStoreWithSentences();
+    const client = fakeClient(true);
+    let calls = 0;
+    const flakyEmbed: EmbedFn = async (texts) => {
+      calls += 1;
+      if (calls > 1) throw new Error('embed down');
+      return texts.map(() => new Float32Array(4).fill(1));
+    };
+    const result = await generatePrototypesForWorkstream(
+      { workstreamId: 'ws-flaky-embed', items: ENGLISH_ITEMS, last: undefined, nowMs: 1000, count: 4 },
+      { eventLog, embed: flakyEmbed, store, client },
+    );
+    expect(result.outcome).toBe('regenerated');
+    expect(store.rows.size).toBeGreaterThan(0);
+  });
+});

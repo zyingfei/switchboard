@@ -5,8 +5,14 @@ import { afterEach, describe, expect, it } from 'vitest';
 
 import { createSuggestionCandidateStore, type SuggestionCandidateStore } from './suggestionCandidateStore.js';
 import {
+  computeClusterCohesion,
+  computeExternalBest,
   DEFAULT_MIN_CLUSTER_MEMBERS,
   DEFAULT_STABILITY_MIN_CONSECUTIVE,
+  DEFAULT_SUGGESTION_MARGIN,
+  hybridSimilarity,
+  resolveSuggestionMargin,
+  SUGGESTION_MARGIN_ENV,
   SUGGESTION_MIN_MEMBERS_ENV,
   SUGGESTION_MIN_MEMBERS_FLOOR,
   SUGGESTION_STABILITY_ENV,
@@ -475,6 +481,236 @@ describe('recomputeSuggestionCandidates — structural naming', () => {
       // separate word tokens, so the structural name surfaces the
       // discriminative WORDS, not the literal hyphenated string.
       expect(named?.structuralName).toContain('recsys');
+    } finally {
+      store.close();
+    }
+  });
+});
+
+// ---- hybridSimilarity — sentence-level vector term (§12) -----------------
+
+describe('hybridSimilarity — sentence-level vector term (§12), pooled fallback preserved', () => {
+  const item = (
+    id: string,
+    embedding: Float32Array,
+    sentenceEmbeddings?: readonly Float32Array[],
+  ): SuggestionEvidenceItem => ({ id, embedding, ...(sentenceEmbeddings === undefined ? {} : { sentenceEmbeddings }) });
+
+  it('uses sentence-level scoring when BOTH sides carry sentence vectors, even if pooled embeddings disagree', () => {
+    const zero = new Float32Array(4); // pooled embedding absent/zero on both — the "16% coverage gap" case
+    const left = item('l', zero, [basis(0, 4)]);
+    const right = item('r', zero, [basis(0, 4)]);
+    // Pooled cosine of two zero vectors is 0 (module's own zero-vector
+    // floor); sentence vectors are IDENTICAL, so sentence-level scoring
+    // still finds a perfect match despite neither side having a usable
+    // pooled embedding at all.
+    expect(hybridSimilarity(left, right, 0)).toBeCloseTo(1, 5);
+  });
+
+  it('falls back to pooled cosine, BYTE-IDENTICAL to the pre-§12 calculation, when either side lacks sentence vectors', () => {
+    // Deliberately NON-unit-length vectors — this is the exact case that
+    // would silently break if the pooled fallback ever routed through
+    // sentenceInteraction.ts's pre-normalized-input assumption instead of
+    // this module's own self-normalizing cosineSimilarity.
+    const left = item('l', new Float32Array([2, 0, 0, 0]));
+    const right = item('r', new Float32Array([0, 3, 0, 0]));
+    expect(hybridSimilarity(left, right, 0)).toBeCloseTo(0, 10); // orthogonal, regardless of magnitude
+    const same = item('s', new Float32Array([2, 0, 0, 0]));
+    expect(hybridSimilarity(left, same, 0)).toBeCloseTo(1, 10); // parallel, regardless of magnitude
+  });
+
+  it('an empty sentenceEmbeddings array on one side is treated as "absent" — pooled fallback, not a zero score', () => {
+    const left = item('l', basis(0, 4), []);
+    const right = item('r', basis(0, 4), [basis(0, 4)]);
+    expect(hybridSimilarity(left, right, 0)).toBeCloseTo(1, 5); // pooled cosine of identical vectors
+  });
+});
+
+// ---- §12 calibrated new-category score (cohesion vs. external-best) -----
+
+describe('computeClusterCohesion / computeExternalBest — pure functions', () => {
+  it('cohesion is the mean pairwise late-interaction score among cluster members', () => {
+    const members: SuggestionEvidenceItem[] = [
+      { id: 'a', embedding: new Float32Array(0), sentenceEmbeddings: [basis(0, 4)] },
+      { id: 'b', embedding: new Float32Array(0), sentenceEmbeddings: [basis(0, 4)] },
+      { id: 'c', embedding: new Float32Array(0), sentenceEmbeddings: [basis(1, 4)] }, // orthogonal to a/b
+    ];
+    // Pairs: (a,b)=1.0, (a,c)=0, (b,c)=0 -> mean = 1/3.
+    expect(computeClusterCohesion(members)).toBeCloseTo(1 / 3, 5);
+  });
+
+  it('cohesion of fewer than 2 members is 0 (nothing to pair)', () => {
+    expect(computeClusterCohesion([{ id: 'a', embedding: new Float32Array(0) }])).toBe(0);
+    expect(computeClusterCohesion([])).toBe(0);
+  });
+
+  it('externalBest is null when no existingWorkstreamSentenceVectors are supplied', () => {
+    const members: SuggestionEvidenceItem[] = [
+      { id: 'a', embedding: new Float32Array(0), sentenceEmbeddings: [basis(0, 4)] },
+    ];
+    expect(computeExternalBest(members, undefined, undefined)).toBeNull();
+  });
+
+  it('externalBest is null when no member carries sentence vectors, even with existing data supplied', () => {
+    const members: SuggestionEvidenceItem[] = [{ id: 'a', embedding: basis(0, 4) }];
+    const existing = new Map([['ws-x', [basis(0, 4)]]]);
+    expect(computeExternalBest(members, existing, undefined)).toBeNull();
+  });
+
+  it('externalBest excludes the split candidate\'s OWN scope workstream', () => {
+    const members: SuggestionEvidenceItem[] = [
+      { id: 'a', embedding: new Float32Array(0), sentenceEmbeddings: [basis(0, 4)] },
+    ];
+    const existing = new Map([
+      ['ws-own', [basis(0, 4)]], // identical, but excluded (own scope)
+      ['ws-other', [basis(3, 4)]], // orthogonal, not excluded
+    ]);
+    expect(computeExternalBest(members, existing, 'ws-own')).toBeCloseTo(0, 5);
+  });
+
+  it('externalBest is the SINGLE largest member-to-workstream score across every member and workstream', () => {
+    const members: SuggestionEvidenceItem[] = [
+      { id: 'a', embedding: new Float32Array(0), sentenceEmbeddings: [basis(2, 4)] }, // weak match to ws-x
+      { id: 'b', embedding: new Float32Array(0), sentenceEmbeddings: [basis(0, 4)] }, // strong match to ws-y
+    ];
+    const existing = new Map([
+      ['ws-x', [basis(1, 4)]],
+      ['ws-y', [basis(0, 4)]],
+    ]);
+    expect(computeExternalBest(members, existing, undefined)).toBeCloseTo(1, 5);
+  });
+});
+
+describe('resolveSuggestionMargin — env parsing ("0 = emit on any positive margin — keep liberal")', () => {
+  const original = process.env[SUGGESTION_MARGIN_ENV];
+  afterEach(() => {
+    if (original === undefined) delete process.env[SUGGESTION_MARGIN_ENV];
+    else process.env[SUGGESTION_MARGIN_ENV] = original;
+  });
+
+  it('defaults to DEFAULT_SUGGESTION_MARGIN when unset', () => {
+    delete process.env[SUGGESTION_MARGIN_ENV];
+    expect(resolveSuggestionMargin()).toBe(DEFAULT_SUGGESTION_MARGIN);
+  });
+
+  it('0 is a VALID, meaningful value — not treated as "unset"', () => {
+    process.env[SUGGESTION_MARGIN_ENV] = '0';
+    expect(resolveSuggestionMargin()).toBe(0);
+  });
+
+  it('negative/garbage falls back to the default', () => {
+    process.env[SUGGESTION_MARGIN_ENV] = '-1';
+    expect(resolveSuggestionMargin()).toBe(DEFAULT_SUGGESTION_MARGIN);
+    process.env[SUGGESTION_MARGIN_ENV] = 'not-a-number';
+    expect(resolveSuggestionMargin()).toBe(DEFAULT_SUGGESTION_MARGIN);
+  });
+});
+
+describe('recomputeSuggestionCandidates — §12 calibrated new-category score (cohesion vs. external-best emit-rule margin)', () => {
+  const withSentence = (items: readonly SuggestionEvidenceItem[], vec: Float32Array): SuggestionEvidenceItem[] =>
+    items.map((item) => ({ ...item, sentenceEmbeddings: [vec] }));
+
+  sqliteIt('a cohesive unfiled group with only a WEAK existing match emits, carrying both cohesion and externalBest', async () => {
+    const store = await makeStore();
+    try {
+      const unfiled = withSentence(groupEvidence('u', 5, 0, 'unfiled'), basis(0));
+      const result = recomputeSuggestionCandidates(store, {
+        scopeId: '__unfiled__',
+        kind: 'new-category',
+        evidence: unfiled,
+        revisionId: 'r1',
+        existingWorkstreamSentenceVectors: new Map([['ws-existing', [basis(5)]]]), // near-orthogonal
+      });
+      const candidate = result.allCandidates[0]!;
+      expect(candidate.emitted).toBe(true);
+      expect(candidate.cohesion).toBeCloseTo(1, 5);
+      expect(candidate.externalBest).toBeCloseTo(0, 5);
+    } finally {
+      store.close();
+    }
+  });
+
+  sqliteIt('a cohesive unfiled group with a STRONG existing match does NOT emit (margin fails)', async () => {
+    const store = await makeStore();
+    try {
+      const unfiled = withSentence(groupEvidence('u', 5, 0, 'unfiled'), basis(0));
+      const result = recomputeSuggestionCandidates(store, {
+        scopeId: '__unfiled__',
+        kind: 'new-category',
+        evidence: unfiled,
+        revisionId: 'r1',
+        existingWorkstreamSentenceVectors: new Map([['ws-existing', [basis(0)]]]), // identical
+      });
+      const candidate = result.allCandidates[0]!;
+      expect(candidate.emitted).toBe(false);
+      expect(candidate.externalBest).toBeCloseTo(candidate.cohesion, 5);
+    } finally {
+      store.close();
+    }
+  });
+
+  sqliteIt('externalBest is null (margin gate never blocks) when no existingWorkstreamSentenceVectors are supplied — liberal, backfill-safe default', async () => {
+    const store = await makeStore();
+    try {
+      const unfiled = withSentence(groupEvidence('u', 5, 0, 'unfiled'), basis(0));
+      const result = recomputeSuggestionCandidates(store, {
+        scopeId: '__unfiled__',
+        kind: 'new-category',
+        evidence: unfiled,
+        revisionId: 'r1',
+      });
+      const candidate = result.allCandidates[0]!;
+      expect(candidate.externalBest).toBeNull();
+      expect(candidate.emitted).toBe(true);
+    } finally {
+      store.close();
+    }
+  });
+
+  sqliteIt('an ALREADY-emitted candidate stays emitted even if a LATER recompute finds a strong external match (sticky — never retroactively un-emitted)', async () => {
+    const store = await makeStore();
+    try {
+      const unfiled = withSentence(groupEvidence('u', 5, 0, 'unfiled'), basis(0));
+      const first = recomputeSuggestionCandidates(store, {
+        scopeId: '__unfiled__',
+        kind: 'new-category',
+        evidence: unfiled,
+        revisionId: 'r1',
+      });
+      expect(first.allCandidates[0]?.emitted).toBe(true);
+      const second = recomputeSuggestionCandidates(store, {
+        scopeId: '__unfiled__',
+        kind: 'new-category',
+        evidence: unfiled,
+        revisionId: 'r2',
+        existingWorkstreamSentenceVectors: new Map([['ws-existing', [basis(0)]]]),
+      });
+      expect(second.allCandidates[0]?.emitted).toBe(true);
+    } finally {
+      store.close();
+    }
+  });
+
+  sqliteIt('a SPLIT candidate excludes its OWN scope workstream from external-best comparison', async () => {
+    const store = await makeStore();
+    try {
+      const groupA = withSentence(groupEvidence('a', 5, 0, 'kv-cache'), basis(0));
+      const groupB = withSentence(groupEvidence('b', 5, 1, 'beta'), basis(1));
+      const result = recomputeSuggestionCandidates(store, {
+        scopeId: 'ws-1',
+        kind: 'split',
+        evidence: [...groupA, ...groupB],
+        revisionId: 'r1',
+        // ws-1 is THIS split's own scope — an identical vector under that
+        // id must be excluded, not treated as a strong external match.
+        existingWorkstreamSentenceVectors: new Map([
+          ['ws-1', [basis(0)]],
+          ['ws-other', [basis(5)]],
+        ]),
+      });
+      const candidateA = result.allCandidates.find((c) => c.memberIds[0]?.startsWith('a-'))!;
+      expect(candidateA.externalBest).toBeCloseTo(0, 5); // ws-1 excluded, ws-other is a weak/orthogonal match
+      expect(candidateA.emitted).toBe(true);
     } finally {
       store.close();
     }

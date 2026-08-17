@@ -132,8 +132,29 @@ const ensureHandle = async (vaultRoot: string): Promise<KeywordIndexStore | null
 export const newLabelHintForPage = async (
   vaultRoot: string,
   canonicalUrl: string,
+  options?: {
+    /** §12 refinement (docs/plans/2026-08-16-category-flexibility-hyde.md
+     *  §12, "the attention of sentence matters"). The prototype lane
+     *  (guess lane 9, tabsession/prototypeLane.ts) is now sentence-aware
+     *  and structurally CANNOT influence the fusion decision that put this
+     *  page into the "genuinely no confident pick" state (laneCorroboration
+     *  .ts/laneFallback.ts hardcode their lane set to ['content','ai'] —
+     *  see prototypeLane.ts's own header) — so a confident prototype-lane
+     *  candidate on this SAME page is real, independent evidence that an
+     *  existing workstream is actually a decent fit, evidence the pooled/
+     *  structural lanes that decided "no candidates" never had access to.
+     *  When true, suppress the "start a new category" nudge: re-prompting
+     *  to CREATE a new category on a page that a sentence-aware match
+     *  already resembles an EXISTING one would be actively misleading, not
+     *  merely unhelpful. Optional/undefined behaves exactly as before this
+     *  phase (never suppressed on this basis) — the caller (server.ts)
+     *  computes this from the SAME per-URL result the prototype lane just
+     *  wrote, no second lookup. */
+    readonly prototypeLaneHasConfidentMatch?: boolean;
+  },
 ): Promise<NewLabelHint | null> => {
   if (!newLabelHintEnabled()) return null;
+  if (options?.prototypeLaneHasConfidentMatch === true) return null;
   const handle = await ensureHandle(vaultRoot);
   if (handle === null) return null;
   try {

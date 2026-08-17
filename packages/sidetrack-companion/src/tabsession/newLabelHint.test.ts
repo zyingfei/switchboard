@@ -127,6 +127,44 @@ describe('newLabelHintForPage — per-vault store lookup', () => {
     expect(hint).toBeNull();
   });
 
+  sqliteIt('§12 — suppressed when the (sentence-aware) prototype lane already found a confident match, even with enough keywords', async () => {
+    const index = await createKeywordIndexStore(vaultRoot);
+    try {
+      index.upsertPageKeywords(
+        'url:https://a.example/rust',
+        ['rust', 'ownership', 'systems'],
+        'deterministic',
+        100,
+      );
+    } finally {
+      index.close();
+    }
+    const hint = await newLabelHintForPage(vaultRoot, 'https://a.example/rust', {
+      prototypeLaneHasConfidentMatch: true,
+    });
+    expect(hint).toBeNull();
+  });
+
+  sqliteIt('§12 — NOT suppressed when the prototype lane found nothing (undefined/false behaves exactly as before)', async () => {
+    const index = await createKeywordIndexStore(vaultRoot);
+    try {
+      index.upsertPageKeywords(
+        'url:https://a.example/rust',
+        ['rust', 'ownership', 'systems'],
+        'deterministic',
+        100,
+      );
+    } finally {
+      index.close();
+    }
+    const withoutOptions = await newLabelHintForPage(vaultRoot, 'https://a.example/rust');
+    expect(withoutOptions).not.toBeNull();
+    const withFalse = await newLabelHintForPage(vaultRoot, 'https://a.example/rust', {
+      prototypeLaneHasConfidentMatch: false,
+    });
+    expect(withFalse).not.toBeNull();
+  });
+
   sqliteIt('reuses the SAME handle across repeated calls for one vault (lazy singleton)', async () => {
     const index = await createKeywordIndexStore(vaultRoot);
     try {

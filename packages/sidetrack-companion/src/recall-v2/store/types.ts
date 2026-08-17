@@ -40,6 +40,50 @@ export interface StoreDocumentChunk {
   readonly quality: string;
 }
 
+// ---- sentence vectors (docs/plans/2026-08-16-category-flexibility-hyde.md
+// §12 — "the attention of sentence matters"). A SEPARATE table from
+// documents_chunks/documents_chunks_vec on purpose: those are content-body
+// PASSAGE chunks keyed by a `docs.entity_id` FK (only ~16% of pages have one
+// — recall-v2 body indexing coverage), whereas a sentence-vector owner is
+// either a page's GIST (universal — synthesized for nearly every filed/
+// unfiled page regardless of recall-v2 body-indexing status, keyed by
+// canonicalUrl, the same id every other evidence-gathering module in this
+// feature area already uses) or a prototype TEXT (keyed by prototypeId, no
+// `docs` row at all). `ownerKind` is the "new kind/namespace column"
+// discriminator; the (ownerKind, ownerId, sentenceIndex) composite key
+// mirrors documents_chunks' (document_entity_id, chunk_index) shape exactly.
+//
+// STORED AS A PLAIN JSON COLUMN, NOT A SECOND vec0 VIRTUAL TABLE — a
+// deliberate deviation from documents_chunks_vec's pattern, for the SAME
+// reason prototypeGeneration.ts's embedCandidatePool documents: "reading raw
+// vector VALUES back out of a sqlite-vec vec0 table is not a pattern this
+// codebase uses anywhere today (every existing caller only ever reads back a
+// MATCH distance, never the stored vector)". Every planned late-interaction
+// call site needs the RAW vectors back (to run max/top-k scoring in
+// application code over a small, already-bounded set — never a fresh ANN
+// search), not a MATCH/KNN query, so a vec0 table would buy nothing here and
+// would be new, unverified read surface. A plain TEXT column this module
+// fully owns (same `JSON.stringify(Array.from(vec))` shape upsertVector/
+// upsertChunkVector/upsertPrototype already use for the WRITE side) is
+// simpler and stays inside this codebase's proven read pattern.
+export type SentenceVectorOwnerKind = 'page' | 'prototype';
+
+export interface SentenceVectorInput {
+  readonly sentenceIndex: number;
+  /** 'title' | 'gist' for a page owner; 'medoid' | 'synthetic-sibling' for a
+   *  prototype owner — same provenance vocabulary prototypes.angle already
+   *  uses, kept as a plain string here so this table never needs to know
+   *  about either owner kind's specific vocabulary. */
+  readonly source: string;
+  readonly text: string;
+  readonly embedding: Float32Array;
+}
+
+export interface SentenceVectorRow extends SentenceVectorInput {
+  readonly ownerKind: SentenceVectorOwnerKind;
+  readonly ownerId: string;
+}
+
 /** A single FTS5 hit. Score is BM25 (negative is better in bun:sqlite's
  *  bm25() ranking column — we'll convert to higher-is-better). */
 export interface StoreFtsHit {
@@ -211,6 +255,61 @@ export interface RecallStore {
     readonly bodyIndexed: 0 | 1;
     readonly pooledChunkCount: number;
   }[];
+
+  // ---- sentence vectors (§12 — see the SentenceVectorRow header above for
+  // WHY these are optional/plain-JSON rather than required/vec0). Every
+  // production SqliteRecallStore implements all five; a lightweight test
+  // fixture/store that predates this phase simply omits them, and every
+  // caller degrades to its documented single-vector fallback (same contract
+  // PrototypeLaneStore's getPrototypeKeywordIdf/getPrototypeKeywordProfile
+  // already establish for optional store methods in this feature area). ----
+
+  /** Replace ALL sentence-vector rows for one (ownerKind, ownerId) —
+   *  delete-then-insert, same idiom upsertDocumentChunks/upsertPrototype use
+   *  for "this owner's sentence set is always exactly its latest split+embed,
+   *  never an accumulating mix." An empty `sentences` array is a valid call
+   *  (clears the owner's rows without writing new ones). */
+  replaceSentenceVectors?(
+    ownerKind: SentenceVectorOwnerKind,
+    ownerId: string,
+    sentences: readonly SentenceVectorInput[],
+  ): void;
+
+  /** Delete every sentence-vector row for one owner. No-op if none exist. */
+  deleteSentenceVectors?(ownerKind: SentenceVectorOwnerKind, ownerId: string): void;
+
+  /** Every sentence-vector row for one owner, in sentenceIndex order. []
+   *  when the owner has none (never backfilled, or genuinely produced zero
+   *  sentences). */
+  getSentenceVectors?(
+    ownerKind: SentenceVectorOwnerKind,
+    ownerId: string,
+  ): readonly SentenceVectorRow[];
+
+  /** Batched read for several owners at once (an IN-list query) — the
+   *  serve-time-safe form: prototypeLane.ts uses this scoped to the small,
+   *  already-bounded set of prototypeIds its own whole-vector KNN just
+   *  returned, never a full-table scan. Owners with no rows are simply
+   *  absent from the returned map (not present with an empty array). */
+  getSentenceVectorsForOwners?(
+    ownerKind: SentenceVectorOwnerKind,
+    ownerIds: readonly string[],
+  ): ReadonlyMap<string, readonly SentenceVectorRow[]>;
+
+  /** Every ownerId currently persisted for `ownerKind` — used by the
+   *  sentence-vector backfill lane to answer "has this page already been
+   *  split+embedded" without a per-page query (same idiom
+   *  allDocumentChunkIds/allChunkVectorIds already establish). */
+  allSentenceVectorOwnerIds?(ownerKind: SentenceVectorOwnerKind): ReadonlySet<string>;
+
+  /** Every PROTOTYPE-owned sentence vector, joined back to its workstream in
+   *  one query (sentence_vectors JOIN prototypes on prototype_id) — the
+   *  bulk form suggestionRecomputeLane.ts's cohesion/external-best
+   *  calibration needs once per (slow, idle-cadence) recompute cycle: "this
+   *  candidate cluster vs. every OTHER existing workstream's sentence
+   *  vectors." Never called on a per-request path (see prototypeLane.ts's
+   *  getSentenceVectorsForOwners instead for that). */
+  sentenceVectorsByWorkstream?(): ReadonlyMap<string, readonly Float32Array[]>;
 
   close(): void;
 }

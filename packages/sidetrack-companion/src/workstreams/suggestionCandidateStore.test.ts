@@ -34,6 +34,8 @@ const candidate = (
   updatedAtMs: 1_000,
   dismissed: false,
   dismissedAtMs: null,
+  cohesion: 0,
+  externalBest: null,
   ...over,
 });
 
