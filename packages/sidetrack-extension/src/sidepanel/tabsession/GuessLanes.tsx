@@ -22,32 +22,23 @@
 
 import type { WorkstreamPrototypeStatus } from '../../companion/categoryFlexibilityClient';
 import { GIST_LANE_MARKER, GIST_LANE_MARKER_TITLE, whyUsedGist } from './gistProvenance';
+import { ATTRIBUTION_LANES } from './laneRegistry';
 import { prototypeStatusLine } from './prototypeStatusText';
 import type { GuessLaneResult, TabSessionWorkstreamOption } from './types';
 
-// Human labels for the six lanes — the resolver's arm names are jargon
-// ('graph', 'similarity', …); these are the plain words the user reads. Kept
-// here (not in suggestionEndorsement) because they're specific to the lane
-// breakdown surface. Order is the frozen wire order (graph → recency, then the
-// optional 'content'), so a lanes array rendered in-order reads
+// Human labels for the lanes — the resolver's arm names are jargon ('graph',
+// 'similarity', …); these are the plain words the user reads. Kept here (not
+// in suggestionEndorsement) because they're specific to the lane breakdown
+// surface. Order is the frozen wire order (graph → recency, then the optional
+// content/ai/prototype tail), so a lanes array rendered in-order reads
 // strongest-structural-signal first.
-const LANE_LABEL: Record<GuessLaneResult['lane'], string> = {
-  graph: 'Graph',
-  similarity: 'Similar pages',
-  topic: 'Topic',
-  title: 'Title match',
-  domain: 'Domain history',
-  recency: 'Recently active',
-  // 'content' (feat/content-lane) — the 7th arm, appended after recency; the
-  // disclosure renders lanes in array order so it slots in automatically when
-  // a newer companion sends it, and is simply never listed on older ones.
-  content: 'Content match',
-  // Lane 8 — the AI's own reading. Named for what it IS rather than how it is
-  // computed, because the whole point of splitting it out from 'content' is
-  // that a reader can see what the on-device model contributed.
-  ai: 'AI gist match',
-  prototype: 'Prototype match',
-};
+//
+// DERIVED from laneRegistry.ts (task #29)'s longLabel — no longer
+// hand-listed, so a lane registered there gets a label here automatically
+// instead of silently falling back to its raw wire id.
+const LANE_LABEL: Record<GuessLaneResult['lane'], string> = Object.fromEntries(
+  Object.entries(ATTRIBUTION_LANES).map(([lane, definition]) => [lane, definition.longLabel]),
+) as Record<GuessLaneResult['lane'], string>;
 
 const workstreamLabel = (
   workstreamId: string,

@@ -637,6 +637,80 @@ PR body for the actual numbers).
 
 ## Landing notes (current state, dated)
 
+**2026-08-17 — single lane registry: derived unions/allowlists/labels + all-
+lanes render contract test (feat/lane-contract-registry, task #29).** Not an
+F1–F7 item; filed here per the "binding plan tracks reality" rule. Closes a
+validated review finding: adding guess-lane 9 ('prototype', PR #377) required
+FOUR manual hand-edits across the two packages (companion's `GuessLane` union,
+extension's `VALID_LANES` parse whitelist, `OPTIONAL_LANE_ORDER` +
+`LANE_SHORT_LABEL` in PipelineStrip.tsx, `LANE_LABEL` in GuessLanes.tsx) with
+ZERO compile/test guarantee tying them together — the lane shipped
+server-side and was silently dropped TWICE (parse allowlist, then render
+order) in one day, both times a live bug report rather than a build failure.
+
+Registry location: no build-shared package exists between the companion
+(Node/Bun server bundle) and the extension (WXT/browser bundle) — they ship
+as fully separate bundles with zero cross-package imports today (checked).
+Rather than introduce a new shared workspace package for nine constant
+objects, the fix keeps ONE canonical file per package —
+`packages/sidetrack-companion/src/tabsession/laneRegistry.ts` and
+`packages/sidetrack-extension/src/sidepanel/tabsession/laneRegistry.ts` —
+each exporting an identical `ATTRIBUTION_LANES` object (`{ order, shortLabel,
+longLabel, behavior: 'decision'|'observe', alwaysVisible }` per lane) plus a
+generated snapshot at `docs/contracts/lanes.json`
+(`scripts/generate-lanes-contract.ts`, run from the companion's copy — the
+source of truth) that BOTH packages' test suites (`laneRegistry.test.ts` in
+each) assert deep-equality against. Drift on either side — or a hand-edited
+JSON that no longer matches the companion — now fails at least one suite
+immediately, at commit time, not in a live build.
+
+Derived, no longer hand-listed: companion's `GuessLane` type + `GUESS_LANE_
+ORDER` (the `alwaysVisible` lanes, `order`-sorted); extension's `GuessLane`
+type (`keyof typeof ATTRIBUTION_LANES`), `VALID_LANES` parse whitelist
+(`Object.keys`), PipelineStrip's `BASE_LANE_ORDER` / `OPTIONAL_LANE_ORDER`
+(alwaysVisible split, `order`-sorted) and `LANE_SHORT_LABEL`, GuessLanes'
+`LANE_LABEL` — all derived from the local registry copy. Zero behavioral
+diff: `GUESS_LANE_ORDER`'s runtime value, the six-then-three render order,
+and every label string are byte-identical to the prior hand-written
+versions (asserted by the pre-existing suites, unmodified, all green).
+
+New producer-to-render contract test
+(`packages/sidetrack-extension/tests/unit/laneRenderContract.test.tsx`,
+`describe.each(ALL_LANE_IDS)`): for EVERY registered lane, builds a
+synthetic wire payload (untyped, as JSON — not a type-checked fixture) and
+asserts (a) the real `parseGuessLanes` keeps it, (b) `GuessLanes`' disclosure
+renders a labeled row with the candidate's workstream + why text, (c)
+`PipelineStrip` renders a FILLED, correctly-labeled chip. This is the test
+that would have caught both the 'ai' and 'prototype' incidents the day each
+lane shipped, not after. 9 lanes × 3 assertions = 27 new tests, plus 4 mirror
+tests per package.
+
+Apple FM wire shapes (#377, task item 4): checked —
+`appleFmEngine.ts`/`.test.ts` and its request/response types are
+companion-only (`grep -rl appleFm packages/sidetrack-extension/src` → 0
+hits, before and after this change). No extension-side duplication exists to
+mirror; no action needed.
+
+Verification: companion `bun test` 3702 pass / 8 skip / 0 fail (408 files,
+rebuilt `dist/` first — the reconcile-child integration suite needs it and
+was otherwise a false pre-existing-looking failure on a fresh worktree, not
+a regression); extension `vitest run tests/unit` 1492 pass / 0 fail (164
+files, includes the 31 new lane tests); both packages' `tsc --noEmit` clean
+(the companion's own top-level `tsc --noEmit -p tsconfig.json` has ~50
+pre-existing unrelated errors — `bun:test` module-resolution + a handful of
+strict-mode fixture-type gaps in files this task never touched — confirmed
+identical on a clean `origin/main` checkout before this branch existed);
+both `bun run build` / `wxt build` clean. Deviations: none from the task
+brief; the one implementation snag was Vite's static rewrite of
+`new URL('../relative', import.meta.url)` into an `http://localhost/@fs/...`
+dev-server URL (its asset-import special case), which broke
+`fileURLToPath` in the extension's mirror test — worked around by resolving
+`import.meta.url` to a path first, then joining with `node:path`, which
+Vite doesn't intercept.
+
+PR: feat(contracts): single lane registry — derived unions/allowlists/labels
++ all-lanes render test (branch `feat/lane-contract-registry`).
+
 **2026-08-16 — resolver hub-subgraph traversal budgets
 (perf/resolver-subgraph-budget).** Not an F1–F7 item; filed here per the
 "binding plan tracks reality" rule since it hit the same measured symptom

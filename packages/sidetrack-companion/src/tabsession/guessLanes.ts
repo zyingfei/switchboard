@@ -27,6 +27,7 @@
 // timestamp.
 
 import type { CandidateEvidence } from './fusion.js';
+import { laneIdsInOrder, type GuessLane } from './laneRegistry.js';
 import {
   gatedDomainWorkstream,
   titleNearestWorkstream,
@@ -41,41 +42,34 @@ import {
 } from '../attribution-v1/state.js';
 
 // ---- wire contract (FROZEN, additive) ---------------------------------
-
-export type GuessLane =
-  | 'graph'
-  | 'similarity'
-  | 'topic'
-  | 'title'
-  | 'domain'
-  | 'recency'
-  // Lane 7 (additive, FROZEN CONTRACT). Query-time full-vector + BM25
-  // comparison per-workstream — computed OUTSIDE buildGuessLanes (async, needs
-  // the recall store handle) and APPENDED to the lanes array after 'recency'.
-  // It is intentionally NOT in GUESS_LANE_ORDER (that is the six synchronous,
-  // I/O-free lanes); see tabsession/contentLane.ts.
-  | 'content'
-  // Lane 8 (additive, FROZEN CONTRACT). The AI lane: the SAME query-time
-  // retrieval as 'content', but asked with the on-device gist ALONE as the
-  // query text — no title, no URL tokens. Where 'content' answers "what does
-  // this page's text resemble?", 'ai' answers "where does the model's READING
-  // of this page point?", and the difference between them is exactly the
-  // AI's marginal contribution. Present only when a gist exists; typed-empty
-  // (with the reason) otherwise, never silently absent.
-  | 'ai'
-  // Lane 9 (additive, FROZEN CONTRACT). The prototype lane — pure vector KNN
-  // of the page's query embedding against OFFLINE, per-workstream generated
-  // prototype texts (docs/plans/2026-08-16-category-flexibility-hyde.md §3).
-  // Computed OUTSIDE buildGuessLanes (async, needs the recall store handle),
-  // same append-after-the-fact shape as 'content'/'ai' — see
-  // tabsession/prototypeLane.ts. NO LLM call at serve time: generation is
-  // entirely offline/background; this lane only ever compares vectors.
-  // Typed-empty when no prototype has been generated yet for any workstream,
-  // or the recall store is unavailable. Disclosure only: zero effect on
-  // fusion/policy in this PR (see laneCorroboration.ts / laneFallback.ts,
-  // both of which hardcode their lane set to ['content','ai'] and are
-  // structurally unable to read this lane's opinion).
-  | 'prototype';
+//
+// GuessLane and its ordering are now DERIVED from tabsession/laneRegistry.ts
+// (task #29 — see that file's header for the incident this closes: adding
+// lane 9 required four hand-edits across two packages with no compile/test
+// guarantee, and the lane was silently dropped twice). The registry is the
+// single source of truth for lane identity, order, and labels, mirrored
+// byte-for-byte in the extension's copy and in docs/contracts/lanes.json.
+//
+// Lane 7 'content' (additive, FROZEN CONTRACT). Query-time full-vector + BM25
+// comparison per-workstream — computed OUTSIDE buildGuessLanes (async, needs
+// the recall store handle) and APPENDED to the lanes array after 'recency'.
+// It is intentionally NOT in GUESS_LANE_ORDER (that is the six synchronous,
+// I/O-free lanes); see tabsession/contentLane.ts.
+//
+// Lane 8 'ai' (additive, FROZEN CONTRACT). The SAME query-time retrieval as
+// 'content', but asked with the on-device gist ALONE as the query text — no
+// title, no URL tokens. Where 'content' answers "what does this page's text
+// resemble?", 'ai' answers "where does the model's READING of this page
+// point?". Present only when a gist exists; typed-empty otherwise.
+//
+// Lane 9 'prototype' (additive, FROZEN CONTRACT). Pure vector KNN of the
+// page's query embedding against OFFLINE, per-workstream generated prototype
+// texts (docs/plans/2026-08-16-category-flexibility-hyde.md §3). Computed
+// OUTSIDE buildGuessLanes, same append-after-the-fact shape as 'content'/'ai'
+// — see tabsession/prototypeLane.ts. Disclosure only: zero effect on
+// fusion/policy (see laneCorroboration.ts / laneFallback.ts, both of which
+// deliberately hardcode their lane set to ['content','ai']).
+export type { GuessLane } from './laneRegistry.js';
 
 export interface GuessLaneCandidate {
   readonly workstreamId: string;
@@ -96,14 +90,12 @@ export interface GuessLaneResult {
 }
 
 // The fixed lane order every response carries. All six ALWAYS present.
-export const GUESS_LANE_ORDER: readonly GuessLane[] = [
-  'graph',
-  'similarity',
-  'topic',
-  'title',
-  'domain',
-  'recency',
-];
+// DERIVED from laneRegistry.ts: the `alwaysVisible` lanes, sorted by `order`.
+// Zero behavioral diff from the old hand-written list — see
+// laneRegistry.test.ts for the value assertion.
+export const GUESS_LANE_ORDER: readonly GuessLane[] = laneIdsInOrder(
+  (definition) => definition.alwaysVisible,
+);
 
 // ---- env flag ---------------------------------------------------------
 
