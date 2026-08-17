@@ -534,3 +534,86 @@ describe('guess-lanes — prototype-lane visibility (docs/plans/2026-08-16-categ
     expect(screen.queryByText(/prototypes · updated/)).toBeNull();
   });
 });
+
+// Filed-lanes mode (docs/plans/2026-08-16-category-flexibility-hyde.md §9
+// addendum, scope 3) — once a page has a primary workstream, SuggestionStats'
+// unfiled headline/possibilities no longer apply, but the lane disclosure
+// must stay reachable (not disappear) and every guess becomes an "also add
+// as secondary" action instead of a re-file, with already-member guesses
+// rendered inert.
+describe('guess-lanes — filed mode (alreadyFiledWorkstreamIds)', () => {
+  it('stays reachable (collapsed by default) on a filed page instead of disappearing', () => {
+    render(
+      <SuggestionStats
+        suggestion={resolution({ action: 'inbox', margin: 0 }, [], lanesWithSomeSignal)}
+        workstreams={workstreams}
+        alreadyFiledWorkstreamIds={new Set(['ws-1'])}
+      />,
+    );
+    // No unfiled headline machinery — but the lane disclosure IS present.
+    expect(screen.queryByText('No signal yet')).toBeNull();
+    expect(screen.queryByText('No confident pick — lane guesses below')).toBeNull();
+    const details = screen.getByText(/Guess lanes/u).closest('details');
+    expect(details).not.toBeNull();
+    // Collapsed by default — reachable via the summary, not forced open.
+    expect(details).not.toHaveAttribute('open');
+  });
+
+  it('renders nothing when there is no suggestion yet or lanes are absent — nothing to disclose', () => {
+    const { container: emptyContainer } = render(
+      <SuggestionStats workstreams={workstreams} alreadyFiledWorkstreamIds={new Set(['ws-1'])} />,
+    );
+    expect(emptyContainer).toBeEmptyDOMElement();
+
+    const { container: noLanesContainer } = render(
+      <SuggestionStats
+        suggestion={resolution({ action: 'inbox', margin: 0 }, [])}
+        workstreams={workstreams}
+        alreadyFiledWorkstreamIds={new Set(['ws-1'])}
+      />,
+    );
+    expect(noLanesContainer).toBeEmptyDOMElement();
+  });
+
+  it('a guess for a workstream NOT already a member calls onAddSecondaryFromLane, never onFileHere', () => {
+    const onAddSecondaryFromLane = vi.fn();
+    const onFileHere = vi.fn();
+    render(
+      <SuggestionStats
+        suggestion={resolution({ action: 'inbox', margin: 0 }, [], lanesWithSomeSignal)}
+        workstreams={workstreams}
+        alreadyFiledWorkstreamIds={new Set(['ws-1'])}
+        onAddSecondaryFromLane={onAddSecondaryFromLane}
+        onFileHere={onFileHere}
+      />,
+    );
+    fireEvent.click(screen.getByText(/Guess lanes/u));
+    // The topic lane's top candidate is ws-3 (Reading / Longform) — not a
+    // member yet.
+    const laneRow = screen.getByText('Reading / Longform').closest('li');
+    expect(laneRow).not.toBeNull();
+    const addButton = within(laneRow as HTMLElement).getByRole('button', { name: 'Also add' });
+    fireEvent.click(addButton);
+    expect(onAddSecondaryFromLane).toHaveBeenCalledTimes(1);
+    expect(onAddSecondaryFromLane).toHaveBeenCalledWith('ws-3');
+    expect(onFileHere).not.toHaveBeenCalled();
+  });
+
+  it('a guess for a workstream ALREADY a member renders inert — no button, no add call', () => {
+    const onAddSecondaryFromLane = vi.fn();
+    render(
+      <SuggestionStats
+        suggestion={resolution({ action: 'inbox', margin: 0 }, [], lanesWithSomeSignal)}
+        workstreams={workstreams}
+        // ws-1 is the graph lane's top candidate.
+        alreadyFiledWorkstreamIds={new Set(['ws-1'])}
+        onAddSecondaryFromLane={onAddSecondaryFromLane}
+      />,
+    );
+    fireEvent.click(screen.getByText(/Guess lanes/u));
+    const laneRow = screen.getByText('Research / Probability').closest('li');
+    expect(laneRow).not.toBeNull();
+    expect(within(laneRow as HTMLElement).queryByRole('button')).toBeNull();
+    expect(within(laneRow as HTMLElement).getByText('✓ already in')).toBeInTheDocument();
+  });
+});

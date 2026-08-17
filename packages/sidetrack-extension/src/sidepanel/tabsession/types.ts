@@ -209,6 +209,19 @@ export interface TabSessionResolverCandidate {
   }[];
 }
 
+// New-workstream hint (docs/plans/2026-08-16-category-flexibility-hyde.md
+// §9 addendum) — an additive field on the batch-resolve result, present ONLY
+// when the page has keywords but no existing workstream is a confident
+// match. `name` is a suggested title; `keywords` are the terms behind it
+// (shown nowhere yet, but kept for a future "why" tooltip). Absent on older
+// companions and on any resolve where the companion had nothing to suggest —
+// callers must treat a missing/malformed hint as "render nothing", never
+// synthesize one client-side.
+export interface NewLabelHint {
+  readonly name: string;
+  readonly keywords: readonly string[];
+}
+
 export interface TabSessionResolutionResult {
   readonly tabSessionId: string;
   readonly dryRun: true;
@@ -228,6 +241,8 @@ export interface TabSessionResolutionResult {
   // GuessLaneResult); a lenient client parse drops it entirely rather than
   // reject the result when it's malformed. Readers render in array order.
   readonly lanes?: readonly GuessLaneResult[];
+  // See NewLabelHint. Additive, may be absent.
+  readonly newLabelHint?: NewLabelHint;
 }
 
 // A resolve REQUEST failed (500 / timeout / network) — NOT an empty
@@ -314,6 +329,8 @@ export interface UrlResolutionResult {
   // Guess-lanes — see TabSessionResolutionResult.lanes. Same additive,
   // may-be-absent contract on the URL-batch resolve wire shape.
   readonly lanes?: readonly GuessLaneResult[];
+  // See NewLabelHint. Same additive, may-be-absent contract.
+  readonly newLabelHint?: NewLabelHint;
 }
 
 // ---- Guess-lanes parse (lenient) ----------------------------------------
@@ -443,6 +460,27 @@ export const parseGuessGate = (value: unknown): GuessGate | undefined => {
   }
   if (typeof detail !== 'string') return undefined;
   return { reason: reason as GuessGateReason, detail };
+};
+
+// ---- New-label-hint parse (lenient) -------------------------------------
+//
+// `newLabelHint` is additive on every resolve wire shape. Same rule as
+// `lanes`/`gate`: parse leniently, and on ANY structural surprise treat the
+// hint as ABSENT (return undefined) — never render a hint synthesized from
+// garbage, and never reject the whole resolution over it.
+
+/** Lenient parse of a wire `newLabelHint` field. Returns the well-formed
+ * hint, or undefined when absent or malformed (old companion / no hint this
+ * resolve / a bug) — the caller then renders nothing, exactly as if the
+ * field were never sent. */
+export const parseNewLabelHint = (value: unknown): NewLabelHint | undefined => {
+  if (!isRecord(value)) return undefined;
+  const { name, keywords } = value;
+  if (typeof name !== 'string' || name.trim().length === 0) return undefined;
+  if (!Array.isArray(keywords) || !keywords.every((k) => typeof k === 'string')) {
+    return undefined;
+  }
+  return { name, keywords };
 };
 
 // The verdict arrow-line rendered by the PipelineStrip. Derived from the gate

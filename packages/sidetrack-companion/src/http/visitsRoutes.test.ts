@@ -285,6 +285,61 @@ describe('per-URL HTTP routes', () => {
     });
   });
 
+  // Panel scope 4 (docs/plans/2026-08-16-category-flexibility-hyde.md §9
+  // addendum) — the main-card AttributionBadge's "×" removes the PRIMARY
+  // membership row, not just secondaries. The route applies NO role-based
+  // validation (unlike a SET, which validates role/provenance/etc.) — this
+  // pins that a primary-role row is accepted for removal exactly like a
+  // secondary one, and that the fold (membershipEvents.test.ts's own
+  // "removing the primary leaves zero primaries" pins the invariant at the
+  // fold level) reflects zero primaries afterward via the read-back route.
+  it('POST .../memberships/{workstreamId}/remove accepts removing a PRIMARY-role row (no role-based rejection)', async () => {
+    const canonicalUrl = 'https://github.com/zyingfei/switchboard/primary-remove';
+    await appendObservation({ seq: 1, url: canonicalUrl, tabSessionId: 'tses_membership_primary' });
+
+    const setResponse = await fetch(
+      `${serverUrl}/v1/visits/${encodeURIComponent(canonicalUrl)}/memberships`,
+      {
+        method: 'POST',
+        headers: headers('idem-primary-set'),
+        body: JSON.stringify({ workstreamId: 'ws_primary', role: 'primary' }),
+      },
+    );
+    expect(setResponse.status).toBe(201);
+
+    const removeResponse = await fetch(
+      `${serverUrl}/v1/visits/${encodeURIComponent(canonicalUrl)}/memberships/ws_primary/remove`,
+      {
+        method: 'POST',
+        headers: headers('idem-primary-remove'),
+        body: JSON.stringify({}),
+      },
+    );
+    // The route does not reject a primary-role removal — same 201 contract
+    // as removing a secondary.
+    expect(removeResponse.status).toBe(201);
+    const body = (await removeResponse.json()) as {
+      data: { accepted: { type: string; payload: Record<string, unknown> } };
+    };
+    expect(body.data.accepted.type).toBe('workstream.membership.removed');
+    expect(body.data.accepted.payload).toMatchObject({
+      subjectId: canonicalUrl,
+      workstreamId: 'ws_primary',
+    });
+
+    // Read-back: zero active rows — not demoted to secondary, not silently
+    // re-promoted from anywhere.
+    const readBack = await fetch(
+      `${serverUrl}/v1/visits/${encodeURIComponent(canonicalUrl)}/memberships`,
+      { headers: headers() },
+    );
+    expect(readBack.status).toBe(200);
+    const readBody = (await readBack.json()) as {
+      data: { memberships: readonly { workstreamId: string; role: string }[] };
+    };
+    expect(readBody.data.memberships).toEqual([]);
+  });
+
   it('POST /v1/visits/{url}/suggestions/decline writes a decline with no membership row', async () => {
     const canonicalUrl = 'https://github.com/zyingfei/switchboard/actions';
     await appendObservation({ seq: 1, url: canonicalUrl, tabSessionId: 'tses_membership_d' });
