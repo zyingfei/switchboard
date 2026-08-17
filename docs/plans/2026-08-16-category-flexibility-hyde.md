@@ -1183,12 +1183,125 @@ delivery — the backfill lane was the only gap.
 
 **Deviation from the original plan:** none beyond what's documented above.
 Scope was kept to exactly the reported gap — wiring the backfill lane and
-verifying/documenting the rest of the audit — no unrelated behavior changes
-to `splitSuggestionEngine.ts`'s stability/clustering defaults or any other
-production policy.
+verifying/documenting the rest of the audit. (Two further scope additions —
+liberal suggestion-stability gating and a new-label hint on batch-resolve —
+landed in the SAME PR as coordinator-directed follow-ups; see the next
+addendum for both, kept as a clearly separated addition rather than folded
+silently into this one.)
 
 `bun run build` clean; `bun run typecheck` clean modulo the same pre-
 existing repo-wide `bun:test` module-resolution gap noted in §10's landing
 note above (unrelated to this change, `tsconfig.build.json` unaffected).
 Full `bun test` for `packages/sidetrack-companion` green (see PR for the
 exact count).
+
+**§10 addendum #3 — liberal suggestion gating + new-label hint (2026-08-17,
+same PR, coordinator-directed follow-up).**
+
+**(1) Liberal suggestion gating.** The stability gate that decides how many
+CONSECUTIVE stable computations a split/new-category candidate must survive
+before it is ever allowed to emit (`recomputeSuggestionCandidates`'s
+`stabilityMinConsecutive`, §4 above) was a flat `3`. Made env-tunable
+(`SIDETRACK_SUGGESTION_STABILITY`, `resolveSuggestionStabilityMinConsecutive`
+in `workstreams/splitSuggestionEngine.ts`) and the DEFAULT lowered to `1` —
+a qualifying candidate now surfaces on its first computation. Rationale:
+population-scoped decline memory (`declineCandidate`/`declinedConceptSets`,
+§7) makes a wrong suggestion nearly free to dismiss — one click, and that
+concept-set never resurfaces for the scope+kind again — so the 2-extra-
+cycle wait the old gate imposed on every GOOD candidate (minutes, at
+`suggestionRecomputeLane.ts`'s cadence) was withholding value to guard
+against a cost the decline UI already makes cheaper than the gate itself.
+`minClusterMembers` also gained an env knob
+(`SIDETRACK_SUGGESTION_MIN_MEMBERS`, `resolveSuggestionMinClusterMembers`)
+but its DEFAULT is UNCHANGED (still `HDBSCAN_TOPIC_MIN_SAMPLES + 1` = 4) and
+floored at `SUGGESTION_MIN_MEMBERS_FLOOR` (`HDBSCAN_TOPIC_MIN_SAMPLES` = 3,
+never settable below — a cluster smaller than the density primitive's own
+min-samples isn't a cluster by that primitive's own definition) — unlike
+stability, "how big must a cluster be" did not loosen, only "how many times
+must it look the same" did.
+
+Verified the `GET /v1/workstreams/suggestions` read surface has NO hidden
+second gate: its filter is exactly `candidate.emitted && !candidate.dismissed`
+(`http/routes/workstreamsRoutes.ts`) — `emitted` IS the stability-gated
+flag, so a candidate the engine emits under the new liberal default is
+immediately visible, proven by a new route-level test that runs the REAL
+engine (not a hand-built store row) and fetches it back same-request.
+
+Tests: the two original stability-mechanism tests
+(`splitSuggestionEngine.test.ts`) now pass `stabilityMinConsecutive: 3`
+explicitly (proving the MECHANISM is unchanged, only the bare-call default
+moved) and are renamed to say so; `splitSuggestionNewTopic.test.ts`'s shared
+options constant does the same (every test in that file is specifically
+about the 3-round cadence); new tests prove (a) a qualifying candidate
+emits on its bare-default first computation, (b) a declined signature stays
+suppressed even under the liberal default while an unrelated fresh cluster
+in the same cycle still emits on ITS first computation (decline memory
+beats liberal stability), (c) the GET-route immediate-visibility case above,
+and (d) env-parsing for both new resolvers (default/override/garbage/
+below-floor).
+
+**(2) New-label hint.** Additive, companion-side-only wire field on the
+batch-resolve response (`UrlResolutionResult.newLabelHint?: {name,
+keywords}`, `tabsession/newLabelHint.ts`, attached by `http/server.ts`'s
+`finalizeBatchResolveResults`) — panel rendering is a separate, already-
+in-flight change building against this contract; this PR ships the
+computation + wire shape only. Present when, for one URL: (a) NO existing
+workstream reached confidence — reusing, byte-for-byte, the SAME
+"genuinely no confident pick" condition `tabsession/laneFallback.ts`'s
+`applyLaneFallbackGuess` already established
+(`fusedCandidates.length === 0 && decision.gate?.reason === 'no-candidates'`),
+checked AFTER `applyLaneDecisions` so a page the lane-fallback guess
+successfully rescued is correctly NOT hinted; AND (b) the page carries
+`SIDETRACK_NEW_LABEL_HINT`-gated (default ON), so a keyword-store hiccup or
+an explicit disable costs nothing (`newLabelHintForPage` never throws, and
+the flag check happens before any store handle opens). `name` is the top-3
+keywords joined (same convention `splitSuggestionEngine.ts`'s
+`keywordNameFor` uses for cluster naming, applied here to one page's own
+terms). Lazy per-vault `KeywordIndexStore` singleton — a THIRD independent
+production caller of that store (after `keywordIngest.ts` and
+`workstreamSuggestionsRoutes.ts`), same "no shared singleton across
+modules" idiom.
+
+**Decline-exclusion, load-bearing, reused not reinvented.**
+`declineMemory.ts`'s own header documents the EXACT live bug this hint
+could have reintroduced: `gate.reason === 'no-candidates'` ALSO fires for a
+URL the user explicitly declined ("not in any stream"), and
+`applyLaneFallbackGuess`/`applyLaneCorroboration` both learned the hard way
+that re-suggesting on a declined page reads the decline as an invitation.
+The new-label-hint attachment in `finalizeBatchResolveResults` applies the
+SAME `isUrlDeclined(laneContext.declines, canonicalUrl)` guard those two
+lanes use, before ever reaching the keyword lookup — a page the user
+declined never gets a "make a new category" prompt either.
+
+Self-sufficiency note: `newLabelHintForPage`'s handle-opening `mkdir -p`s
+`_BAC/connections` itself (same defensive fix already applied to
+`scheduleKeywordBackfillLoop` above) — harmless in production (boot always
+creates that directory long before the HTTP listener starts accepting
+requests) but caught a real race in the new route-level tests against a
+freshly-created test vault.
+
+**Tests:**
+- `tabsession/newLabelHint.test.ts` (new) — pure `computeNewLabelHint`
+  (null below the 2-keyword floor, top-3 naming, full keyword list
+  preserved); env-flag defaults; per-vault lookup (present/absent by
+  indexed-keyword-count, flag-off no-op, lazy-singleton reuse).
+- `http/visitsRoutes.test.ts` (extended, `POST /v1/visits/batch-resolve —
+  newLabelHint` block) — weak lanes (edgeless snapshot, `gate.reason ===
+  'no-candidates'`) + >=2 keywords -> present; a strong existing-workstream
+  match (direct `closest_visit` -> `visit_in_workstream` asserted edge
+  chain, keywords present too, isolating the variable) -> absent; no
+  keywords indexed -> absent even with weak lanes; a declined URL -> absent
+  even with weak lanes + keywords; `SIDETRACK_NEW_LABEL_HINT=0` -> absent
+  for an otherwise-qualifying page.
+
+`bun run build` clean. Full `bun test` for `packages/sidetrack-companion`
+green (see PR for the exact count); the newly-touched suites
+(`splitSuggestionEngine.test.ts`, `splitSuggestionHybridDistance.test.ts`,
+`splitSuggestionNewTopic.test.ts`, `suggestionRecomputeLane.test.ts`,
+`http/workstreamsRoutes.test.ts`, `tabsession/newLabelHint.test.ts`,
+`http/visitsRoutes.test.ts`, `http/server.test.ts`,
+`http/routeTable.characterization.test.ts`,
+`http/batchResolveShape.characterization.test.ts`, `tabsession/
+resolver.test.ts`, `tabsession/laneFallback.test.ts`, `tabsession/
+laneCorroboration.test.ts`, `tabsession/declineMemory.test.ts`,
+`http/resolveSwrRoutes.test.ts`) reran green in isolation.
