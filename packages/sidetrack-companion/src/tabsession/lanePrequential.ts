@@ -207,6 +207,26 @@ const appendLaneLogLines = async (vaultRoot: string, lines: readonly string[]): 
 };
 
 /**
+ * Append pre-built prediction rows directly, bypassing the GuessLane-typed
+ * writer (recordLanePredictions below). For measurement callers scoring a
+ * narrower concept than a full disclosed lane — e.g. prototype lane v2's
+ * per-source arbitration (`'prototype:medoid'` / `'prototype:generated'` /
+ * `'prototype:keyword'`, docs/plans/2026-08-16-category-flexibility-hyde.md
+ * §11) — that still want the IDENTICAL append/rotate/score machinery and
+ * on-disk format `scoreLanePredictions` already reads generically (its `l`
+ * field is a plain string, not constrained to `GuessLane`). Same best-effort
+ * contract as recordLanePredictions: the caller fires-and-forgets this.
+ */
+export const recordRawLanePredictions = async (
+  vaultRoot: string,
+  records: readonly LanePredictionRecord[],
+): Promise<number> => {
+  if (!lanePrequentialEnabled()) return 0;
+  if (records.length === 0) return 0;
+  return await appendLaneLogLines(vaultRoot, records.map((r) => JSON.stringify(r)));
+};
+
+/**
  * Append every lane's TOP pick for each resolved URL, as one write.
  *
  * Batched deliberately: a batch-resolve serves up to a few dozen URLs, and one
