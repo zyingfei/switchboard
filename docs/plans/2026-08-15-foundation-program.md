@@ -2177,3 +2177,79 @@ writes).
 
 PR: perf(store): diff-aware putCurrent — O(changed-rows) WAL writes per
 publish (branch `perf/diff-aware-putcurrent`).
+
+**2026-08-17 — CI cross-package spine (task #31, ci/cross-package-spine).**
+Not an F1–F7 item; filed here per the "binding plan tracks reality" rule.
+Issue #143's evidence: PR #141 shipped with `/v1/edge/events` effectively
+unreachable and nothing caught it, because at the time there was no hosted
+CI at all (`gh api .../actions/workflows` returned `total_count: 0`, no
+`.github/` directory existed). Three additive jobs on top of the (now-
+existing) `ci.yml`, honest-CI philosophy preserved (fast, deterministic,
+no browser in the blocking path):
+
+1. **Blocking deterministic smoke** —
+   `packages/sidetrack-companion/src/integration/extensionCompanionSpine.test.ts`.
+   Boots a real `createCompanionHttpServer`/`startHttpServer` instance
+   (same harness `batchResolveShape.characterization.test.ts` /
+   `prototypeLaneWiring.test.ts` use), replays the extension's REAL wire
+   shapes (edge-event batch ordering imported directly from
+   `sidetrack-extension/src/background/storage/edge-event-drain.ts`;
+   page-content POST via the extension's real, shipped
+   `PageContentClient.index()` — both are dependency-free leaf modules,
+   verified importable cross-package with zero chrome/DOM machinery
+   pulled in) through the canonical loop: `POST /v1/edge/events` ->
+   `POST /v1/timeline/events` -> `POST /v1/page-content/extracted` ->
+   drain via `SyncContractRunner.awaitIdle()` (no sleeps) -> `GET
+   /v1/timeline` + `GET /v1/visits/inbox` + `GET /v1/page-content/coverage`
+   all show the visit -> idempotent-replay + direct event-log read-back
+   proves the durable substrate recorded `engagement.session.aggregated`
+   (issue #143's exact ask, generalized past "the HTTP call returned
+   200"). No ci.yml change needed for this item — `bun test` auto-
+   discovers the new file, so it joins the EXISTING blocking `companion`
+   job's full-suite run automatically. Verified deterministic 3x locally
+   (~300ms/run).
+2. **`vector-real-dim` job (new, blocking)** — the `companion` job's
+   `SIDETRACK_SQLITE_LIB=off` opt-out (added so low-dimension fixtures
+   elsewhere don't hit strict vec-column enforcement) meant the blocking
+   gate never guaranteed real-384-dim sqlite-vec coverage end to end. New
+   job runs the genuinely vector-dependent suites (5 files: the four
+   `recall-v2/store/*.test.ts` sqlite-vec-store suites +
+   `http/prototypeLaneWiring.test.ts`) WITHOUT the opt-out, real
+   `RECALL_MODEL.embeddingDim` (384) vectors, on ubuntu-latest — 20 tests,
+   371-406ms measured locally across 3 repeated runs, so BLOCKING per the
+   task's <2min bar. Notable finding surfaced during verification (via
+   `gh run view` on a recent green `main` run): `SIDETRACK_SQLITE_LIB=off`
+   does NOT actually prevent sqlite-vec from loading on GitHub's
+   `ubuntu-latest` runner today — `prototypeLaneWiring.test.ts`'s hard
+   `vectorBackendAvailable===true` assertion already passes there,
+   contradicting local macOS reproduction (where the opt-out genuinely
+   disables vec). Pre-existing platform discrepancy, unrelated to this
+   change, flagged in docs/CI.md rather than fixed here (out of scope for
+   #31) — it does independently confirm the new job's core assumption
+   (real vec-capable sqlite is available on that runner).
+3. **`package-smoke` job (new, advisory)** — `wxt build` (real extension
+   artifact) + companion `tsc -p tsconfig.build.json` + `stamp-build.mjs`,
+   boot `dist/cli.js` against an empty temp vault, assert `/v1/version`
+   reports a `buildSha`, `SIGTERM`, assert clean exit inside the shutdown
+   watchdog's grace window (the #374 shutdown contract). ~15-20s measured
+   locally (macOS). Advisory (`continue-on-error: true`) since real
+   bundling + process-signal timing carries more environment-specific
+   flake risk than a pure unit-test job; promote once stable across real
+   PR traffic.
+
+`docs/CI.md` (new) documents the full `bun run verify` (local, authoritative,
+runs `build`/`lint`/`format:check` too) vs hosted-CI (fast, parallel,
+per-package, does not run `verify` verbatim) contract, the per-job
+blocking/advisory table, and why browser e2e
+(`connections-full-browser-sync-user-story.spec.ts`) stays out of the
+blocking path — it still exists, still runs in the live-check loop
+(`docs/dev-testing.md`), just isn't wired to block merges.
+
+`connectionsMaterializer.ts` untouched, per this task's binding
+constraint — the spine test deliberately exercises the (simpler, already
+event-driven) timeline materializer + direct event-log/projection reads
+instead of wiring the Class B connections materializer into the test
+harness.
+
+PR: ci: cross-package spine — extension→companion smoke, real-dim
+vectors, package smoke (branch `ci/cross-package-spine`).
