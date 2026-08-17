@@ -183,7 +183,11 @@ export const buildPrototypeLane = async (
     .map(([workstreamId, agg]) => ({
       workstreamId,
       score: agg.best < 0 ? 0 : agg.best > 1 ? 1 : agg.best,
-      why: `closest of ${String(agg.count)} matching generated prototype${agg.count === 1 ? '' : 's'}, similarity ${agg.best.toFixed(2)}`,
+      // UI-visibility phase (docs/plans/2026-08-16-category-flexibility-
+      // hyde.md) — plain-language `why`, not the ML term "prototype": the
+      // client already shows the matched workstream's NAME beside this
+      // string (guess-lane-name), so this doesn't repeat it.
+      why: `close to ${String(agg.count)} example${agg.count === 1 ? '' : 's'} generated for this workstream (${agg.best.toFixed(2)})`,
     }))
     .sort((left, right) =>
       right.score !== left.score

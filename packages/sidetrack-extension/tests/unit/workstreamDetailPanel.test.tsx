@@ -207,3 +207,71 @@ describe('WorkstreamDetailPanel — rename + move', () => {
     expect((title as HTMLButtonElement).disabled).toBe(true);
   });
 });
+
+describe('WorkstreamDetailPanel — prototype-lane visibility', () => {
+  it('renders the one-line prototype status when provided', () => {
+    render(
+      <WorkstreamDetailPanel
+        workstreamLabel="Research"
+        linkedNotes={[]}
+        trustEntries={[]}
+        onClose={() => undefined}
+        onTrustChange={() => undefined}
+        prototypeStatus={{
+          workstreamId: 'ws_research',
+          prototypeCount: 3,
+          generatedAt: Date.now() - 2 * 60 * 60 * 1000,
+          evidenceCount: 12,
+          evidenceWatermark: '12:abc',
+          engine: 'apple-fm#reason=ok',
+          engineLabel: 'Apple Intelligence',
+          method: 'generated',
+          methodNote: null,
+          whyNot: null,
+          whyNotDetail: null,
+        }}
+      />,
+    );
+    expect(screen.getByText('Prototype matching')).toBeInTheDocument();
+    expect(screen.getByText(/3 prototypes · updated .* from 12 pages/)).toBeInTheDocument();
+  });
+
+  it('renders the honest why-not when no prototypes exist yet', () => {
+    render(
+      <WorkstreamDetailPanel
+        workstreamLabel="New group"
+        linkedNotes={[]}
+        trustEntries={[]}
+        onClose={() => undefined}
+        onTrustChange={() => undefined}
+        prototypeStatus={{
+          workstreamId: 'ws_new',
+          prototypeCount: 0,
+          generatedAt: null,
+          evidenceCount: 2,
+          evidenceWatermark: null,
+          engine: null,
+          engineLabel: null,
+          method: null,
+          methodNote: null,
+          whyNot: 'needs 5+ saved pages, has 2',
+          whyNotDetail: null,
+        }}
+      />,
+    );
+    expect(screen.getByText('needs 5+ saved pages, has 2')).toBeInTheDocument();
+  });
+
+  it('renders no prototype section when prototypeStatus is omitted', () => {
+    render(
+      <WorkstreamDetailPanel
+        workstreamLabel="No status yet"
+        linkedNotes={[]}
+        trustEntries={[]}
+        onClose={() => undefined}
+        onTrustChange={() => undefined}
+      />,
+    );
+    expect(screen.queryByText('Prototype matching')).toBeNull();
+  });
+});

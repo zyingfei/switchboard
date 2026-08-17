@@ -1,5 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 
+import type { WorkstreamPrototypeStatus } from '../../../src/companion/categoryFlexibilityClient';
+import { prototypeStatusLine } from '../../../src/sidepanel/tabsession/prototypeStatusText';
 import { ChecklistPanel, type ChecklistPanelItem } from './ChecklistPanel';
 import { Icons } from './icons';
 import type { LinkedNote } from './LinkedNotes';
@@ -58,6 +60,11 @@ interface WorkstreamDetailPanelProps {
   // companion export route and reports the written file paths back so
   // the panel can confirm inline. Undefined = action hidden.
   readonly onExport?: () => Promise<readonly string[]>;
+  // Prototype-lane visibility (docs/plans/2026-08-16-category-flexibility-
+  // hyde.md, UI-visibility phase — "very little visibility about how hyDE
+  // works"). Undefined -> the section renders nothing (old companion, or
+  // this workstream has neither evidence nor a generation history yet).
+  readonly prototypeStatus?: WorkstreamPrototypeStatus;
 }
 
 const collectDescendantIds = (
@@ -97,6 +104,7 @@ export function WorkstreamDetailPanel({
   onChecklistRemove,
   checklistBusy = false,
   onExport,
+  prototypeStatus,
 }: WorkstreamDetailPanelProps) {
   const renameEnabled = onRename !== undefined && workstream !== undefined;
   const moveEnabled = onMove !== undefined && workstream !== undefined;
@@ -205,6 +213,15 @@ export function WorkstreamDetailPanel({
         )}
         <span className="muted">workstream</span>
       </div>
+
+      {prototypeStatus !== undefined ? (
+        <div className="detail-sec">
+          <div className="detail-sec-head">Prototype matching</div>
+          <div className="ws-detail-prototype-status mono subtle">
+            {prototypeStatusLine(prototypeStatus)}
+          </div>
+        </div>
+      ) : null}
 
       {moveEnabled ? (
         <div className="detail-sec">

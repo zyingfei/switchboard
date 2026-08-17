@@ -226,6 +226,41 @@ describe('recomputeSuggestionCandidates — dirty-marking (incremental recompute
   });
 });
 
+describe('recomputeSuggestionCandidates — decline memory (dismissed) is sticky across recompute', () => {
+  sqliteIt('a dismissed candidate stays dismissed after a later recompute with drifted-but-overlapping membership', async () => {
+    const store = await makeStore();
+    try {
+      const groupA = groupEvidence('a', 4, 0, 'alpha');
+      const groupB = groupEvidence('b', 4, 1, 'beta');
+      const r1 = recomputeSuggestionCandidates(store, {
+        scopeId: 'ws-1',
+        kind: 'split',
+        evidence: [...groupA, ...groupB],
+        revisionId: 'r1',
+      });
+      const target = r1.allCandidates.find((c) => c.memberIds[0]?.startsWith('a-'));
+      expect(target).toBeDefined();
+      expect(store.dismissCandidate('ws-1', 'split', target!.fingerprint, 5_000)).toBe(true);
+
+      // A tiny membership drift (one extra member) still overlaps well above
+      // the 0.75 Jaccard match threshold, so the engine must recognize this
+      // as "the same emerging cluster" and carry the dismissal forward.
+      const groupADrifted = [...groupA, { id: 'a-extra', embedding: basis(0), title: 'alpha extra' }];
+      const r2 = recomputeSuggestionCandidates(store, {
+        scopeId: 'ws-1',
+        kind: 'split',
+        evidence: [...groupADrifted, ...groupB],
+        revisionId: 'r2',
+      });
+      const carried = r2.allCandidates.find((c) => c.memberIds.includes('a-0'));
+      expect(carried?.dismissed).toBe(true);
+      expect(carried?.dismissedAtMs).toBe(5_000);
+    } finally {
+      store.close();
+    }
+  });
+});
+
 describe('recomputeSuggestionCandidates — new-category', () => {
   sqliteIt('fires on a single qualifying cluster (no ">=2" requirement)', async () => {
     const store = await makeStore();

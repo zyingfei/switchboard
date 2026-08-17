@@ -569,3 +569,167 @@ engine deferred to avoid the sibling branch's active files.
 
 Full test suite green (`bun test`); `bun run build` clean. See the PR for
 file list and exact test counts.
+
+## 9. Landing note — UI-visibility phase (2026-08-17)
+
+USER DIRECTIVE that scoped this phase: "shipped features are invisible;
+get them into the panel where the user already looks." §1/§2 (multi-
+membership) landed in #376, §2/§3 (prototype lane) in #377, §4 (split/
+new-category stats) also in #376 — none of it had a panel surface until
+this PR. No new computation anywhere in this phase: every route below is
+a READ (or a thin write reusing #376's existing event types) over data
+those two PRs already produce.
+
+**A.1 — multi-membership chips.** New file
+`packages/sidetrack-companion/src/workstreams/membershipEvents.ts`'s
+`foldAllActiveMemberships(subjectKind, events)` — one bucketing pass over
+the raw membership-event set, then one `foldWorkstreamMembership` call
+per subject over ONLY that subject's own bucket (never O(subjects ×
+events)). Three route changes in `http/routes/visitsRoutes.ts`: a new
+`GET /v1/visits/:canonicalUrl/memberships` (single-URL, on-demand), and a
+`memberships` overlay added to both `GET /v1/visits/projection` and
+`GET /v1/visits/inbox` (batched, one extra type-indexed event read per
+request). **Important finding, test-verified**
+(`http/visitsRoutes.test.ts`, "overlay SECONDARY memberships onto
+items"): `currentAttribution` (the pre-multi-membership scalar
+`AttributionBadge` reads) and the new `memberships` fold are TWO
+INDEPENDENT sources today — a page filed via the older `/attribute` route
+has a `currentAttribution` but zero rows in the new fold, because no
+backfill has run (§1's backfill is explicitly a separate, one-time,
+consent-gated CLI step, not automatic). The panel's `MembershipChips`
+component (`src/sidepanel/tabsession/MembershipChips.tsx`) is written
+defensively around this: it always filters out any membership row whose
+`workstreamId` equals the primary, so a future backfill landing changes
+nothing about how chips render. Wired into `InboxCard.tsx` beside the
+existing `AttributionBadge` (primary stays the one visually-dominant
+chip); rendered in both `InboxView` (Inbox) and the workstream detail
+"Pages in this workstream" list in `App.tsx`. Strings: `Also in: <name>`
+label + pill chips with a `×` remove (secondary chips only, per spec) +
+a `+` "Add to another workstream" affordance that opens the existing
+`WorkstreamPicker` in a new additive mode (new `membershipAddTargetId`
+state, parallel to the existing replace-primary `tabSessionMoveId`
+state — independent so the two pickers never fight over what a selection
+means). Picking "Not assigned" in that additive picker is a no-op
+(documented in code) rather than a new no-membership-add mechanism.
+
+**A.2 — split / new-category suggestions.** `suggestionCandidateStore.ts`
+gained `dismissed`/`dismissedAtMs` fields (additive `ALTER TABLE ADD
+COLUMN`, same guarded idiom `sync/eventStore.ts` uses for `resolver_url`)
+and a `dismissCandidate(scopeId, kind, fingerprint, dismissedAtMs)`
+method; `splitSuggestionEngine.ts` carries `dismissed`/`dismissedAtMs`
+forward across recomputes via the SAME Jaccard-overlap match that already
+carries `consecutiveStableCount` forward — decline memory that survives
+a re-cluster, matching "per-scope decline memory means it never recurs."
+Replaced the predecessor's uncommitted, single-purpose
+`GET /v1/workstreams/:workstreamId/split-suggestion` with ONE generalized
+read surface for BOTH kinds: `GET /v1/workstreams/suggestions?kind=split
+&workstreamId=<id>` or `?kind=new-category` (workstreamId ignored,
+always reads the store's `NEW_CATEGORY_SCOPE_ID` sentinel internally —
+never leaked over the wire), returning every `emitted && !dismissed`
+candidate. `POST /v1/workstreams/suggestions/decline` (body
+`{kind, fingerprint, workstreamId?}`) is the whole-CLUSTER counterpart to
+#376's per-URL `.../suggestions/decline` — that route declines "this URL
+into this EXISTING workstream"; this one declines "this proposed NEW
+grouping, which has no workstream yet," a real gap the existing
+`SUGGESTION_DECLINED` event schema (keyed to an existing workstreamId)
+cannot express. One `WorkstreamSuggestionCard` component renders BOTH
+kinds off the store's own `kind` discriminator — split cards render
+inside the source workstream's own "Pages in this workstream" list
+(fetched per-workstream on switch); new-category cards render at the top
+of the Inbox (fetched once on entering that view) — surfaced exactly
+where their affected pages already live. Strings: split —
+`These N pages look like their own group — split?` (+ the structural
+name as a secondary line when one exists); new-category —
+`These N unfiled pages look like a topic: <keywords> — create it?` (or
+the nameless fallback when the structural namer found nothing). Actions
+are `Accept`/`Decline` (not the codebase's usual dismiss-icon `×`) —
+deliberate: this is a create-a-new-workstream decision, a different
+stakes class than a per-row hint dismissal. **Accept flow** (design §4,
+"not a new mechanism"): `POST /v1/workstreams` create, then
+`POST .../memberships {role:'primary', suggestionSource}` for every
+member, then the candidate is immediately consumed via the SAME decline
+endpoint (`declineSuggestionCandidate`) so it stops resurfacing — the
+store's `dismissed` flag doesn't distinguish accepted-vs-declined by
+design; both mean "never show me this exact cluster again." `role:
+'primary'` was chosen deliberately: per the A.1 finding above,
+`currentAttribution` doesn't read this event type at all yet, so
+`'primary'` has no worse a display side effect than `'secondary'` today,
+and is the semantically correct value once the backfill lands.
+**Realistic caveat, stated plainly:** `recomputeSuggestionCandidates` is
+still never called by anything in production (per #376's own landing
+note, §8 above) — this phase's read/accept/decline surfaces are real and
+fully tested against a manually-seeded store, but will show empty in a
+running companion until a future PR wires a recompute pass. That wiring
+is explicitly out of scope here (same reasoning #376 gave: it touches
+the sibling recall-v2 branch's active files).
+
+**B — prototype-lane visibility.** Kept the prior session's
+`GET /v1/workstreams/prototypes/status` route and
+`workstreams/prototypeStatus.ts` unchanged (verified correct; added the
+test file it was missing, `prototypeStatus.test.ts`, 10 cases covering
+every `whyNot`/`methodNote` branch). New client
+`src/companion/categoryFlexibilityClient.ts` (extension) fetches it once
+per bridge connection (not per-render), building a
+`Map<workstreamId, WorkstreamPrototypeStatus>` threaded to three panel
+surfaces via one shared formatter,
+`src/sidepanel/tabsession/prototypeStatusText.ts`'s `prototypeStatusLine`
+— so the wording can never drift between them: (1) the prototype lane's
+own row in the guess-lanes hover/expanded disclosure
+(`GuessLanes.tsx`/`SuggestionStats.tsx`), appended beneath the per-match
+`why` line (distinct — `why` describes THIS match, the new line
+describes the workstream's STANDING prototype state); (2) every
+`WorkstreamPicker` row (all three instances — the create/re-file/
+add-membership pickers all share the one component), as a one-line
+subtitle under the workstream name; (3) `WorkstreamDetailPanel`'s new
+"Prototype matching" section. String: `{N} prototype(s) · updated
+{relative} from {M} page(s)`, or the route's own honest `whyNot` verbatim
+when none exist (`needs 5+ saved pages, has 2`, `Apple Intelligence
+engine unavailable`, `generation pending — runs in the background`). No
+separate dashboard — all three are places the user already looks per the
+UI taste rules.
+
+**B.3 — why-string jargon pass.** Audited every `emptyReason`/`why`
+string `prototypeLane.ts` emits. The `emptyReason` set (`recall store
+unavailable`, `vector backend unavailable`, `embedder cold — cannot
+compare`, …) turned out to be a DELIBERATE, pre-existing CROSS-LANE
+convention — `contentLane.ts` emits byte-identical strings for the same
+underlying conditions, and `laneFallback.test.ts` string-matches
+`'recall store unavailable'` regardless of which lane produced it. That's
+house style spanning the whole guess-lane subsystem, not jargon #377
+introduced — left untouched (rewriting it means touching every lane and
+dozens of pinned tests, well outside this phase's scope). The ONE string
+that WAS prototype-lane-specific and read as jargon: the populated `why`,
+`"closest of N matching generated prototype(s), similarity 0.NN"` — stiff
+phrasing, and "prototype" is an ML term the client never needs (the
+matched workstream's NAME already renders adjacent to this string).
+Rewritten to `"close to N example(s) generated for this workstream
+(0.NN)"` — closer to the brief's own suggested tone
+(`"close to the examples generated from your Research pages (0.81)"`,
+minus the redundant name already shown beside it). Updated the one
+pinned assertion (`prototypeLane.test.ts`) and a golden-case fixture
+(`goldenResolveCases.test.ts` case 5 — the string there is incidental
+fixture data, not an assertion target, so this is cosmetic-only there).
+
+**Deviations, stated plainly (none silent):** (1) Thread/tab-session
+membership chips not built — the read/write routes only cover
+`subjectKind:'canonical-url'` (#376's own scope note, §8 above); no
+extension UI surface reads thread/tab-session membership today either.
+(2) The additive "add to workstream" picker reuses the existing
+single-select `WorkstreamPicker` rather than a new multi-select
+component — picking "Not assigned" there is a silent no-op, documented
+in code, not a new mechanism. (3) `role:'primary'` for suggestion-accept
+memberships, reasoned above. (4) Cherry-picked PR #383's two commits
+(`fix/prototype-lane-panel-allowlist` — adds `'prototype'` to the
+extension's `GuessLane`/`VALID_LANES`/`OPTIONAL_LANE_ORDER`/label maps;
+was open, not yet on `origin/main`, per the task's own instruction to
+reuse rather than duplicate) as this branch's first two commits.
+
+Both packages: `bun test` (companion, 3474 pass / 8 skip / 0 fail) and
+`vitest run tests/unit` (extension, 1442 pass / 161 files) green;
+`bun run build` clean in both (companion `tsc -p tsconfig.build.json`;
+extension `wxt build`). One companion test was observed flaky on a single
+loaded-machine run (passed clean on immediate rerun and on the final full
+run) — unrelated file, not caused by this phase's changes. Bun itself
+(v1.3.14) panics with a C++ exception on process EXIT after `bun test`'s
+own summary prints "0 fail" — an engine-level crash ("this indicates a
+bug in Bun, not your code"), not a test failure.

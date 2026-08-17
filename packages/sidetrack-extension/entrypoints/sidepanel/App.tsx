@@ -109,6 +109,11 @@ import { createTurnsClient, type CapturedTurnRecord } from '../../src/turns/clie
 import { deriveLifecycle } from '../../src/sidepanel/lifecycle';
 import { useFocusedRelatedPages } from '../../src/sidepanel/focusedRelated';
 import { formatRelative } from '../../src/util/time';
+import {
+  createCategoryFlexibilityClient,
+  type SuggestionCandidateSummary,
+  type WorkstreamPrototypeStatus,
+} from '../../src/companion/categoryFlexibilityClient';
 import { createSuggestionsClient } from '../../src/companion/suggestionsClient';
 import { listPendingOffers, markStatus, type OfferRecord } from '../../src/codingAttach/state';
 import {
@@ -173,6 +178,8 @@ import { tabSessionDisplayTitle } from '../../src/sidepanel/tabsession/displayTi
 import { InboxCard } from '../../src/sidepanel/tabsession/InboxCard';
 import { InboxView } from '../../src/sidepanel/tabsession/InboxView';
 import { PageEvidenceBadge } from '../../src/sidepanel/tabsession/PageEvidenceBadge';
+import { prototypeStatusLine } from '../../src/sidepanel/tabsession/prototypeStatusText';
+import { WorkstreamSuggestionCard } from '../../src/sidepanel/tabsession/WorkstreamSuggestionCard';
 import { loadOrCreateEdgeReplica } from '../../src/sync/edgeReplicaId';
 import {
   TAB_SESSION_DRAG_MIME,
@@ -267,6 +274,7 @@ const tabSessionRecordFromUrl = (url: UrlVisitRecord): TabSessionRecord => ({
         },
       }),
   ...(url.pageEvidence === undefined ? {} : { pageEvidence: url.pageEvidence }),
+  ...(url.memberships === undefined ? {} : { memberships: url.memberships }),
   attributionHistory: url.attributionHistory,
 });
 
@@ -959,6 +967,12 @@ const App = () => {
   // "active workstream pill" intent). Keeps tab attribution and intent
   // independent so changing one doesn't accidentally change the other.
   const [tabSessionMoveId, setTabSessionMoveId] = useState<string | null>(null);
+  // Multi-membership "add to workstream" picker — when set, the
+  // WorkstreamPicker modal ADDS a secondary membership to this canonical
+  // URL instead of replacing the primary (the tabSessionMoveId picker
+  // above does the replace). Independent state so the two pickers never
+  // fight over which action a selection means.
+  const [membershipAddTargetId, setMembershipAddTargetId] = useState<string | null>(null);
   // Stage 5 polish — debug panel-state dump. Tracks the latest dump
   // result so the icon button can flash a success/error chip with the
   // file path the user can hand to an assistant.
@@ -1205,6 +1219,32 @@ const App = () => {
   const [urlInbox, setUrlInbox] = useState<UrlInboxData>(EMPTY_URL_INBOX);
   const [urlProjection, setUrlProjection] = useState<UrlProjection | null>(null);
   const [urlSuggestions, setUrlSuggestions] = useState<Record<string, UrlResolutionResult>>({});
+  // Split / new-category suggestion candidates (docs/plans/2026-08-16-
+  // category-flexibility-hyde.md, UI-visibility phase) — surfaced inline
+  // where the affected pages live: split candidates inside the source
+  // workstream's own "Pages in this workstream" list, new-category
+  // candidates at the top of the Inbox. Both read from the SAME companion
+  // route family (categoryFlexibilityClient), one array per kind since
+  // they render in two different places.
+  const [splitSuggestionCandidates, setSplitSuggestionCandidates] = useState<
+    readonly SuggestionCandidateSummary[]
+  >([]);
+  const [newCategorySuggestionCandidates, setNewCategorySuggestionCandidates] = useState<
+    readonly SuggestionCandidateSummary[]
+  >([]);
+  // Fingerprints currently mid accept/decline — dims that ONE card's
+  // actions without blocking the rest of the panel.
+  const [suggestionActionPendingFingerprints, setSuggestionActionPendingFingerprints] = useState<
+    ReadonlySet<string>
+  >(new Set());
+  // Prototype-lane visibility (docs/plans/2026-08-16-category-flexibility-
+  // hyde.md, UI-visibility phase). Fetched once per panel-open / bridge
+  // change (cheap, folds existing events — no new computation), NOT
+  // per-render: consumed as a lookup keyed by workstreamId, threaded to
+  // the guess-lanes prototype row and the workstream picker/detail rows.
+  const [prototypeStatusByWorkstream, setPrototypeStatusByWorkstream] = useState<
+    ReadonlyMap<string, WorkstreamPrototypeStatus>
+  >(new Map());
   // Per-URL resolve FAILURES (500 "database is locked" during a drain,
   // timeout, network), tracked separately from `urlSuggestions` so a failed
   // request is never rendered as the confident empty "No signal yet" card.
@@ -3799,6 +3839,205 @@ const App = () => {
     });
   };
 
+  // Multi-membership UI-visibility phase (docs/plans/2026-08-16-category-
+  // flexibility-hyde.md) — additive "add to workstream" / chip "×" remove,
+  // wired the same way ignoreUrl/attributeUrlToWorkstream are: a direct
+  // companion call, THEN a background refetch so the SAME batched
+  // `/v1/visits/projection` read that already powers `urlRecords` picks up
+  // the new `memberships` overlay. No optimistic overlay here (unlike
+  // primary attribution) — a secondary chip's add/remove is low-stakes and
+  // reversible, and the refetch round-trip is fast enough that a chip
+  // popping in/out a beat later reads fine.
+  const addMembershipToUrl = async (
+    canonicalUrl: string,
+    workstreamId: string,
+  ): Promise<WorkboardState> => {
+    if (port.length === 0 || bridgeKey.length === 0) {
+      throw new Error('Companion is not configured.');
+    }
+    const portNumber = Number(port);
+    if (!Number.isFinite(portNumber) || portNumber <= 0) {
+      throw new Error('Companion is not configured.');
+    }
+    await createCategoryFlexibilityClient({ port: portNumber, bridgeKey }).addMembership(
+      canonicalUrl,
+      workstreamId,
+    );
+    await loadTabSessions({ background: true });
+    return await sendRequest({ type: messageTypes.getWorkboardState });
+  };
+
+  const removeMembershipFromUrl = async (
+    canonicalUrl: string,
+    workstreamId: string,
+  ): Promise<WorkboardState> => {
+    if (port.length === 0 || bridgeKey.length === 0) {
+      throw new Error('Companion is not configured.');
+    }
+    const portNumber = Number(port);
+    if (!Number.isFinite(portNumber) || portNumber <= 0) {
+      throw new Error('Companion is not configured.');
+    }
+    await createCategoryFlexibilityClient({ port: portNumber, bridgeKey }).removeMembership(
+      canonicalUrl,
+      workstreamId,
+    );
+    await loadTabSessions({ background: true });
+    return await sendRequest({ type: messageTypes.getWorkboardState });
+  };
+
+  const handleAddMembership = (canonicalUrl: string, workstreamId: string) => {
+    void runAction(() => addMembershipToUrl(canonicalUrl, workstreamId));
+  };
+
+  const handleRemoveMembership = (canonicalUrl: string, workstreamId: string) => {
+    void runAction(() => removeMembershipFromUrl(canonicalUrl, workstreamId));
+  };
+
+  // Split / new-category suggestion accept+decline (design doc §4's
+  // accept flow: "not a new mechanism — POST /v1/workstreams create + a
+  // batch of WORKSTREAM_MEMBERSHIP_SET{provenance:'ai-suggested-accepted'}
+  // for every visit in the accepted sub-cluster"). role:'primary' for
+  // every accepted member — correct forward-looking intent (this page's
+  // home is now the new group) and, since `currentAttribution` (the
+  // pre-multi-membership scalar AttributionBadge reads) is not derived
+  // from this event type yet (no backfill has run — see
+  // workstreamMembershipStore.ts's landing note), role choice here has no
+  // WORSE display side effect than 'secondary' would; it's simply the
+  // semantically right value once that backfill lands.
+  const suggestionFingerprintKey = (candidate: SuggestionCandidateSummary): string =>
+    `${candidate.kind}:${candidate.scopeId}:${candidate.fingerprint}`;
+
+  const acceptSuggestionCandidate = async (
+    candidate: SuggestionCandidateSummary,
+  ): Promise<WorkboardState> => {
+    if (port.length === 0 || bridgeKey.length === 0) {
+      throw new Error('Companion is not configured.');
+    }
+    const portNumber = Number(port);
+    if (!Number.isFinite(portNumber) || portNumber <= 0) {
+      throw new Error('Companion is not configured.');
+    }
+    const client = createCategoryFlexibilityClient({ port: portNumber, bridgeKey });
+    const title =
+      candidate.suggestedName !== null && candidate.suggestedName.trim().length > 0
+        ? candidate.suggestedName
+        : candidate.kind === 'split'
+          ? `Split group (${String(candidate.memberCount)} pages)`
+          : `New topic (${String(candidate.memberCount)} pages)`;
+    const beforeIds = new Set(state.workstreams.map((workstream) => workstream.bac_id));
+    const created = await sendRequest({
+      type: messageTypes.createWorkstream,
+      workstream: { title },
+    });
+    const newWorkstream =
+      created.workstreams.find((workstream) => !beforeIds.has(workstream.bac_id)) ??
+      [...created.workstreams].reverse().find((workstream) => workstream.title === title);
+    if (newWorkstream === undefined) {
+      throw new Error('Created workstream could not be found in the refreshed workboard state.');
+    }
+    const suggestionSource =
+      candidate.kind === 'split' ? 'workstream-split' : 'workstream-new-category';
+    for (const memberId of candidate.memberIds) {
+      await client.addMembership(memberId, newWorkstream.bac_id, {
+        role: 'primary',
+        suggestionSource,
+      });
+    }
+    // Consume the candidate so it stops resurfacing now that it's been
+    // acted on — reuses the SAME sticky decline-memory mechanism a real
+    // decline uses (the store's `dismissed` flag doesn't distinguish WHY;
+    // "accepted" and "declined" both mean "never show me this exact
+    // cluster again").
+    await client
+      .declineSuggestionCandidate({
+        kind: candidate.kind,
+        fingerprint: candidate.fingerprint,
+        scopeId: candidate.scopeId,
+      })
+      .catch(() => undefined);
+    await loadTabSessions({ background: true });
+    return await sendRequest({ type: messageTypes.getWorkboardState });
+  };
+
+  const declineSuggestionCandidateAction = async (
+    candidate: SuggestionCandidateSummary,
+  ): Promise<WorkboardState> => {
+    if (port.length === 0 || bridgeKey.length === 0) {
+      throw new Error('Companion is not configured.');
+    }
+    const portNumber = Number(port);
+    if (!Number.isFinite(portNumber) || portNumber <= 0) {
+      throw new Error('Companion is not configured.');
+    }
+    await createCategoryFlexibilityClient({ port: portNumber, bridgeKey }).declineSuggestionCandidate({
+      kind: candidate.kind,
+      fingerprint: candidate.fingerprint,
+      scopeId: candidate.scopeId,
+    });
+    return await sendRequest({ type: messageTypes.getWorkboardState });
+  };
+
+  const refreshSplitSuggestions = async (workstreamId: string): Promise<void> => {
+    const portNumber = Number(port);
+    if (bridgeKey.length === 0 || !Number.isFinite(portNumber) || portNumber <= 0) {
+      setSplitSuggestionCandidates([]);
+      return;
+    }
+    try {
+      setSplitSuggestionCandidates(
+        await createCategoryFlexibilityClient({ port: portNumber, bridgeKey }).splitSuggestionsFor(
+          workstreamId,
+        ),
+      );
+    } catch {
+      setSplitSuggestionCandidates([]);
+    }
+  };
+
+  const refreshNewCategorySuggestions = async (): Promise<void> => {
+    const portNumber = Number(port);
+    if (bridgeKey.length === 0 || !Number.isFinite(portNumber) || portNumber <= 0) {
+      setNewCategorySuggestionCandidates([]);
+      return;
+    }
+    try {
+      setNewCategorySuggestionCandidates(
+        await createCategoryFlexibilityClient({ port: portNumber, bridgeKey }).newCategorySuggestions(),
+      );
+    } catch {
+      setNewCategorySuggestionCandidates([]);
+    }
+  };
+
+  const handleAcceptSuggestionCandidate = (candidate: SuggestionCandidateSummary) => {
+    const key = suggestionFingerprintKey(candidate);
+    setSuggestionActionPendingFingerprints((current) => new Set(current).add(key));
+    void runAction(() => acceptSuggestionCandidate(candidate)).finally(() => {
+      setSuggestionActionPendingFingerprints((current) => {
+        const next = new Set(current);
+        next.delete(key);
+        return next;
+      });
+      if (candidate.kind === 'split') void refreshSplitSuggestions(candidate.scopeId);
+      else void refreshNewCategorySuggestions();
+    });
+  };
+
+  const handleDeclineSuggestionCandidate = (candidate: SuggestionCandidateSummary) => {
+    const key = suggestionFingerprintKey(candidate);
+    setSuggestionActionPendingFingerprints((current) => new Set(current).add(key));
+    void runAction(() => declineSuggestionCandidateAction(candidate)).finally(() => {
+      setSuggestionActionPendingFingerprints((current) => {
+        const next = new Set(current);
+        next.delete(key);
+        return next;
+      });
+      if (candidate.kind === 'split') void refreshSplitSuggestions(candidate.scopeId);
+      else void refreshNewCategorySuggestions();
+    });
+  };
+
   // Stage 5 polish — "Dump panel state" button handler. Collects the
   // panel's visible-to-debugging fields (focused tab, urlInbox slice,
   // suggestions, view mode, companion status) and POSTs to the
@@ -5108,6 +5347,51 @@ const App = () => {
   useEffect(() => {
     currentWsIdRef.current = currentWsId;
   }, [currentWsId]);
+  // Split suggestion candidates for the workstream currently open —
+  // fetched fresh on every switch (cheap, store-backed read; see
+  // categoryFlexibilityClient.ts). Cleared to [] for the Inbox (no
+  // workstream) and 'All threads'/'All notes' pseudo-views.
+  useEffect(() => {
+    if (currentWsId === null) {
+      setSplitSuggestionCandidates([]);
+      return;
+    }
+    void refreshSplitSuggestions(currentWsId);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [currentWsId, port, bridgeKey]);
+  // New-category suggestion candidates from the unfiled pool — fetched
+  // once on entering the Inbox (where those pages already live), not on
+  // every keystroke of the Inbox's own search filter.
+  useEffect(() => {
+    if (viewMode !== 'inbox') return;
+    void refreshNewCategorySuggestions();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [viewMode, port, bridgeKey]);
+  // Prototype-lane status — fetched once per bridge connection (not
+  // per-workstream: the route already returns every workstream that has
+  // evidence or has ever generated, in one call). Refreshed whenever the
+  // user switches into a workstream so a just-completed background
+  // generation shows up without a manual panel reload.
+  useEffect(() => {
+    const portNumber = Number(port);
+    if (bridgeKey.length === 0 || !Number.isFinite(portNumber) || portNumber <= 0) {
+      setPrototypeStatusByWorkstream(new Map());
+      return;
+    }
+    let cancelled = false;
+    void createCategoryFlexibilityClient({ port: portNumber, bridgeKey })
+      .prototypeStatuses()
+      .then((statuses) => {
+        if (cancelled) return;
+        setPrototypeStatusByWorkstream(new Map(statuses.map((status) => [status.workstreamId, status])));
+      })
+      .catch(() => {
+        if (!cancelled) setPrototypeStatusByWorkstream(new Map());
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [port, bridgeKey, currentWsId]);
   // Phase 4: persist the user's currently-focused workstream id so
   // the timeline observer (running in the background SW) can stamp
   // it onto every browser.timeline.observed event for active-
@@ -8744,6 +9028,7 @@ const App = () => {
                               );
                             },
                           })}
+                      prototypeStatusByWorkstream={prototypeStatusByWorkstream}
                     />
                   ) : null}
                   {/* On-device AI row (feat/enrich-visibility) — sits HERE, in
@@ -9120,6 +9405,7 @@ const App = () => {
           }}
           /* When opening from "+", default new workstream parent = current */
           parentForNew={currentWsId}
+          prototypeStatusByWorkstream={prototypeStatusByWorkstream}
         />
       ) : null}
 
@@ -9153,6 +9439,45 @@ const App = () => {
             });
           }}
           parentForNew={null}
+          prototypeStatusByWorkstream={prototypeStatusByWorkstream}
+        />
+      ) : null}
+
+      {membershipAddTargetId !== null ? (
+        <WorkstreamPicker
+          workstreams={state.workstreams}
+          threads={threads}
+          currentWsId={
+            urlProjection?.byCanonicalUrl[membershipAddTargetId]?.currentAttribution
+              ?.workstreamId ?? null
+          }
+          createMode={false}
+          onClose={() => {
+            setMembershipAddTargetId(null);
+          }}
+          onSelect={(id) => {
+            // Additive picker — selecting "Not assigned" (null) has no
+            // membership-add meaning, so it's a no-op rather than an
+            // error; the user just closes without adding anything.
+            if (id !== null) {
+              handleAddMembership(membershipAddTargetId, id);
+            }
+            setMembershipAddTargetId(null);
+          }}
+          onCreate={(title, parentId, description) => {
+            void runAction(async () => {
+              return await sendRequest({
+                type: messageTypes.createWorkstream,
+                workstream: {
+                  title,
+                  ...(parentId === null ? {} : { parentId }),
+                  ...(description !== undefined && description.length > 0 ? { description } : {}),
+                },
+              });
+            });
+          }}
+          parentForNew={null}
+          prototypeStatusByWorkstream={prototypeStatusByWorkstream}
         />
       ) : null}
 
@@ -9395,6 +9720,21 @@ const App = () => {
                 <span>Pages in this workstream</span>
                 <span className="count mono">{String(currentWorkstreamTabSessions.length)}</span>
               </div>
+              {splitSuggestionCandidates.map((candidate) => (
+                <WorkstreamSuggestionCard
+                  key={candidate.fingerprint}
+                  candidate={candidate}
+                  pending={suggestionActionPendingFingerprints.has(
+                    `${candidate.kind}:${candidate.scopeId}:${candidate.fingerprint}`,
+                  )}
+                  onAccept={() => {
+                    handleAcceptSuggestionCandidate(candidate);
+                  }}
+                  onDecline={() => {
+                    handleDeclineSuggestionCandidate(candidate);
+                  }}
+                />
+              ))}
               {currentWorkstreamTabSessions.length === 0 ? (
                 <div className="thread-empty subtle">No pages attributed here yet.</div>
               ) : (
@@ -9421,6 +9761,10 @@ const App = () => {
                         displayCtx={displayCtx}
                         onOpenInConnections={requestSwitchToConnections}
                         chatThreadCaptured={isChatThreadCapturedForRecord(record)}
+                        onAddMembership={(canonicalUrl) => {
+                          setMembershipAddTargetId(canonicalUrl);
+                        }}
+                        onRemoveMembership={handleRemoveMembership}
                       />
                     );
                   })}
@@ -9480,6 +9824,10 @@ const App = () => {
             setTabSessionMoveId(canonicalUrl);
           }}
           onIgnore={handleUrlIgnore}
+          onAddMembership={(canonicalUrl) => {
+            setMembershipAddTargetId(canonicalUrl);
+          }}
+          onRemoveMembership={handleRemoveMembership}
           displayCtx={displayCtx}
           onOpenInConnections={requestSwitchToConnections}
           onRefreshSuggestion={(canonicalUrl) => {
@@ -9503,6 +9851,10 @@ const App = () => {
             setViewMode('search');
           }}
           isChatThreadCaptured={isChatThreadCapturedForRecord}
+          newCategorySuggestions={newCategorySuggestionCandidates}
+          suggestionActionPendingFingerprints={suggestionActionPendingFingerprints}
+          onAcceptSuggestion={handleAcceptSuggestionCandidate}
+          onDeclineSuggestion={handleDeclineSuggestionCandidate}
         />
       ) : viewMode === 'all' ? (
         // Scope D — the all-threads feed used to be the ternary's
@@ -10797,6 +11149,9 @@ const App = () => {
                   title: w.title,
                   ...(w.parentId === undefined ? {} : { parentId: w.parentId }),
                 })),
+                ...(prototypeStatusByWorkstream.get(currentWs.bac_id) === undefined
+                  ? {}
+                  : { prototypeStatus: prototypeStatusByWorkstream.get(currentWs.bac_id) }),
                 onRename: (nextTitle: string) => {
                   void runAction(async () => {
                     const next = await sendRequest({
@@ -11523,6 +11878,11 @@ interface WorkstreamPickerProps {
   readonly onClose: () => void;
   readonly onSelect: (id: string | null) => void;
   readonly onCreate: (title: string, parentId: string | null, description?: string) => void;
+  // Prototype-lane visibility — folded into each row's tooltip ("N
+  // threads in X · 3 prototypes · updated 2h ago from 12 pages" or the
+  // why-not). Omitted -> rows show only the thread-count tooltip, exactly
+  // as before.
+  readonly prototypeStatusByWorkstream?: ReadonlyMap<string, WorkstreamPrototypeStatus>;
 }
 
 function WorkstreamPicker({
@@ -11534,6 +11894,7 @@ function WorkstreamPicker({
   onClose,
   onSelect,
   onCreate,
+  prototypeStatusByWorkstream,
 }: WorkstreamPickerProps) {
   const [query, setQuery] = useState('');
   const [creating, setCreating] = useState(createMode);
@@ -11627,6 +11988,7 @@ function WorkstreamPicker({
           </button>
           {hierarchical.map(({ ws: w, depth }) => {
             const count = threadCountFor(w.bac_id);
+            const prototypeStatus = prototypeStatusByWorkstream?.get(w.bac_id);
             return (
               <button
                 type="button"
@@ -11646,9 +12008,19 @@ function WorkstreamPicker({
                 }
                 style={depth > 0 ? { paddingLeft: `${String(12 + depth * 14)}px` } : undefined}
               >
-                <span className="ws-picker-name">
-                  {depth > 0 ? <span className="ws-picker-indent">└ </span> : null}
-                  {w.title}
+                <span className="ws-picker-name-col">
+                  <span className="ws-picker-name">
+                    {depth > 0 ? <span className="ws-picker-indent">└ </span> : null}
+                    {w.title}
+                  </span>
+                  {/* Prototype-lane visibility (docs/plans/2026-08-16-
+                      category-flexibility-hyde.md) — one line, right where
+                      the user already picks a workstream. */}
+                  {prototypeStatus !== undefined ? (
+                    <span className="ws-picker-prototype-status mono subtle">
+                      {prototypeStatusLine(prototypeStatus)}
+                    </span>
+                  ) : null}
                 </span>
                 <span className="mono subtle" title={`${String(count)} threads in ${w.title}`}>
                   {count}

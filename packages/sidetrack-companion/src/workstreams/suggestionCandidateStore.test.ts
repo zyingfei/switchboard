@@ -32,6 +32,8 @@ const candidate = (
   structuralName: null,
   createdAtMs: 1_000,
   updatedAtMs: 1_000,
+  dismissed: false,
+  dismissedAtMs: null,
   ...over,
 });
 
@@ -78,6 +80,45 @@ describe('suggestionCandidateStore', () => {
       expect(store.candidatesFor('ws-1', 'split').map((r) => r.fingerprint)).toEqual(['a b']);
       expect(store.candidatesFor('ws-1', 'new-category').map((r) => r.fingerprint)).toEqual(['x y']);
       expect(store.candidatesFor('ws-2', 'split').map((r) => r.fingerprint)).toEqual(['p q']);
+    } finally {
+      store.close();
+    }
+  });
+
+  sqliteIt('round-trips dismissed=false by default', async () => {
+    const vaultRoot = await makeVault();
+    const store = await createSuggestionCandidateStore(vaultRoot);
+    try {
+      store.replaceScope('ws-1', 'split', 'rev-1', [candidate({ fingerprint: 'a b' })]);
+      const rows = store.candidatesFor('ws-1', 'split');
+      expect(rows[0]).toMatchObject({ dismissed: false, dismissedAtMs: null });
+    } finally {
+      store.close();
+    }
+  });
+
+  sqliteIt('dismissCandidate marks a matching fingerprint dismissed and returns true', async () => {
+    const vaultRoot = await makeVault();
+    const store = await createSuggestionCandidateStore(vaultRoot);
+    try {
+      store.replaceScope('ws-1', 'split', 'rev-1', [candidate({ fingerprint: 'a b', emitted: true })]);
+      const changed = store.dismissCandidate('ws-1', 'split', 'a b', 2_000);
+      expect(changed).toBe(true);
+      const rows = store.candidatesFor('ws-1', 'split');
+      expect(rows[0]).toMatchObject({ dismissed: true, dismissedAtMs: 2_000 });
+    } finally {
+      store.close();
+    }
+  });
+
+  sqliteIt('dismissCandidate is a no-op (returns false) for an unknown fingerprint', async () => {
+    const vaultRoot = await makeVault();
+    const store = await createSuggestionCandidateStore(vaultRoot);
+    try {
+      store.replaceScope('ws-1', 'split', 'rev-1', [candidate({ fingerprint: 'a b' })]);
+      const changed = store.dismissCandidate('ws-1', 'split', 'nope', 2_000);
+      expect(changed).toBe(false);
+      expect(store.candidatesFor('ws-1', 'split')[0]).toMatchObject({ dismissed: false });
     } finally {
       store.close();
     }
