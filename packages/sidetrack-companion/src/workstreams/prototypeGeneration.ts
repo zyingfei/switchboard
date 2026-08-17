@@ -1,23 +1,45 @@
 // Prototype-lane offline generation — orchestration.
-// docs/plans/2026-08-16-category-flexibility-hyde.md §3 (Phase 2 of that
-// doc's phased plan; THIS file is the whole of Phase 2's generation half).
+// docs/plans/2026-08-16-category-flexibility-hyde.md §3 (Phase 2) + §11
+// ("prototype lane v2 — medoid selection + keyword profiles, generation as
+// a measured expansion tier").
 //
 // WHAT THIS DOES, per workstream, on a background cadence (never per page,
 // never on a request path):
 //   1. Gather the workstream's own filed-visit evidence (titles + gists).
-//   2. Decide DIRTY via a debounced watermark (§ below) — most ticks touch
-//      zero workstreams.
-//   3. Below the cold-start floor → typed-skip, no generation attempted.
-//   4. Evidence corpus language: 'en' → generate m grounded example texts on
-//      Apple FM (the ONLY generation engine this lane uses — see
-//      appleFmEngine.ts); anything else ('zh' / 'mixed-en-zh', per this
-//      codebase's own appleCanServe contract) → SKIP generation and SELECT m
-//      real evidence excerpts as the prototype texts instead (ReDE-RF
-//      pattern) — never a broken or English-leaking generation.
-//   5. Embed every resulting text with the SAME embedder recall-v2 uses and
-//      persist: one WORKSTREAM_PROTOTYPE_GENERATED event per text (durable
-//      provenance) + an upsert into the recall-v2 sqlite-vec store's
+//   2. Decide DIRTY via a debounced watermark, ALSO checking a scoring-
+//      version bump (§ below) — most ticks touch zero workstreams.
+//   3. Below the cold-start floor → typed-skip, no production attempted.
+//   4. MEDOID TIER (v2 default, EVERY workstream, English or not): select K
+//      representative real member texts via greedy k-medoids over their
+//      embeddings (prototypeMedoids.ts), excluding structural outliers (the
+//      pineapple-cake guard). This is the generalized ReDE-RF path — real
+//      evidence, embedded directly, never generated — and it is the ONLY
+//      tier a non-English or Apple-FM-unavailable workstream ever gets.
+//   5. GENERATION TIER (expansion, English-dominant evidence + Apple FM
+//      available): a small number of synthetic-sibling prototypes —
+//      register-matched (excerpt-style, never meta-description prose) and
+//      explicitly asked to use vocabulary the saved evidence does NOT
+//      already contain. Boosted (more prototypes) for sparse workstreams,
+//      where interpolation value is highest; a mature workstream gets just
+//      one, since its medoids already anchor most of the space. Skipping
+//      this tier (engine down, zh-dominant, budget exceeded) is NEVER fatal
+//      — the medoid tier still lands.
+//   6. Embed every resulting text with the SAME embedder recall-v2 uses
+//      (medoid texts reuse the embedding already computed for medoid
+//      SELECTION — no second embed pass) and persist: one
+//      WORKSTREAM_PROTOTYPE_GENERATED event per text (durable provenance,
+//      angle-tagged) + an upsert into the recall-v2 sqlite-vec store's
 //      prototype_vec table (the served copy the guess lane KNNs against).
+//
+// SELECTION ANCHORS, GENERATION EXPANDS. Medoids are real saved pages — they
+// can never be "confidently wrong" about what the workstream contains, only
+// possibly stale or non-diverse (mitigated by the k-medoid diversification
+// + outlier guard). Generation covers what medoids structurally cannot:
+// future/unseen vocabulary for the same activity. Both compete in the same
+// served KNN; per-source prequential counters (tabsession/prototypeLane.ts)
+// measure which one actually earns its keep, per workstream population
+// regime — that measurement, not a priori judgment, is what should someday
+// decide how the blend is tuned further.
 //
 // DIRTY-MARKING, NO FULL-PASS SWEEPS. `evidenceWatermark` encodes BOTH the
 // evidence count and a content hash: "<count>:<sha256>". A workstream whose
@@ -25,9 +47,13 @@
 // compare, not a re-embed. Even when the watermark DOES change, regeneration
 // only fires past a debounce (≥5 new evidence items OR ≥14 days elapsed,
 // whichever first) — coarser than servedFeatureModel.ts's 120s TTL warmer
-// because workstream semantics drift far slower than serve traffic (design
-// doc §3). The debounce numbers are the "conservative default cadence" the
-// task asked for; SIDETRACK_PROTOTYPE_GENERATION is the boolean kill switch.
+// because workstream semantics drift far slower than serve traffic. A
+// SCORING-VERSION bump (PROTOTYPE_EMBEDDING_SCHEMA_VERSION) additionally
+// forces every workstream dirty on its NEXT tick regardless of watermark —
+// this is how v2's medoid/keyword-profile rescoring reaches an existing
+// vault's already-generated prototypes with no manual migration, no
+// full-pass sweep: the existing debounced tick loop just naturally catches
+// every workstream up, one dirty tick at a time.
 //
 // GENERATION ENGINE. Apple FM ONLY (per the 2026-08-16 user directive) —
 // this lane deliberately does NOT fall back to Nano/WebGPU/remote the way
@@ -35,10 +61,7 @@
 // panel session (Nano is a Chrome API; WebGPU's explicit-load singleton lives
 // in the extension's sidepanel), neither of which a companion background job
 // has access to; Apple FM alone is reachable over loopback HTTP from any
-// process on the machine (see appleFmEngine.ts's header). When Apple FM is
-// unavailable, generation is SKIPPED GRACEFULLY (a typed report reason, never
-// a thrown error) — prior standing prototypes are left untouched, and the
-// workstream stays dirty for the next tick.
+// process on the machine (see appleFmEngine.ts's header).
 
 import { createHash } from 'node:crypto';
 
@@ -63,11 +86,17 @@ import {
 } from './events.js';
 import {
   evidenceBudgetChars,
+  evidenceExcerpt,
   gatherWorkstreamEvidence,
   selectEvidenceWithinBudget,
   workstreamEvidenceLanguage,
   type WorkstreamEvidenceItem,
 } from './prototypeEvidence.js';
+import { identifyOutliers, selectMedoids, type EmbeddedMember } from './prototypeMedoids.js';
+import {
+  buildKeywordProfilesForWorkstreams,
+  type KeywordLookupDeps,
+} from './prototypeKeywordProfileBuild.js';
 
 // ---- env gating ----------------------------------------------------------
 
@@ -76,9 +105,10 @@ export const PROTOTYPE_GENERATION_ENV = 'SIDETRACK_PROTOTYPE_GENERATION';
 /** Default ON — same kill-switch idiom as every other observe/shadow flag in
  *  this codebase (SIDETRACK_GUESS_LANES, SIDETRACK_CONTENT_LANE,
  *  SIDETRACK_LANE_PREQUENTIAL, SIDETRACK_LANE_CORROBORATION all default ON
- *  with an explicit '0'/'false' rollback). Generation itself is conservative
- *  by CADENCE (the debounce below), not by being opt-in — a fresh vault
- *  simply never crosses the floor and nothing runs. */
+ *  with an explicit '0'/'false' rollback). Gates the WHOLE tick (medoid tier
+ *  included) — the generation tier ALSO stays subordinate to this same flag
+ *  (per the brief: "generation stays env-gated (existing flag)"), it has no
+ *  separate switch. */
 export const prototypeGenerationEnabled = (): boolean => {
   const raw = process.env[PROTOTYPE_GENERATION_ENV];
   return raw !== '0' && raw !== 'false';
@@ -87,18 +117,43 @@ export const prototypeGenerationEnabled = (): boolean => {
 export const PROTOTYPE_COUNT_ENV = 'SIDETRACK_PROTOTYPE_COUNT';
 const DEFAULT_PROTOTYPE_COUNT = 4;
 
-/** m — how many prototype texts per workstream per batch. Clamped to the
- *  design doc's stated 3-5 range regardless of what the env says, so a
- *  misconfigured value degrades to the nearest valid count rather than
- *  silently doing something the design never measured. */
+/** K_medoid — how many medoid prototypes per workstream per batch (v1's name
+ *  survives; v2 repurposes it specifically as the MEDOID tier's count, since
+ *  medoids are now the always-on default every workstream gets — see
+ *  prototypeGenerationCountFor for the SEPARATE generation-tier count).
+ *  Clamped to the design's stated 3-5 range regardless of what the env says. */
 export const prototypeCount = (): number => {
   const raw = Number(process.env[PROTOTYPE_COUNT_ENV]);
   if (!Number.isFinite(raw)) return DEFAULT_PROTOTYPE_COUNT;
   return Math.min(5, Math.max(3, Math.round(raw)));
 };
 
+/** Sparse-workstream generation boost (§11 refinement). Below this many
+ *  filed members, generation contributes MORE prototypes — interpolation
+ *  value is highest where medoids have the least real material to anchor
+ *  on. A judgment call, flagged for golden-set tuning like every other
+ *  unspecified numeric threshold in this feature area. */
+export const PROTOTYPE_GENERATION_BOOST_BELOW_ENV = 'SIDETRACK_PROTOTYPE_GENERATION_BOOST_BELOW';
+const DEFAULT_PROTOTYPE_GENERATION_BOOST_BELOW = 8;
+
+export const prototypeGenerationBoostBelow = (): number => {
+  const raw = Number(process.env[PROTOTYPE_GENERATION_BOOST_BELOW_ENV]);
+  if (!Number.isFinite(raw) || raw < 1) return DEFAULT_PROTOTYPE_GENERATION_BOOST_BELOW;
+  return Math.round(raw);
+};
+
+export const PROTOTYPE_GENERATION_COUNT_SPARSE = 3;
+export const PROTOTYPE_GENERATION_COUNT_MATURE = 1;
+
+/** K_gen — how many synthetic-sibling prototypes to generate for a
+ *  workstream with `memberCount` filed pages. */
+export const prototypeGenerationCountFor = (memberCount: number): number =>
+  memberCount < prototypeGenerationBoostBelow()
+    ? PROTOTYPE_GENERATION_COUNT_SPARSE
+    : PROTOTYPE_GENERATION_COUNT_MATURE;
+
 /** Cold-start floor (design doc §6, risk 2 — "double cold-start"). Below
- *  this, generation is not attempted at all; the north-star study's P3
+ *  this, production is not attempted at all; the north-star study's P3
  *  finding (real-vector density wants ~30 members) argues for an even higher
  *  bar for confident SERVING, but this is the floor for ATTEMPTING — just
  *  above HDBSCAN_TOPIC_MIN_SAMPLES=3, matching the doc's stated number. */
@@ -112,7 +167,19 @@ export const MIN_NEW_EVIDENCE_SINCE_LAST = 5;
  *  — 14 days, design doc §3. */
 export const MAX_STALE_MS = 14 * 24 * 60 * 60 * 1000;
 
-export const PROTOTYPE_EMBEDDING_SCHEMA_VERSION = 1;
+/** v2 (§11) bumped from 1 to 2 — medoid selection + the single revised
+ *  synthetic-sibling prompt materially change what every existing
+ *  prototype's TEXT would be even for byte-identical evidence, so a version
+ *  mismatch alone (see decideDirty) forces one regeneration per workstream
+ *  on its next tick, with no manual migration and no full-pass sweep. */
+export const PROTOTYPE_EMBEDDING_SCHEMA_VERSION = 2;
+
+/** Bounded-per-cycle candidate pool for medoid embedding — most-recent-
+ *  first, same "cap the population, never a full sweep" idiom as
+ *  unfiledEvidence.ts's SIDETRACK_UNFILED_POPULATION_CAP and
+ *  keywordBackfillLane.ts's batchCap. A workstream can have far more filed
+ *  members than are worth (re-)embedding on any single dirty tick. */
+export const MEDOID_CANDIDATE_POOL_CAP = 40;
 
 // ---- evidence watermark ---------------------------------------------------
 
@@ -151,6 +218,9 @@ export interface WorkstreamGenerationState {
   readonly generatorModelId: string;
   readonly method: 'generated' | 'selected';
   readonly prototypeIds: readonly string[];
+  /** Every real historical event already carries this field (v1 wrote it,
+   *  hardcoded to 1, but never read it back — see decideDirty). */
+  readonly embeddingSchemaVersion: number;
 }
 
 /** Latest generation BATCH per workstream — all prototype-events sharing that
@@ -181,6 +251,7 @@ export const foldLatestPrototypeGenerations = (
         generatorModelId: p.generatorModelId,
         method: p.method,
         prototypeIds: [p.prototypeId],
+        embeddingSchemaVersion: p.embeddingSchemaVersion,
       });
     } else {
       byWorkstream.set(p.workstreamId, {
@@ -220,19 +291,26 @@ const readPrototypeGenerationEvents = async (
 
 export type DirtyDecision =
   | { readonly dirty: false; readonly reason: 'below-floor' | 'unchanged' | 'debounced' }
-  | { readonly dirty: true; readonly reason: 'first-generation' | 'evidence-grew' | 'stale' };
+  | {
+      readonly dirty: true;
+      readonly reason: 'first-generation' | 'evidence-grew' | 'stale' | 'version-bumped';
+    };
 
 /**
  * Pure decision function — no I/O, fully unit-testable. `nowMs` is threaded
  * so the 14-day trigger is deterministic in tests.
  *
- * BYTE-IDENTICAL EVIDENCE SHORT-CIRCUITS REGARDLESS OF STALENESS. The design
- * doc's "≥5 new members OR ≥14 days elapsed" debounce describes when a
- * CHANGED workstream should regenerate; it is not a periodic-refresh policy
- * for a workstream whose evidence has not moved at all. Re-generating from
- * the exact same evidence would spend an engine call to produce merely
- * DIFFERENT (LLM stochasticity), not more grounded, text — the opposite of
- * this program's cost discipline. A workstream with genuinely stale evidence
+ * VERSION-BUMP CHECKED BEFORE THE WATERMARK COMPARE. A scoring-version bump
+ * (PROTOTYPE_EMBEDDING_SCHEMA_VERSION) means the OUTPUT text/algorithm
+ * changed even for byte-identical evidence — "unchanged watermark" must not
+ * short-circuit a version mismatch, or v2's medoid rescoring would never
+ * reach a workstream whose evidence happens not to have grown since v1.
+ *
+ * BYTE-IDENTICAL EVIDENCE (AT THE CURRENT VERSION) SHORT-CIRCUITS REGARDLESS
+ * OF STALENESS. Re-generating from the exact same evidence at an unchanged
+ * version would spend an engine call to produce merely DIFFERENT (LLM
+ * stochasticity) text, not more grounded text — the opposite of this
+ * program's cost discipline. A workstream with genuinely stale evidence
  * (nothing filed to it in months) simply keeps its last-good prototypes.
  */
 export const decideDirty = (
@@ -240,9 +318,11 @@ export const decideDirty = (
   watermark: string,
   last: WorkstreamGenerationState | undefined,
   nowMs: number,
+  currentVersion: number = PROTOTYPE_EMBEDDING_SCHEMA_VERSION,
 ): DirtyDecision => {
   if (evidenceCount < MIN_EVIDENCE_FOR_GENERATION) return { dirty: false, reason: 'below-floor' };
   if (last === undefined) return { dirty: true, reason: 'first-generation' };
+  if (last.embeddingSchemaVersion !== currentVersion) return { dirty: true, reason: 'version-bumped' };
   if (last.evidenceWatermark === watermark) return { dirty: false, reason: 'unchanged' };
   const lastParsed = parseEvidenceWatermark(last.evidenceWatermark);
   const grew =
@@ -253,36 +333,28 @@ export const decideDirty = (
   return { dirty: false, reason: 'debounced' };
 };
 
-// ---- prompt construction (grounded — evidence only, never the workstream's
-// own name/description; see prototypeEvidence.ts's header) -----------------
+// ---- synthetic-sibling prompt (the ONLY generation angle v2 keeps) -------
+//
+// v1 varied FIVE prompt angles (theme-description, likely-excerpt,
+// terminology, task-inference, distinctive-detail) — day-one evidence
+// showed the meta-register ones (theme-description, behavioral-inference)
+// render generic prose near every tech page, which is exactly what let
+// three unrelated workstreams tie at ~0.82. v2 keeps only the one angle
+// that behaves as a real EXCERPT (reads like a saved page's own gist+title)
+// and explicitly widens vocabulary beyond what the evidence already says —
+// the two properties that make this tier a genuine complement to the
+// medoid tier rather than a redundant restatement of it.
 
-const PROMPT_ANGLES: readonly ((evidence: string) => string)[] = [
-  (evidence) =>
-    `Below are short excerpts (titles and summaries) from web pages a person has ` +
-    `saved into the same personal collection:\n\n${evidence}\n\n` +
-    `In ONE sentence, describe the kind of activity or topic these pages have in ` +
-    `common. Do not quote or restate the excerpts; write only the new description.`,
-  (evidence) =>
-    `Below are short excerpts (titles and summaries) from web pages a person has ` +
-    `saved into the same personal collection:\n\n${evidence}\n\n` +
-    `Write ONE short example excerpt (2-3 sentences), in a similar style, that ` +
-    `could plausibly belong to this same collection. Do not copy the excerpts above.`,
-  (evidence) =>
-    `Below are short excerpts (titles and summaries) from web pages a person has ` +
-    `saved into the same personal collection:\n\n${evidence}\n\n` +
-    `In ONE sentence, list terminology and named entities likely to appear on ` +
-    `another page belonging to this same collection.`,
-  (evidence) =>
-    `Below are short excerpts (titles and summaries) from web pages a person has ` +
-    `saved into the same personal collection:\n\n${evidence}\n\n` +
-    `In ONE sentence, describe a question or task this person is likely pursuing, ` +
-    `based only on these excerpts.`,
-  (evidence) =>
-    `Below are short excerpts (titles and summaries) from web pages a person has ` +
-    `saved into the same personal collection:\n\n${evidence}\n\n` +
-    `In ONE sentence, name the single most distinctive, specific detail shared ` +
-    `across these excerpts (not a generic category).`,
-];
+const SYNTHETIC_SIBLING_PROMPT = (evidence: string): string =>
+  `Below are short excerpts (titles and summaries) from web pages a person has ` +
+  `saved into the same personal collection:\n\n${evidence}\n\n` +
+  `Write ONE short excerpt (2-3 sentences), in the exact same style as a page ` +
+  `title and summary shown above — NOT a description of the collection as a ` +
+  `whole — that could plausibly be another page belonging to this same ` +
+  `collection. Use related terminology and phrasings that do NOT already ` +
+  `appear in the excerpts above, while staying on the exact same theme: the ` +
+  `goal is a plausible NEW page in different words, not a restatement of the ` +
+  `ones shown. Do not copy the excerpts above.`;
 
 const MAX_GENERATION_OUTPUT_TOKENS = 120;
 
@@ -293,12 +365,7 @@ const cleanGeneratedText = (raw: string): string => {
     : trimmed;
 };
 
-// ---- generation result ------------------------------------------------
-
-export interface GeneratedPrototype {
-  readonly text: string;
-  readonly method: 'generated' | 'selected';
-}
+// ---- shared engine client ---------------------------------------------
 
 export interface AppleFmClient {
   readonly status: typeof appleFmStatus;
@@ -310,76 +377,221 @@ const REAL_APPLE_FM_CLIENT: AppleFmClient = {
   generate: generateWithAppleFm,
 };
 
-export type GenerationOutcome =
-  | {
-      readonly kind: 'texts';
-      readonly texts: readonly GeneratedPrototype[];
-      readonly generatorModelId: string;
-    }
-  | { readonly kind: 'engine-unavailable'; readonly reason: string };
+export type EmbedFn = (texts: readonly string[]) => Promise<readonly Float32Array[]>;
+
+// ---- medoid tier (v2 default, every workstream) ----------------------------
+
+interface MedoidCandidate {
+  readonly canonicalUrl: string;
+  readonly text: string;
+  readonly embedding: Float32Array;
+}
+
+/** Bounded-per-cycle, most-recent-first, only items with a real excerpt —
+ *  mirrors prototypeEvidence.ts's own most-recent-first convention. */
+const boundedCandidatePool = (
+  items: readonly WorkstreamEvidenceItem[],
+): readonly WorkstreamEvidenceItem[] => {
+  const withExcerpt = items.filter((item) => evidenceExcerpt(item) !== null);
+  return [...withExcerpt]
+    .sort((left, right) => right.firstSeenAtMs - left.firstSeenAtMs)
+    .slice(0, MEDOID_CANDIDATE_POOL_CAP);
+};
 
 /**
- * Produce m prototype texts for one workstream's evidence — generation on
- * Apple FM for English-dominant evidence, selection (real excerpts, no LLM
- * call) for zh/mixed evidence. Never throws; engine failures degrade to
- * 'engine-unavailable'.
+ * Embed the bounded candidate pool ONCE — the SAME embed call medoid
+ * selection needs, and the resulting vectors are reused DIRECTLY as the
+ * chosen medoids' prototype vectors (a medoid's text IS the member's own
+ * excerpt verbatim, so it never needs a second embed pass). Never throws;
+ * a failed or dimension-mismatched batch degrades to [] (the caller treats
+ * that as embedder-unavailable, the one fatal failure mode in this tier).
+ *
+ * DELIBERATE SCOPE CUT: does not attempt to reuse embeddings already
+ * present in recall-v2's docs_vec for members that happen to be indexed
+ * there (~16% coverage per the keyword-clustering PR's own measurement).
+ * Reading raw vector VALUES back out of a sqlite-vec vec0 table is not a
+ * pattern this codebase uses anywhere today (every existing caller only
+ * ever reads back a MATCH distance, never the stored vector), so doing it
+ * here would be new, unverified surface area for a speculative optimization
+ * — always (re-)embedding the bounded candidate pool is simpler, always
+ * correct, and still bounded (MEDOID_CANDIDATE_POOL_CAP per workstream per
+ * dirty tick, which only fires past the debounce). Flagged here as a
+ * documented deviation rather than a silent gap.
  */
-export const producePrototypeTexts = async (
-  items: readonly WorkstreamEvidenceItem[],
-  count: number,
-  client: AppleFmClient = REAL_APPLE_FM_CLIENT,
-): Promise<GenerationOutcome> => {
-  const language = workstreamEvidenceLanguage(items);
-  if (language !== 'en') {
-    // ReDE-RF selection — real evidence excerpts embedded directly, never
-    // generated. Distinct excerpts, most-recent-first, capped at `count`.
-    const seen = new Set<string>();
-    const texts: GeneratedPrototype[] = [];
-    const sorted = [...items].sort((left, right) => right.firstSeenAtMs - left.firstSeenAtMs);
-    for (const item of sorted) {
-      const excerpt = item.gist ?? item.title;
-      if (excerpt === null || excerpt === undefined || excerpt.length === 0) continue;
-      if (seen.has(excerpt)) continue;
-      seen.add(excerpt);
-      texts.push({ text: cleanGeneratedText(excerpt), method: 'selected' });
-      if (texts.length >= count) break;
+const embedCandidatePool = async (
+  pool: readonly WorkstreamEvidenceItem[],
+  embed: EmbedFn,
+): Promise<readonly MedoidCandidate[]> => {
+  const texts = pool.map((item) => evidenceExcerpt(item)!);
+  if (texts.length === 0) return [];
+  let vectors: readonly Float32Array[];
+  try {
+    vectors = await embed(texts);
+  } catch {
+    return [];
+  }
+  if (vectors.length !== pool.length) return [];
+  return pool.map((item, index) => ({
+    canonicalUrl: item.canonicalUrl,
+    text: texts[index]!,
+    embedding: vectors[index]!,
+  }));
+};
+
+interface MedoidSelectionResult {
+  readonly picks: readonly MedoidCandidate[];
+  readonly outlierUrls: ReadonlySet<string>;
+}
+
+/** Pure wrapper over prototypeMedoids.ts's generic id/embedding primitives,
+ *  typed to this module's MedoidCandidate shape — see prototypeMedoids.ts
+ *  for the algorithm (greedy k-medoids + P90 centroid-distance outlier
+ *  exclusion, the pineapple-cake guard). */
+const selectMedoidPrototypes = (
+  candidates: readonly MedoidCandidate[],
+  k: number,
+): MedoidSelectionResult => {
+  const asMembers: readonly EmbeddedMember[] = candidates.map((c) => ({
+    id: c.canonicalUrl,
+    embedding: c.embedding,
+  }));
+  const outlierUrls = identifyOutliers(asMembers);
+  const medoidUrls = selectMedoids(asMembers, k, outlierUrls);
+  const byUrl = new Map(candidates.map((c) => [c.canonicalUrl, c]));
+  const picks = medoidUrls.flatMap((url) => {
+    const candidate = byUrl.get(url);
+    return candidate === undefined ? [] : [candidate];
+  });
+  return { picks, outlierUrls };
+};
+
+// ---- combined production (medoid tier + generation tier) ------------------
+
+export interface ProducedPrototype {
+  readonly text: string;
+  readonly method: 'generated' | 'selected';
+  readonly angle: 'medoid' | 'synthetic-sibling';
+  /** Present only for angle='medoid' — the exact member this text was drawn
+   *  from (the brief's "provenance: member url, evidence watermark"; the
+   *  watermark half is already on every event via `evidenceWatermark`). */
+  readonly sourceMemberUrl?: string;
+  /** Already embedded — medoid vectors are reused from candidate-pool
+   *  embedding, generated vectors from the post-generation embed batch. No
+   *  second embed pass anywhere in this module. */
+  readonly vec: Float32Array;
+}
+
+export type ProductionOutcome =
+  | {
+      readonly kind: 'produced';
+      readonly prototypes: readonly ProducedPrototype[];
+      readonly medoidGeneratorModelId: string;
+      readonly generatedGeneratorModelId: string | null;
+      /** Non-null whenever the generation (expansion) tier contributed
+       *  nothing THIS tick — never fatal on its own; the medoid tier still
+       *  lands. null only when generation actually ran and produced
+       *  something. */
+      readonly generationSkippedReason: string | null;
     }
+  | { readonly kind: 'embedder-unavailable'; readonly reason: string };
+
+/**
+ * Produce ALL prototypes for one workstream's evidence: the medoid tier
+ * (always attempted) plus, when eligible, the generation/expansion tier.
+ * Never throws. Only a total medoid-embedding failure is treated as fatal
+ * — Apple FM being unavailable, or the evidence being non-English, degrades
+ * the OUTCOME to "medoids only", never blocks the batch.
+ */
+export const produceWorkstreamPrototypes = async (
+  items: readonly WorkstreamEvidenceItem[],
+  medoidCount: number,
+  deps: { readonly embed: EmbedFn; readonly client?: AppleFmClient },
+): Promise<ProductionOutcome> => {
+  const pool = boundedCandidatePool(items);
+  const candidates = await embedCandidatePool(pool, deps.embed);
+  if (candidates.length === 0) {
     return {
-      kind: 'texts',
-      texts,
-      generatorModelId: `evidence-selection#reason=${language}`,
+      kind: 'embedder-unavailable',
+      reason: 'embedder returned no (or a mismatched number of) vectors',
     };
   }
 
-  const status = await client.status();
-  if (!status.available) {
-    return { kind: 'engine-unavailable', reason: appleFmUnavailableCopy(status.reason) };
+  const { picks, outlierUrls } = selectMedoidPrototypes(candidates, medoidCount);
+  const medoidGeneratorModelId = 'medoid-selection#v2';
+  const medoidPrototypes: ProducedPrototype[] = picks.map((p) => ({
+    text: p.text,
+    method: 'selected',
+    angle: 'medoid',
+    sourceMemberUrl: p.canonicalUrl,
+    vec: p.embedding,
+  }));
+
+  const language = workstreamEvidenceLanguage(items);
+  let generatedPrototypes: readonly ProducedPrototype[] = [];
+  let generatedGeneratorModelId: string | null = null;
+  let generationSkippedReason: string | null = null;
+
+  if (language !== 'en') {
+    generationSkippedReason = `evidence language is ${language} — Apple FM generation is english-only, medoid tier only`;
+  } else {
+    const client = deps.client ?? REAL_APPLE_FM_CLIENT;
+    const status = await client.status();
+    if (!status.available) {
+      generationSkippedReason = appleFmUnavailableCopy(status.reason);
+    } else {
+      const kGen = prototypeGenerationCountFor(items.length);
+      const budgetChars = evidenceBudgetChars(appleMaxInputChars(status.contextTokens));
+      // The outlier guard applies here too — a structurally-excluded member
+      // must not leak into the generation prompt either.
+      const evidenceForGeneration = items.filter((item) => !outlierUrls.has(item.canonicalUrl));
+      const { text: evidenceText } = selectEvidenceWithinBudget(evidenceForGeneration, budgetChars);
+      if (evidenceText.length === 0) {
+        generationSkippedReason = 'no evidence text to generate from';
+      } else {
+        const rawTexts: string[] = [];
+        for (let i = 0; i < kGen; i += 1) {
+          const raw = await client.generate({
+            prompt: SYNTHETIC_SIBLING_PROMPT(evidenceText),
+            maxOutputTokens: MAX_GENERATION_OUTPUT_TOKENS,
+            timeoutMs: APPLE_GENERATION_TIMEOUT_MS,
+          });
+          if (raw === null) continue;
+          const cleaned = cleanGeneratedText(raw);
+          if (cleaned.length === 0) continue;
+          rawTexts.push(cleaned);
+        }
+        if (rawTexts.length === 0) {
+          generationSkippedReason = 'the local Apple AI service answered, but every generation failed';
+        } else {
+          let vectors: readonly Float32Array[];
+          try {
+            vectors = await deps.embed(rawTexts);
+          } catch {
+            vectors = [];
+          }
+          if (vectors.length === rawTexts.length) {
+            generatedGeneratorModelId = 'apple-fm#reason=ok';
+            generatedPrototypes = rawTexts.map((text, index) => ({
+              text,
+              method: 'generated' as const,
+              angle: 'synthetic-sibling' as const,
+              vec: vectors[index]!,
+            }));
+          } else {
+            generationSkippedReason = 'generated text embedding failed';
+          }
+        }
+      }
+    }
   }
-  const budgetChars = evidenceBudgetChars(appleMaxInputChars(status.contextTokens));
-  const { text: evidenceText } = selectEvidenceWithinBudget(items, budgetChars);
-  if (evidenceText.length === 0) {
-    return { kind: 'engine-unavailable', reason: 'no evidence text to generate from' };
-  }
-  const texts: GeneratedPrototype[] = [];
-  const angles = PROMPT_ANGLES.slice(0, count);
-  for (const angle of angles) {
-    const raw = await client.generate({
-      prompt: angle(evidenceText),
-      maxOutputTokens: MAX_GENERATION_OUTPUT_TOKENS,
-      timeoutMs: APPLE_GENERATION_TIMEOUT_MS,
-    });
-    if (raw === null) continue;
-    const cleaned = cleanGeneratedText(raw);
-    if (cleaned.length === 0) continue;
-    texts.push({ text: cleaned, method: 'generated' });
-  }
-  if (texts.length === 0) {
-    return {
-      kind: 'engine-unavailable',
-      reason: 'the local Apple AI service answered, but every generation failed',
-    };
-  }
-  return { kind: 'texts', texts, generatorModelId: `apple-fm#reason=ok` };
+
+  return {
+    kind: 'produced',
+    prototypes: [...medoidPrototypes, ...generatedPrototypes],
+    medoidGeneratorModelId,
+    generatedGeneratorModelId,
+    generationSkippedReason,
+  };
 };
 
 // ---- store write side (structural subset — see recall-v2/store/sqlite.ts) --
@@ -395,6 +607,8 @@ export interface PrototypeStore {
       readonly method: 'generated' | 'selected';
       readonly generatedAt: number;
       readonly evidenceWatermark: string;
+      readonly angle?: 'medoid' | 'synthetic-sibling';
+      readonly sourceMemberUrl?: string;
     },
     vec: Float32Array,
   ): void;
@@ -406,16 +620,30 @@ export interface PrototypeStore {
     readonly method: 'generated' | 'selected';
     readonly generatedAt: number;
     readonly evidenceWatermark: string;
+    readonly angle?: 'medoid' | 'synthetic-sibling';
+    readonly sourceMemberUrl?: string;
   }[];
   allPrototypeWorkstreamIds(): ReadonlySet<string>;
   queryPrototypeVector(opts: { readonly vec: Float32Array; readonly limit: number }): readonly {
     readonly prototypeId: string;
     readonly workstreamId: string;
     readonly cosineDistance: number;
+    readonly angle?: 'medoid' | 'synthetic-sibling';
   }[];
+  /** v2 keyword-profile signal (§11) — optional on the interface so a
+   *  fixture/store that predates it still satisfies PrototypeStore; the
+   *  real recall-v2 SqliteRecallStore always implements it. */
+  replacePrototypeKeywordProfiles?(
+    idf: ReadonlyMap<string, number>,
+    profiles: ReadonlyMap<
+      string,
+      {
+        readonly weights: ReadonlyMap<string, number>;
+        readonly displayKeyword: ReadonlyMap<string, string>;
+      }
+    >,
+  ): void;
 }
-
-export type EmbedFn = (texts: readonly string[]) => Promise<readonly Float32Array[]>;
 
 // ---- one workstream's generation pass --------------------------------------
 
@@ -425,12 +653,16 @@ export interface WorkstreamGenerationResult {
     | 'below-floor'
     | 'unchanged'
     | 'debounced'
-    | 'engine-unavailable'
     | 'embedder-unavailable'
     | 'regenerated';
   readonly detail?: string;
   readonly prototypeCount?: number;
-  readonly method?: 'generated' | 'selected';
+  readonly medoidCount?: number;
+  readonly generatedCount?: number;
+  /** Present whenever the generation/expansion tier contributed nothing
+   *  this tick — NOT fatal; `outcome` can still be 'regenerated' from the
+   *  medoid tier alone. */
+  readonly generationSkippedReason?: string;
 }
 
 /**
@@ -447,6 +679,8 @@ export const generatePrototypesForWorkstream = async (
     readonly items: readonly WorkstreamEvidenceItem[];
     readonly last: WorkstreamGenerationState | undefined;
     readonly nowMs: number;
+    /** K_medoid — the generation/expansion tier's own count is derived
+     *  separately per workstream (prototypeGenerationCountFor). */
     readonly count: number;
   },
   deps: {
@@ -462,26 +696,22 @@ export const generatePrototypesForWorkstream = async (
     return { workstreamId: input.workstreamId, outcome: decision.reason };
   }
 
-  const outcome = await producePrototypeTexts(input.items, input.count, deps.client);
-  if (outcome.kind === 'engine-unavailable') {
-    return {
-      workstreamId: input.workstreamId,
-      outcome: 'engine-unavailable',
-      detail: outcome.reason,
-    };
-  }
-
-  let vectors: readonly Float32Array[];
-  try {
-    vectors = await deps.embed(outcome.texts.map((t) => t.text));
-  } catch {
-    vectors = [];
-  }
-  if (vectors.length !== outcome.texts.length) {
+  const outcome = await produceWorkstreamPrototypes(input.items, input.count, {
+    embed: deps.embed,
+    ...(deps.client === undefined ? {} : { client: deps.client }),
+  });
+  if (outcome.kind === 'embedder-unavailable') {
     return {
       workstreamId: input.workstreamId,
       outcome: 'embedder-unavailable',
-      detail: 'embedder returned no (or a mismatched number of) vectors',
+      detail: outcome.reason,
+    };
+  }
+  if (outcome.prototypes.length === 0) {
+    return {
+      workstreamId: input.workstreamId,
+      outcome: 'embedder-unavailable',
+      detail: outcome.generationSkippedReason ?? 'no prototypes produced',
     };
   }
 
@@ -490,18 +720,18 @@ export const generatePrototypesForWorkstream = async (
     PROTOTYPE_SOURCE_EVIDENCE_MAX_COUNT,
   );
 
-  const rows: {
-    readonly prototypeId: string;
-    readonly text: string;
-    readonly method: 'generated' | 'selected';
-  }[] = outcome.texts.map((t, index) => ({
+  const rows = outcome.prototypes.map((p, index) => ({
     prototypeId: `${input.workstreamId}:${watermark}:${String(index)}`,
-    text: t.text,
-    method: t.method,
+    text: p.text,
+    method: p.method,
+    angle: p.angle,
+    sourceMemberUrl: p.sourceMemberUrl,
+    vec: p.vec,
+    generatorModelId:
+      p.angle === 'medoid' ? outcome.medoidGeneratorModelId : outcome.generatedGeneratorModelId ?? 'unknown',
   }));
 
-  for (let i = 0; i < rows.length; i += 1) {
-    const row = rows[i]!;
+  for (const row of rows) {
     const payload: PrototypeGeneratedSnapshot = {
       payloadVersion: 1,
       prototypeId: row.prototypeId,
@@ -509,10 +739,12 @@ export const generatePrototypesForWorkstream = async (
       generatedText: row.text,
       embeddingSchemaVersion: PROTOTYPE_EMBEDDING_SCHEMA_VERSION,
       sourceEvidenceIds,
-      generatorModelId: outcome.generatorModelId,
+      generatorModelId: row.generatorModelId,
       generatedAt: input.nowMs,
       method: row.method,
       evidenceWatermark: watermark,
+      angle: row.angle,
+      ...(row.sourceMemberUrl === undefined ? {} : { sourceMemberUrl: row.sourceMemberUrl }),
     };
     const clientEventId = prototypeClientEventId(row.prototypeId);
     const existing = await deps.eventLog.findByClientEventId(clientEventId).catch(() => null);
@@ -532,30 +764,35 @@ export const generatePrototypesForWorkstream = async (
   // served copy is always exactly the latest generation, never a mix of
   // watermarks (see sqlite.ts's deletePrototypesForWorkstream doc comment).
   deps.store.deletePrototypesForWorkstream(input.workstreamId);
-  for (let i = 0; i < rows.length; i += 1) {
-    const row = rows[i]!;
-    const vec = vectors[i];
-    if (vec === undefined) continue;
+  for (const row of rows) {
     deps.store.upsertPrototype(
       {
         prototypeId: row.prototypeId,
         workstreamId: input.workstreamId,
         generatedText: row.text,
-        generatorModelId: outcome.generatorModelId,
+        generatorModelId: row.generatorModelId,
         method: row.method,
         generatedAt: input.nowMs,
         evidenceWatermark: watermark,
+        angle: row.angle,
+        ...(row.sourceMemberUrl === undefined ? {} : { sourceMemberUrl: row.sourceMemberUrl }),
       },
-      vec,
+      row.vec,
     );
   }
 
-  const firstMethod = rows[0]?.method;
+  const medoidCount = rows.filter((r) => r.angle === 'medoid').length;
+  const generatedCount = rows.filter((r) => r.angle === 'synthetic-sibling').length;
+
   return {
     workstreamId: input.workstreamId,
     outcome: 'regenerated',
     prototypeCount: rows.length,
-    ...(firstMethod === undefined ? {} : { method: firstMethod }),
+    medoidCount,
+    generatedCount,
+    ...(outcome.generationSkippedReason === null
+      ? {}
+      : { generationSkippedReason: outcome.generationSkippedReason }),
   };
 };
 
@@ -569,7 +806,13 @@ export interface PrototypeGenerationTickReport {
   readonly unchanged: number;
   readonly debounced: number;
   readonly belowFloor: number;
+  /** Ticks where the GENERATION (expansion) tier was skipped for ANY
+   *  reason — the medoid tier may well have still succeeded; this is an
+   *  observability counter, not a failure counter (see
+   *  WorkstreamGenerationResult.generationSkippedReason). */
   readonly engineUnavailable: number;
+  /** Ticks where NOTHING was produced (medoid embedding itself failed) —
+   *  the one truly fatal outcome in this tier. */
   readonly embedderUnavailable: number;
   readonly engineUnavailableReason: string | null;
   readonly results: readonly WorkstreamGenerationResult[];
@@ -590,7 +833,7 @@ const EMPTY_REPORT = (nowMs: number, enabled: boolean): PrototypeGenerationTickR
 });
 
 /**
- * One generation pass over every workstream that currently has filed
+ * One production pass over every workstream that currently has filed
  * evidence. Pure orchestration over injected deps — fully unit-testable with
  * a fake AppleFmClient/embedder/store, never calling the real engine in
  * tests (see prototypeGeneration.test.ts).
@@ -603,6 +846,12 @@ export const runPrototypeGenerationTick = async (
     readonly embed: EmbedFn;
     readonly store: PrototypeStore;
     readonly client?: AppleFmClient;
+    /** v2 keyword-profile signal (§11) — optional; when absent, the
+     *  keyword-profile store is simply left at its last-built state (or
+     *  empty) and the lane's keyword blend degrades to pure vector scoring
+     *  for every candidate, same "vectors only" fallback contract as
+     *  splitSuggestionEngine.ts's hybridSimilarity. */
+    readonly keywordLookup?: KeywordLookupDeps;
   },
   nowMs: number = Date.now(),
 ): Promise<PrototypeGenerationTickReport> => {
@@ -613,6 +862,26 @@ export const runPrototypeGenerationTick = async (
     () => new Map<string, readonly WorkstreamEvidenceItem[]>(),
   );
   if (evidenceByWorkstream.size === 0) return EMPTY_REPORT(nowMs, true);
+
+  // Keyword-profile refresh — same cadence as prototype regeneration, but
+  // NOT gated by per-workstream dirty-marking: it is a cheap full-replace
+  // over a small vocabulary (see sqlite.ts's replacePrototypeKeywordProfiles
+  // doc comment), so there is no correctness reason to debounce it
+  // separately, and doing so would mean the keyword signal can silently lag
+  // a workstream whose PROTOTYPES didn't need regenerating but whose
+  // MEMBERSHIP (and therefore keyword profile) still grew.
+  if (deps.keywordLookup !== undefined && deps.store.replacePrototypeKeywordProfiles !== undefined) {
+    try {
+      const { profiles, idf } = buildKeywordProfilesForWorkstreams(
+        evidenceByWorkstream,
+        deps.keywordLookup,
+      );
+      deps.store.replacePrototypeKeywordProfiles(idf, profiles);
+    } catch {
+      // Best-effort — a failed keyword-profile refresh must never block
+      // prototype generation itself.
+    }
+  }
 
   const priorEvents = await readPrototypeGenerationEvents(vaultRoot, eventLog).catch(
     () => [] as readonly AcceptedEvent[],
@@ -654,13 +923,13 @@ export const runPrototypeGenerationTick = async (
       case 'below-floor':
         belowFloor += 1;
         break;
-      case 'engine-unavailable':
-        engineUnavailable += 1;
-        engineUnavailableReason ??= result.detail ?? null;
-        break;
       case 'embedder-unavailable':
         embedderUnavailable += 1;
         break;
+    }
+    if (result.generationSkippedReason !== undefined) {
+      engineUnavailable += 1;
+      engineUnavailableReason ??= result.generationSkippedReason;
     }
   }
 
@@ -707,15 +976,40 @@ export const schedulePrototypeGenerationLoop = (
 ): (() => void) => {
   const runTick = async (): Promise<void> => {
     if (!prototypeGenerationEnabled()) return;
+    // Short-lived per-tick handles (this runs on an hours-scale interval —
+    // opening/closing a small SQLite handle per tick is cheap and avoids
+    // holding a keyword-store connection open for the companion's whole
+    // lifetime for a feature that only reads it once every few hours).
+    const closers: (() => void)[] = [];
     try {
       const { peekRecallV2Store, warmRecallV2Store } = await import('../recall-v2/pipeline.js');
       warmRecallV2Store(vaultRoot);
       const store = (await peekRecallV2Store(vaultRoot)) as PrototypeStore | undefined;
       if (store === undefined) return;
       const { embed } = await import('../recall/embedder.js');
+
+      let keywordLookup: KeywordLookupDeps | undefined;
+      try {
+        const { createKeywordIndexStore } = await import('../search-index/keywordIndexStore.js');
+        const { createKeywordConceptStore } = await import('../enrichment/keywordConceptStore.js');
+        const indexStore = await createKeywordIndexStore(vaultRoot);
+        closers.push(() => indexStore.close());
+        const conceptStore = await createKeywordConceptStore(vaultRoot);
+        closers.push(() => conceptStore.close());
+        keywordLookup = {
+          keywordsForPage: (pageKey) => indexStore.keywordsForPage(pageKey),
+          conceptForKeyword: (keyword) => conceptStore.conceptForKeyword(keyword),
+        };
+      } catch {
+        // Keyword layer unavailable this tick — the lane's keyword blend
+        // degrades to pure vector scoring; never blocks prototype generation.
+        keywordLookup = undefined;
+      }
+
       const report = await runPrototypeGenerationTick(vaultRoot, connectionsStore, eventLog, {
         embed,
         store,
+        ...(keywordLookup === undefined ? {} : { keywordLookup }),
       });
       hygieneStatus.lastPrototypeGenerationAt = new Date(report.ranAt).toISOString();
       hygieneStatus.lastPrototypeGenerationRegenerated = report.regenerated;
@@ -723,6 +1017,8 @@ export const schedulePrototypeGenerationLoop = (
       hygieneStatus.lastPrototypeGenerationEngineUnavailableReason = report.engineUnavailableReason;
     } catch {
       // Best-effort — a failed generation tick must never crash the companion.
+    } finally {
+      for (const close of closers) close();
     }
   };
   const interval = setInterval(() => {

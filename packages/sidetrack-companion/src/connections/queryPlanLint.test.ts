@@ -178,6 +178,80 @@ const HOT_STATEMENTS: readonly HotStatement[] = [
          )`,
     allowScanTables: ['connections_scope_nodes'],
   },
+  // --- #writeCurrentRows' scope-membership anti-join deletes (2026-08-17
+  // disk-wear fix — see snapshot.ts's #writeCurrentRows doc comment and
+  // putCurrentDiffAware.perf.test.ts). Replaces the old DELETE-all-then-
+  // reinsert-all shape putCurrent/writeSnapshotAndProgress used whenever
+  // dirtyScopes was undefined (the forceFullRebuildForThreadReconcile full-
+  // rebuild case — essentially every real catch-up/drain). Same bug-class
+  // neighborhood as replaceScopeRows' deleteScopeNodes/deleteScopeEdges
+  // above: an unindexed correlated lookup here would reintroduce a #378-
+  // shaped hang, just against connections_scope_nodes/_edges' own PK index
+  // instead of edges_index(src, dst). ---
+  {
+    kind: 'literal',
+    id: 'writeCurrentRows.deleteScopeNodesAntiJoin',
+    sourceRef: 'src/connections/snapshot.ts (SqliteConnectionsStore#writeCurrentRows)',
+    sql: `DELETE FROM connections_scope_nodes
+             WHERE NOT EXISTS (
+               SELECT 1 FROM temp_writecur_scope_nodes t
+               WHERE t.scope_kind = connections_scope_nodes.scope_kind
+                 AND t.scope_id = connections_scope_nodes.scope_id
+                 AND t.node_id = connections_scope_nodes.node_id
+             )`,
+    allowScanTables: ['connections_scope_nodes'],
+  },
+  {
+    kind: 'literal',
+    id: 'writeCurrentRows.deleteScopeEdgesAntiJoin',
+    sourceRef: 'src/connections/snapshot.ts (SqliteConnectionsStore#writeCurrentRows)',
+    sql: `DELETE FROM connections_scope_edges
+             WHERE NOT EXISTS (
+               SELECT 1 FROM temp_writecur_scope_edges t
+               WHERE t.scope_kind = connections_scope_edges.scope_kind
+                 AND t.scope_id = connections_scope_edges.scope_id
+                 AND t.edge_src = connections_scope_edges.edge_src
+                 AND t.edge_dst = connections_scope_edges.edge_dst
+             )`,
+    allowScanTables: ['connections_scope_edges'],
+  },
+  {
+    kind: 'literal',
+    id: 'writeCurrentRows.deleteScopeNodesScopedAntiJoin',
+    sourceRef: 'src/connections/snapshot.ts (SqliteConnectionsStore#writeCurrentRows)',
+    sql: `DELETE FROM connections_scope_nodes
+             WHERE EXISTS (
+               SELECT 1 FROM temp_writecur_dirty_scopes d
+               WHERE d.scope_kind = connections_scope_nodes.scope_kind
+                 AND d.scope_id = connections_scope_nodes.scope_id
+             )
+             AND NOT EXISTS (
+               SELECT 1 FROM temp_writecur_scope_nodes t
+               WHERE t.scope_kind = connections_scope_nodes.scope_kind
+                 AND t.scope_id = connections_scope_nodes.scope_id
+                 AND t.node_id = connections_scope_nodes.node_id
+             )`,
+    allowScanTables: ['connections_scope_nodes'],
+  },
+  {
+    kind: 'literal',
+    id: 'writeCurrentRows.deleteScopeEdgesScopedAntiJoin',
+    sourceRef: 'src/connections/snapshot.ts (SqliteConnectionsStore#writeCurrentRows)',
+    sql: `DELETE FROM connections_scope_edges
+             WHERE EXISTS (
+               SELECT 1 FROM temp_writecur_dirty_scopes d
+               WHERE d.scope_kind = connections_scope_edges.scope_kind
+                 AND d.scope_id = connections_scope_edges.scope_id
+             )
+             AND NOT EXISTS (
+               SELECT 1 FROM temp_writecur_scope_edges t
+               WHERE t.scope_kind = connections_scope_edges.scope_kind
+                 AND t.scope_id = connections_scope_edges.scope_id
+                 AND t.edge_src = connections_scope_edges.edge_src
+                 AND t.edge_dst = connections_scope_edges.edge_dst
+             )`,
+    allowScanTables: ['connections_scope_edges'],
+  },
   // --- Resolver-cache read/write (D3, on the served-resolve hot path) -----
   {
     kind: 'literal',
@@ -501,7 +575,9 @@ const seedForPlanLint = (db: LintDb): void => {
 /** Opens a store on `:memory:`, runs its own schema-init DDL + one
  *  `replaceScopeRows({})` no-op (creates the TEMP tables replaceScopeRows'
  *  statements reference — they only exist after that call, never in the
- *  base schema block), seeds bulk rows, and returns the raw handle. */
+ *  base schema block) + one `putCurrent({})` no-op (same reason, for
+ *  #writeCurrentRows' own `temp_writecur_*` anti-join tables — 2026-08-17
+ *  disk-wear fix), seeds bulk rows, and returns the raw handle. */
 const buildSeededStore = async (): Promise<{
   readonly store: SqliteConnectionsStore;
   readonly db: LintDb;
@@ -516,6 +592,15 @@ const buildSeededStore = async (): Promise<{
         ...EMPTY_PROGRESS('connections', 'connections@query-plan-lint'),
         snapshotRevisionId: 'seed',
       },
+    });
+    await store.putCurrent({
+      scope: {},
+      nodes: [],
+      edges: [],
+      updatedAt: '2026-08-17T00:00:00.000Z',
+      nodeCount: 0,
+      edgeCount: 0,
+      snapshotRevision: 'seed-writecur',
     });
   });
   seedForPlanLint(db);
