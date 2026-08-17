@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { copyFile, mkdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises';
+import { appendFile, copyFile, mkdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 
 import { createRevision } from '../domain/ids.js';
@@ -13,7 +13,6 @@ import { createRevision } from '../domain/ids.js';
 // This is what makes metadata-only plugin upgrades cheap.
 //
 // Storage: a single binary file at `_BAC/recall/embed-cache.bin`.
-// Append-only with periodic compaction (TODO follow-up).
 //
 //   u32 headerLength + UTF-8 JSON header
 //     { magic, version, modelId, modelRevision, dim }
@@ -24,6 +23,49 @@ import { createRevision } from '../domain/ids.js';
 // Mismatched modelId or modelRevision → cache is dropped on next
 // write (the lifecycle's stale-check already rebuilds the index in
 // that case; the cache is purely an optimization).
+//
+// ---------------------------------------------------------------------------
+// WRITE PATH (2026-08-17) — APPEND, NOT REWRITE.
+//
+// `putMany` used to read the WHOLE file and rewrite it (tmp + rename) on
+// EVERY call, no matter how small the incoming batch was. At a ~10-14MB live
+// cache and the page-evidence embed lane calling `putMany`+`put` once PER
+// embedded record (two full-file rewrites per record: one for the chunk
+// vectors, one for the doc vector), that put write volume at O(cache-size)
+// PER RECORD instead of O(record-size) — a full-file rewrite every ~4s cycle
+// traced to ~350MB/min of disk writes dominated by this file, the SSD-wear
+// top concern.
+//
+// The on-disk FORMAT already supported this without any migration: records
+// are read sequentially into a Map keyed by hash, so a later record for the
+// same hash simply overwrites an earlier one when parsed — a duplicate-key
+// log is already valid input. So the fix needed no new file, no schema
+// version bump, and no one-time port: when the model identity is unchanged,
+// `putMany` now APPENDS just the new/changed records (one `appendFile` of
+// only the incoming batch's bytes) instead of re-serializing every entry in
+// the cache. A first write, or a model-identity change, still does a full
+// (fresh, therefore small) rewrite — that path was never the expensive one.
+//
+// COMPACTION: repeated overwrites of the same hash (re-embeds, model
+// migrations via `migrateModel`) leave stale superseded records in the log.
+// Each append that overwrites an existing hash counts that record's encoded
+// byte length as "stale" (`staleBytesSinceCompaction`, module-scoped per
+// path). Once accumulated stale bytes cross `compactionStaleBytesThreshold`
+// (default 2MB), the next write does one full compacting rewrite instead of
+// an append, reclaiming the dead space, then resumes appending. This is the
+// "periodic compaction" this file's docstring named as a TODO for years —
+// now the actual write strategy, not a follow-up.
+//
+// CRASH SAFETY: an append is not a single atomic rename like the old
+// rewrite-then-swap was, so a crash mid-`appendFile` can leave a truncated
+// trailing record. `readCacheFileUncached` treats an incomplete trailing
+// record as end-of-file (stopping the scan there) rather than discarding the
+// whole parse — every record fully written before the crash is still read
+// back. Losing an in-flight, not-yet-fsynced batch is acceptable: this file
+// is a CACHE (embedTextHash → vector); the worst case is re-embedding a few
+// texts, never corrupting recall (the lifecycle rebuilds the index from
+// source content, not from this cache).
+// ---------------------------------------------------------------------------
 //
 // ---------------------------------------------------------------------------
 // E2 (2026-07-29) — THIS FILE IS THE SHARED SUBSTRATE.
@@ -120,6 +162,22 @@ export interface EmbeddingCacheOptions {
   readonly lockAttempts?: number;
   readonly lockRetryMs?: number;
   readonly lockStaleMs?: number;
+  /** Accumulated stale (superseded-record) bytes in the append log that
+   *  trigger a compacting rewrite. Default 2MB. Tests lower this to force a
+   *  deterministic compaction. */
+  readonly compactionStaleBytesThreshold?: number;
+  /** Audibility hook: called with a throttled, ONE-LINE-per-window summary
+   *  of bytes actually written to disk (`[embed-cache] flushed
+   *  entries=N bytes=M kind=append|compact`) so write volume is
+   *  attributable from the log. Defaults to a no-op — callers that want
+   *  the line on stdout pass `(m) => process.stdout.write(`${m}\n`)`, same
+   *  convention as the background-embedding lane's `log` dep. */
+  readonly log?: (message: string) => void;
+  /** Minimum ms between flush log lines per cache file. Pending
+   *  entries/bytes accumulate across throttled-away flushes so the next
+   *  emitted line still reports the true total for the window. Default
+   *  5000ms; tests pass 0 to log every flush deterministically. */
+  readonly flushLogIntervalMs?: number;
 }
 
 export class EmbeddingCacheBackpressureError extends Error {
@@ -155,6 +213,26 @@ const readString = (buffer: Buffer, cursor: { offset: number }): string => {
   return value;
 };
 
+/** Encode one (hash, vector) record in the on-disk record format. Shared by
+ *  the full-rewrite path (writeCacheFile) and the append-only path, so a
+ *  record looks byte-identical regardless of which path wrote it. */
+const encodeRecord = (hash: string, vector: Float32Array, dim: number): Buffer => {
+  const vecBytes = Buffer.alloc(dim * 4);
+  for (let i = 0; i < dim; i += 1) {
+    vecBytes.writeFloatLE(vector[i] ?? 0, i * 4);
+  }
+  return Buffer.concat([encodeString(hash), vecBytes]);
+};
+
+const encodeRecords = (
+  entries: Iterable<readonly [string, Float32Array]>,
+  dim: number,
+): Buffer => {
+  const records: Buffer[] = [];
+  for (const [hash, vector] of entries) records.push(encodeRecord(hash, vector, dim));
+  return Buffer.concat(records);
+};
+
 interface CacheState {
   readonly path: string;
   readonly dim: number;
@@ -174,10 +252,13 @@ interface LoadedCache {
 // call, with no cross-process signalling to get wrong.
 const memo = new Map<string, { mtimeMs: number; size: number; ino: number; loaded: LoadedCache }>();
 
-/** Test seam — the memo is process-global, so tests that write the file
- *  directly (rather than through this module) must be able to drop it. */
+/** Test seam — the memo (and the append/compaction/flush-log bookkeeping,
+ *  all process-global) so tests that write the file directly (rather than
+ *  through this module) must be able to drop them. */
 export const __resetEmbeddingCacheMemo = (): void => {
   memo.clear();
+  staleBytesSinceCompaction.clear();
+  flushLogState.clear();
 };
 
 const readCacheFileUncached = async (state: CacheState): Promise<LoadedCache | null> => {
@@ -199,7 +280,17 @@ const readCacheFileUncached = async (state: CacheState): Promise<LoadedCache | n
     if (header.magic !== MAGIC || header.version !== VERSION) return null;
     if (header.dim !== state.dim) return null;
     const entries = new Map<string, Float32Array>();
+    // CRASH SAFETY: appends are no longer swapped in atomically (see the
+    // WRITE PATH note above), so a crash mid-`appendFile` can leave a
+    // truncated trailing record. Treat "not enough bytes left for one more
+    // full record" as end-of-file rather than a parse error — every record
+    // fully written before the crash is still returned; only the in-flight,
+    // never-fsynced tail is dropped (acceptable: this is a cache).
+    const recordBytes = (hashByteLength: number): number => 4 + hashByteLength + state.dim * 4;
     while (cursor.offset < buffer.length) {
+      if (cursor.offset + 4 > buffer.length) break; // truncated hash-length field
+      const hashLength = buffer.readUInt32LE(cursor.offset);
+      if (cursor.offset + recordBytes(hashLength) > buffer.length) break; // truncated record
       const hash = readString(buffer, cursor);
       const vec = new Float32Array(state.dim);
       for (let i = 0; i < state.dim; i += 1) {
@@ -241,25 +332,24 @@ const readCacheFile = async (state: CacheState): Promise<LoadedCache | null> => 
   return loaded;
 };
 
+// A full rewrite (tmp + atomic rename). This is the EXPENSIVE, O(cache-size)
+// path — used only for: the first write to a path, a model-identity change
+// ("start clean"), a `migrateModel`/`rollbackMigration`, and a compaction
+// once accumulated stale bytes cross the threshold. Returns the total bytes
+// written so callers can attribute the write in the flush log.
 const writeCacheFile = async (
   state: CacheState,
   header: CacheHeader,
   entries: Map<string, Float32Array>,
-): Promise<void> => {
+): Promise<number> => {
   await mkdir(dirname(state.path), { recursive: true });
   const headerBytes = Buffer.from(JSON.stringify(header), 'utf8');
   const headerLen = Buffer.alloc(4);
   headerLen.writeUInt32LE(headerBytes.length, 0);
-  const records: Buffer[] = [];
-  for (const [hash, vec] of entries) {
-    const vecBytes = Buffer.alloc(state.dim * 4);
-    for (let i = 0; i < state.dim; i += 1) {
-      vecBytes.writeFloatLE(vec[i] ?? 0, i * 4);
-    }
-    records.push(Buffer.concat([encodeString(hash), vecBytes]));
-  }
+  const recordBytes = encodeRecords(entries, state.dim);
+  const fileBytes = Buffer.concat([headerLen, headerBytes, recordBytes]);
   const tempPath = join(dirname(state.path), `.embed-cache.${createRevision()}.tmp`);
-  await writeFile(tempPath, Buffer.concat([headerLen, headerBytes, ...records]));
+  await writeFile(tempPath, fileBytes);
   await rename(tempPath, state.path);
   // Refresh the memo from what we just wrote so the next read is free instead
   // of re-parsing bytes this process already has in hand.
@@ -274,6 +364,91 @@ const writeCacheFile = async (
   } catch {
     memo.delete(state.path);
   }
+  staleBytesSinceCompaction.delete(state.path);
+  return fileBytes.length;
+};
+
+// APPEND-ONLY path: writes only the incoming batch's encoded bytes to the
+// end of the file (one `appendFile` call), then updates the memo in-memory
+// (merged map) so a subsequent read doesn't re-parse the file it already
+// has in hand. This is the O(batch), not O(cache-size), write. Returns the
+// bytes actually written to disk.
+const appendCacheEntries = async (
+  state: CacheState,
+  header: CacheHeader,
+  mergedEntries: Map<string, Float32Array>,
+  incoming: readonly (readonly [string, Float32Array])[],
+): Promise<number> => {
+  const appendBytes = encodeRecords(incoming, state.dim);
+  await appendFile(state.path, appendBytes);
+  try {
+    const info = await stat(state.path);
+    memo.set(state.path, {
+      mtimeMs: info.mtimeMs,
+      size: info.size,
+      ino: info.ino,
+      loaded: { header, entries: mergedEntries },
+    });
+  } catch {
+    memo.delete(state.path);
+  }
+  return appendBytes.length;
+};
+
+// Per-path accumulator of superseded-record bytes still sitting in the
+// append log (a later record for the same hash makes the earlier on-disk
+// record dead weight). Drives the compaction trigger — see the WRITE PATH
+// doc comment above.
+const staleBytesSinceCompaction = new Map<string, number>();
+const DEFAULT_COMPACTION_STALE_BYTES_THRESHOLD = 2 * 1024 * 1024;
+
+// Throttled flush-log accumulator, keyed by path. Pending entries/bytes
+// accumulate across throttled-away flushes so the next emitted line still
+// reports the true total for the window — a flush is never silently
+// unaccounted for, only its LOG LINE is coalesced.
+interface FlushLogState {
+  lastLogAtMs: number;
+  pendingEntries: number;
+  pendingBytes: number;
+  kinds: Set<'append' | 'compact'>;
+}
+const flushLogState = new Map<string, FlushLogState>();
+const DEFAULT_FLUSH_LOG_INTERVAL_MS = 5_000;
+
+const recordFlush = (
+  path: string,
+  kind: 'append' | 'compact',
+  entries: number,
+  bytes: number,
+  log: (message: string) => void,
+  intervalMs: number,
+): void => {
+  const nowMs = Date.now();
+  const state = flushLogState.get(path) ?? {
+    lastLogAtMs: 0,
+    pendingEntries: 0,
+    pendingBytes: 0,
+    kinds: new Set<'append' | 'compact'>(),
+  };
+  state.pendingEntries += entries;
+  state.pendingBytes += bytes;
+  state.kinds.add(kind);
+  if (nowMs - state.lastLogAtMs < intervalMs) {
+    flushLogState.set(path, state);
+    return;
+  }
+  const kindLabel = [...state.kinds].sort().join('+');
+  log(
+    `[embed-cache] flushed entries=${String(state.pendingEntries)} bytes=${String(
+      state.pendingBytes,
+    )} kind=${kindLabel} path=${path}`,
+  );
+  flushLogState.set(path, {
+    lastLogAtMs: nowMs,
+    pendingEntries: 0,
+    pendingBytes: 0,
+    kinds: new Set<'append' | 'compact'>(),
+  });
 };
 
 export const createEmbeddingCache = (
@@ -290,6 +465,12 @@ export const createEmbeddingCache = (
   const lockAttempts = Math.max(1, options.lockAttempts ?? 6);
   const lockRetryMs = Math.max(0, options.lockRetryMs ?? 5);
   const lockStaleMs = Math.max(1, options.lockStaleMs ?? 120_000);
+  const compactionStaleBytesThreshold = Math.max(
+    0,
+    options.compactionStaleBytesThreshold ?? DEFAULT_COMPACTION_STALE_BYTES_THRESHOLD,
+  );
+  const log = options.log ?? ((): void => undefined);
+  const flushLogIntervalMs = Math.max(0, options.flushLogIntervalMs ?? DEFAULT_FLUSH_LOG_INTERVAL_MS);
 
   const withWriteLock = async <T>(fn: () => Promise<T>): Promise<T> => {
     await mkdir(dirname(lockPath), { recursive: true });
@@ -363,20 +544,49 @@ export const createEmbeddingCache = (
         existing !== null &&
         existing.header.modelId === model.modelId &&
         existing.header.modelRevision === model.modelRevision;
-      // Model changed (or no file yet) — start clean. Serving vectors from a
-      // different model would be worse than a cold cache.
+      if (!modelMatches) {
+        // Model changed (or no file yet) — start clean. Serving vectors from
+        // a different model would be worse than a cold cache. This is a
+        // FULL rewrite, but of a fresh (therefore small — just this batch)
+        // map, so it is cheap; it is not the O(cache-size)-per-record path
+        // the append design exists to avoid.
+        const header = freshHeader(model);
+        const entries = new Map<string, Float32Array>();
+        for (const [hash, vector] of writable) entries.set(hash, vector);
+        const bytes = await writeCacheFile(state, header, entries);
+        recordFlush(state.path, 'compact', entries.size, bytes, log, flushLogIntervalMs);
+        return;
+      }
+      // Model matches the on-disk header — APPEND only the incoming batch's
+      // bytes (O(batch), not O(cache-size)). See the WRITE PATH doc comment
+      // at the top of this file for why the on-disk record format already
+      // supports a duplicate-key log without any migration.
       //
       // COPY, never mutate `existing.entries` in place: that Map may be the
-      // MEMO's, and a write that fails after an in-place mutation would leave the
-      // memo claiming entries that are not on disk (the file's stat is unchanged,
-      // so nothing would ever invalidate it). writeCacheFile installs this fresh
-      // map as the new memo on success.
-      const entries = modelMatches
-        ? new Map<string, Float32Array>(existing.entries)
-        : new Map<string, Float32Array>();
-      const header = modelMatches ? existing.header : freshHeader(model);
-      for (const [hash, vector] of writable) entries.set(hash, vector);
-      await writeCacheFile(state, header, entries);
+      // MEMO's, and a write that fails after an in-place mutation would leave
+      // the memo claiming entries that are not on disk (the file's stat is
+      // unchanged, so nothing would ever invalidate it). appendCacheEntries
+      // installs this merged map as the new memo only after the append lands.
+      const merged = new Map<string, Float32Array>(existing.entries);
+      let staleBytes = 0;
+      for (const [hash, vector] of writable) {
+        const prior = existing.entries.get(hash);
+        if (prior !== undefined) staleBytes += encodeRecord(hash, prior, state.dim).length;
+        merged.set(hash, vector);
+      }
+      const appendedBytes = await appendCacheEntries(state, existing.header, merged, writable);
+      const totalStaleBytes = (staleBytesSinceCompaction.get(state.path) ?? 0) + staleBytes;
+      if (totalStaleBytes >= compactionStaleBytesThreshold && compactionStaleBytesThreshold > 0) {
+        // Enough superseded records have piled up in the log — reclaim the
+        // dead space with one compacting rewrite. Still amortized: this
+        // triggers only after `compactionStaleBytesThreshold` bytes of
+        // OVERWRITES accumulate, not on every write.
+        const compactedBytes = await writeCacheFile(state, existing.header, merged);
+        recordFlush(state.path, 'compact', merged.size, compactedBytes, log, flushLogIntervalMs);
+      } else {
+        staleBytesSinceCompaction.set(state.path, totalStaleBytes);
+        recordFlush(state.path, 'append', writable.length, appendedBytes, log, flushLogIntervalMs);
+      }
     });
   };
 
@@ -466,6 +676,7 @@ export const createEmbeddingCache = (
         await copyFile(rollbackPath, temporary);
         await rename(temporary, state.path);
         memo.delete(state.path);
+        staleBytesSinceCompaction.delete(state.path);
         return true;
       } catch (error) {
         if (error instanceof Error && 'code' in error && error.code === 'ENOENT') return false;

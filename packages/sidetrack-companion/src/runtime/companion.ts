@@ -70,6 +70,8 @@ import {
 import { ensurePageContentStoreReady } from '../page-content/store.js';
 import {
   createBackgroundEmbeddingLane,
+  DEFAULT_BACKGROUND_EMBEDDING_CONFIG,
+  resolveEmbedBatchCapFromEnv,
   type BackgroundEmbeddingLaneHealth,
 } from '../page-evidence/backgroundEmbeddingLane.js';
 import {
@@ -1314,24 +1316,34 @@ export const startCompanion = async (
       const candidateSource = createIncrementalBackgroundEmbeddingCandidateSource(
         options.vaultPath,
       );
-      const backgroundEmbeddingLane = createBackgroundEmbeddingLane({
-        listCandidates: candidateSource.listCandidates,
-        embedCanonicalUrl: embedOne,
-        isDrainActive: () => connectionsMaterializer.isDrainActive(),
-        // WARMUP GATE: do no embed work (and burn no attempts) until the
-        // embedder child has warmed. Before this, the lane's first cycles
-        // fired embeds against a cold child → 'failed' → permanent
-        // quarantine of the whole backlog (the 90-min soak inertness).
-        // embedderClient is non-null here (the lane is gated on
-        // useChildProcesses), but stay defensive.
-        isEmbedderReady: () => embedderClient?.isReady() ?? false,
-        isTombstoned: (page) => pageEvidenceTombstoneSet.matchesPage(page),
-        onEmbedded: (canonicalUrl) =>
-          connectionsMaterializer.requalifyVisitForSimilarity(canonicalUrl),
-        readProgress: () => readBackgroundEmbeddingProgress(options.vaultPath),
-        writeProgress: (progress) => writeBackgroundEmbeddingProgress(options.vaultPath, progress),
-        log: (message) => process.stdout.write(`${message}\n`),
-      });
+      // SIDETRACK_EMBED_BATCH overrides the per-cycle visit cap (default 16
+      // — see resolveEmbedBatchCapFromEnv's doc comment for why this is
+      // safe now that the embed cache writes O(batch), not O(cache-size),
+      // per record). Bad/blank/out-of-range values degrade to the default
+      // rather than failing boot.
+      const embedBatchCap = resolveEmbedBatchCapFromEnv(process.env['SIDETRACK_EMBED_BATCH']);
+      const backgroundEmbeddingLane = createBackgroundEmbeddingLane(
+        {
+          listCandidates: candidateSource.listCandidates,
+          embedCanonicalUrl: embedOne,
+          isDrainActive: () => connectionsMaterializer.isDrainActive(),
+          // WARMUP GATE: do no embed work (and burn no attempts) until the
+          // embedder child has warmed. Before this, the lane's first cycles
+          // fired embeds against a cold child → 'failed' → permanent
+          // quarantine of the whole backlog (the 90-min soak inertness).
+          // embedderClient is non-null here (the lane is gated on
+          // useChildProcesses), but stay defensive.
+          isEmbedderReady: () => embedderClient?.isReady() ?? false,
+          isTombstoned: (page) => pageEvidenceTombstoneSet.matchesPage(page),
+          onEmbedded: (canonicalUrl) =>
+            connectionsMaterializer.requalifyVisitForSimilarity(canonicalUrl),
+          readProgress: () => readBackgroundEmbeddingProgress(options.vaultPath),
+          writeProgress: (progress) =>
+            writeBackgroundEmbeddingProgress(options.vaultPath, progress),
+          log: (message) => process.stdout.write(`${message}\n`),
+        },
+        { ...DEFAULT_BACKGROUND_EMBEDDING_CONFIG, batchCap: embedBatchCap },
+      );
       // Expose the lane's health snapshot to /v1/status so an inert lane
       // is VISIBLE within minutes instead of a 90-min silent stall.
       backgroundEmbeddingLaneHealth = backgroundEmbeddingLane.health;
