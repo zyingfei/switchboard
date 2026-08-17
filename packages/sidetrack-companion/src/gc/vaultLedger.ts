@@ -222,6 +222,13 @@ export const classifyVaultPath = (segments: readonly string[]): LedgerFamily => 
         // (subtreeOf) for scoped workstream CRUD. See
         // src/workstreams/workstreamParentStore.ts.
         leaf === 'workstream-parent.db' ||
+        // Gist keywords as sparse-data clustering features (2026-08-16) —
+        // the maintained keyword -> page inverted index, and the small
+        // keyword -> concept-id centroid store. See
+        // src/search-index/keywordIndexStore.ts and
+        // src/enrichment/keywordConceptStore.ts.
+        leaf === 'keyword-index.db' ||
+        leaf === 'keyword-concepts.db' ||
         leaf === 'snapshot.sqlite'
       ) {
         return 'connections-sidecar-dbs';

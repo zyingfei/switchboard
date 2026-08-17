@@ -7,7 +7,10 @@ export const cosine = (left: Float32Array, right: Float32Array): number => {
   return dot;
 };
 
-const normalize = (vector: Float32Array): Float32Array => {
+// Exported (additive, 2026-08-16) so keywordConcepts.ts can reuse the SAME
+// unit-normalization the split-suggestion centroid math already uses,
+// instead of forking a second copy.
+export const normalize = (vector: Float32Array): Float32Array => {
   let sum = 0;
   for (const value of vector) {
     sum += value * value;

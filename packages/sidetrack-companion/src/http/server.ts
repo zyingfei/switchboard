@@ -140,6 +140,7 @@ import { entitiesRoutes } from './routes/entitiesRoutes.js';
 import { threadSuggestionRoutes, threadsRoutesA } from './routes/threadsRoutes.js';
 import { eventsRoutes } from './routes/eventsRoutes.js';
 import { workstreamsRoutes } from './routes/workstreamsRoutes.js';
+import { workstreamSuggestionsRoutes } from './routes/workstreamSuggestionsRoutes.js';
 import { queueRoutes } from './routes/queueRoutes.js';
 import { remindersRoutes } from './routes/remindersRoutes.js';
 import { codingSessionsRoutes } from './routes/codingSessionsRoutes.js';
@@ -1788,6 +1789,7 @@ export const routes: readonly RouteDefinition[] = [
   ...eventsRoutes,
   ...threadsRoutesA,
   ...workstreamsRoutes,
+  ...workstreamSuggestionsRoutes,
   ...queueRoutes,
   ...remindersRoutes,
   ...codingSessionsRoutes,

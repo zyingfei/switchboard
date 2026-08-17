@@ -1,6 +1,11 @@
 // Small NLTK-inspired English stopword subset; enough to keep common glue
-// words from dominating workstream/thread title similarity.
-const STOPWORDS = new Set([
+// words from dominating workstream/thread title similarity. Exported
+// (additive, 2026-08-16) so the deterministic keyword extractor
+// (enrichment/keywordExtract.ts) can reuse the SAME list rather than forking
+// a third one — this codebase already has two independent English stopword
+// sets (this one and recall-v2/query-analysis.ts's); a keyword feature
+// deliberately reuses this one instead of adding a third.
+export const STOPWORDS = new Set([
   'the',
   'and',
   'for',

@@ -144,6 +144,20 @@ export const TITLE_PROMPT_PREFIX = [
 // "begin immediately with the subject") removed it in 3/3 documents. Asking
 // for plain sentences also dropped the markdown scaffolding that was ending
 // up in the retrieval corpus.
+// Keywords line (2026-08-16, "gist keywords as sparse-data clustering
+// features"). Appended to the SAME call, mirroring how the chunk-synthesis
+// pass below already asks for "the key entities" in one shot — no second
+// model call, no new event, just one more labelled line the companion-side
+// parser (enrichment/keywordExtract.ts) recovers downstream. Deliberately on
+// its OWN final line, after the summary and after the SKIP escape hatch, so
+// a model that abstains (SKIP) never reaches it and the summary's own
+// preamble-avoidance tuning (see the header note below) is unaffected — the
+// instruction that mattered for that tuning is the FIRST one, not the last.
+const KEYWORDS_LINE_INSTRUCTION =
+  'After the summary, on its own final line, write: Keywords: term1, term2, term3 ' +
+  '— 3 to 7 short terms or phrases from the document that someone would search ' +
+  'for to find it again. Lowercase, comma-separated, no explanation.';
+
 export const GIST_PROMPT_PREFIX = [
   'Summarize the document below in 2 to 3 plain sentences.',
   'Begin immediately with the subject matter.',
@@ -153,6 +167,7 @@ export const GIST_PROMPT_PREFIX = [
   '(English document → English summary, 中文内容 → 中文摘要).',
   'Use ONLY facts stated in the document. Do not invent names or products.',
   'If the document is too thin to summarize, reply exactly: SKIP',
+  KEYWORDS_LINE_INSTRUCTION,
   '',
   'Document:',
   '---',
@@ -198,6 +213,7 @@ export const GIST_SYNTHESIS_PROMPT_PREFIX = [
   '(English notes → English summary, 中文笔记 → 中文摘要).',
   'Use ONLY facts present in the notes. Do not mention the notes, the',
   'sections, or these instructions.',
+  KEYWORDS_LINE_INSTRUCTION,
   '',
   'Notes:',
   '---',

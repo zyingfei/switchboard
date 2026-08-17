@@ -139,6 +139,8 @@ describe('HTTP route table characterization (stage S1 pin)', () => {
       'PATCH ^\\/v1\\/workstreams\\/(?<workstreamId>[A-Za-z0-9_-]+)$',
       'DELETE ^\\/v1\\/workstreams\\/(?<workstreamId>[A-Za-z0-9_-]+)$',
       'GET ^\\/v1\\/workstreams\\/(?<workstreamId>[A-Za-z0-9_-]+)\\/linked-notes$',
+      'POST ^\\/v1\\/workstreams\\/suggestions\\/new-topic\\/(?<fingerprint>[^/]+)\\/accept$',
+      'POST ^\\/v1\\/workstreams\\/suggestions\\/new-topic\\/(?<fingerprint>[^/]+)\\/decline$',
       'POST ^\\/v1\\/queue$',
       'GET ^\\/v1\\/queue\\/(?<bacId>[A-Za-z0-9_-]+)\\/projection$',
       'POST ^\\/v1\\/reminders$',

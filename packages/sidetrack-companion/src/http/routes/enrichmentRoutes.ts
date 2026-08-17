@@ -8,6 +8,7 @@ import { appendContentEnrichmentEvent, type EntityContentEnrichedPayload } from 
 import { appendEnrichmentRetractionEvent } from '../../enrichment/enrichmentRetraction.js';
 import type { EnrichmentFamily, EntityEnrichmentRetractedPayload } from '../../enrichment/events.js';
 import { appendEnrichmentEvent, titleEnrichmentEnabled, type EntityTitleEnrichedKind, type EntityTitleEnrichedPayload } from '../../enrichment/titleEnrichment.js';
+import { ingestGistKeywords, resyncGistKeywordsAfterRetraction } from '../../enrichment/keywordIngest.js';
 
 import { HttpRouteError, readBody } from '../routeSupport.js';
 import type { RouteDefinition } from '../routeSupport.js';
@@ -185,8 +186,24 @@ export const enrichmentRoutes: readonly RouteDefinition[] = [
         // duplicate hash / durable-write failure all count as skipped; the
         // batch never fails on one bad item.
         const outcome = await appendContentEnrichmentEvent(eventLog, candidate);
-        if (outcome === 'accepted') accepted += 1;
-        else skipped += 1;
+        if (outcome === 'accepted') {
+          accepted += 1;
+          // Keyword layer (docs/plans/2026-08-16-category-flexibility-hyde.md,
+          // keyword section) — extract + index + concept-assign off the SAME
+          // gist text just durably persisted. Best-effort: never throws, and
+          // a vaultRoot-less context (some test/loopback configurations)
+          // simply skips it rather than failing the enrichment write.
+          // Awaited (not fire-and-forget): this route is not on a tight
+          // serve-latency budget (unlike /v1/status), and awaiting keeps the
+          // write and its keyword-layer side effect observable in the same
+          // request — no reader can see the gist accepted but the keyword
+          // index not yet caught up.
+          if (context.vaultRoot !== undefined) {
+            await ingestGistKeywords(context.vaultRoot, candidate.kind, candidate.id, candidate.gist);
+          }
+        } else {
+          skipped += 1;
+        }
       }
       return [200, { data: { accepted, skipped } }];
     },
@@ -280,8 +297,23 @@ export const enrichmentRoutes: readonly RouteDefinition[] = [
           retractedAt,
         };
         const outcome = await appendEnrichmentRetractionEvent(eventLog, candidate);
-        if (outcome === 'accepted') accepted += 1;
-        else skipped += 1;
+        if (outcome === 'accepted') {
+          accepted += 1;
+          // Keyword layer re-sync — only 'content' retractions carry a gist;
+          // a 'title' retraction has nothing for the keyword index to
+          // reconcile. Delegates to the gist fold's own retraction semantics
+          // (see keywordIngest.ts) rather than re-deriving them here.
+          if (context.vaultRoot !== undefined && candidate.family === 'content') {
+            await resyncGistKeywordsAfterRetraction(
+              context.vaultRoot,
+              eventLog,
+              candidate.kind,
+              candidate.id,
+            );
+          }
+        } else {
+          skipped += 1;
+        }
       }
       return [200, { data: { accepted, skipped } }];
     },

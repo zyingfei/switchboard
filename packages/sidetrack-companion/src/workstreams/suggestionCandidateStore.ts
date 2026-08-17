@@ -61,6 +61,35 @@ export interface SuggestionCandidateStore {
     revisionId: string,
     candidates: readonly SuggestionCandidateRecord[],
   ) => void;
+  /**
+   * POPULATION-SCOPED DECLINE MEMORY (2026-08-16, "gist keywords as sparse-
+   * data clustering features" §7 — additive, not part of the original §4
+   * design). Distinct from `declineMemory.ts`'s per-(subject,workstream)
+   * decline: a NEW-TOPIC candidate has no workstreamId until it is accepted,
+   * so a decline of one cannot be expressed as "declined workstream X" —
+   * there is no X yet. Instead this records the DECLINED CLUSTER's own
+   * concept-id fingerprint at the scope+kind it was declined under; a future
+   * candidate at the same scope+kind is checked against every declined
+   * fingerprint by concept-Jaccard overlap (see
+   * splitSuggestionEngine.ts's isSuppressedByDecline) — "a declined cluster
+   * must not recur while membership is substantially the same."
+   */
+  readonly declineCandidate: (
+    scopeId: string,
+    kind: SuggestionCandidateKind,
+    fingerprint: string,
+    conceptIds: readonly string[],
+    declinedAtMs: number,
+  ) => void;
+  /** Every declined concept-id set at this scope+kind, for the overlap
+   *  check above. Unbounded by design — decline records are sparse (one per
+   *  user decision, not one per page) and this store already keeps
+   *  candidate history unpruned for the same reason threadRegisterStore.ts
+   *  does. */
+  readonly declinedConceptSets: (
+    scopeId: string,
+    kind: SuggestionCandidateKind,
+  ) => readonly (readonly string[])[];
   readonly close: () => void;
 }
 
@@ -109,6 +138,14 @@ const SCHEMA = `
     structural_name TEXT,
     created_at_ms INTEGER NOT NULL,
     updated_at_ms INTEGER NOT NULL,
+    PRIMARY KEY (scope_id, kind, fingerprint)
+  );
+  CREATE TABLE IF NOT EXISTS suggestion_candidate_decline (
+    scope_id TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    fingerprint TEXT NOT NULL,
+    concept_ids_json TEXT NOT NULL,
+    declined_at_ms INTEGER NOT NULL,
     PRIMARY KEY (scope_id, kind, fingerprint)
   );
 `;
@@ -180,6 +217,17 @@ export const createSuggestionCandidateStore = async (
         structural_name, created_at_ms, updated_at_ms)
      VALUES (?,?,?,?,?,?,?,?,?)`,
   );
+  const upsertDecline = db.query(
+    `INSERT INTO suggestion_candidate_decline
+       (scope_id, kind, fingerprint, concept_ids_json, declined_at_ms)
+     VALUES (?,?,?,?,?)
+     ON CONFLICT(scope_id, kind, fingerprint) DO UPDATE SET
+       concept_ids_json = excluded.concept_ids_json,
+       declined_at_ms = excluded.declined_at_ms`,
+  );
+  const selectDeclines = db.query(
+    'SELECT concept_ids_json FROM suggestion_candidate_decline WHERE scope_id = ? AND kind = ?',
+  );
 
   const candidatesFor = (
     scopeId: string,
@@ -229,10 +277,37 @@ export const createSuggestionCandidateStore = async (
     }
   };
 
+  const declineCandidate = (
+    scopeId: string,
+    kind: SuggestionCandidateKind,
+    fingerprint: string,
+    conceptIds: readonly string[],
+    declinedAtMs: number,
+  ): void => {
+    upsertDecline.run(scopeId, kind, fingerprint, JSON.stringify(conceptIds), declinedAtMs);
+  };
+
+  const declinedConceptSets = (
+    scopeId: string,
+    kind: SuggestionCandidateKind,
+  ): readonly (readonly string[])[] => {
+    const rows = selectDeclines.all(scopeId, kind) as readonly { readonly concept_ids_json: string }[];
+    return rows.map((row) => {
+      try {
+        const parsed: unknown = JSON.parse(row.concept_ids_json);
+        return Array.isArray(parsed) ? (parsed as string[]) : [];
+      } catch {
+        return [];
+      }
+    });
+  };
+
   return {
     candidatesFor,
     lastComputedRevision,
     replaceScope,
+    declineCandidate,
+    declinedConceptSets,
     close: () => {
       db.close?.();
     },

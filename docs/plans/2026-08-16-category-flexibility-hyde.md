@@ -569,3 +569,295 @@ engine deferred to avoid the sibling branch's active files.
 
 Full test suite green (`bun test`); `bun run build` clean. See the PR for
 file list and exact test counts.
+
+## 9. Landing note — gist keywords as sparse-data clustering features + new-topic suggestions (2026-08-17)
+
+Shipped in one PR on `feat/gist-keywords-clustering`, branched from this
+doc's §8 landing point. Doc-vector coverage sits at ~16% of pages
+(embedding-only clustering starves); this closes the gap by making the
+already-shipped, quality-approved gist enrichment ALSO emit 3-7 keywords
+per page, and using discrete keyword-concept overlap as a clustering
+feature everywhere embeddings are sparse — binding doctrine: the LLM is an
+offline feature extractor inside the already-running enrichment lane, every
+downstream consumer is deterministic stats, never a second model call.
+
+**Architecture correction, stated up front (documented, not silent).** The
+brief scoped this to "the enrichment pipeline (src/enrichment/,
+appleFmEngine.ts)" and described gists as "the existing Apple FM
+enrichment." Neither is quite how gists actually work: gist SYNTHESIS runs
+in the BROWSER extension (`packages/sidetrack-extension/src/sidepanel/nano/
+gistSynthesis.ts`, on-device Nano/Apple FM/WebGPU, routed by
+`resolveEngineForLanguage`), not in the companion's `appleFmEngine.ts` — that
+module is a *different*, already-shipped lane (§3 above, workstream-prototype
+generation, companion-side, offline, reading gists rather than producing
+them). The companion only receives, validates, and folds the finished gist
+text via `ENTITY_CONTENT_ENRICHED` events. Given this, "amend the existing
+gist call" is implemented as: amend the EXTENSION's gist-synthesis prompts to
+append one more labelled line to the SAME generation call (§9.1), then build
+a PURE, RETROACTIVE PARSER on the companion side — exactly the precedent
+`enrichment/entityExtract.ts` + `entityIndex.ts` already established for
+"Key Entities" (same review finding, `docs/audits/2026-07-29-recommendation-
+graph-feature-review.md` §G4/§E3: a gist section generated and then thrown
+away). This keeps the companion-side surface literally inside
+`src/enrichment/` as scoped, costs zero new event types, and is retroactive
++ retraction-safe for free (downstream of the already-correct gist fold).
+
+**§1 — extraction.** `enrichment/keywordExtract.ts`'s `extractKeywords(gist,
+{language?})` is ONE function with two paths, not two features:
+- **LLM-authored.** `titleSynthesis.ts`'s `GIST_PROMPT_PREFIX` (single-pass;
+  previously had no structured section at all) and
+  `GIST_SYNTHESIS_PROMPT_PREFIX` (chunk-merge pass; already asked for "key
+  entities") both gained one shared instruction line asking for `Keywords:
+  term1, term2, term3` (3-7 terms) appended after the summary. Trusted only
+  when the gist's OWN detected language is `'en'` — `extractLlmKeywords`
+  line-anchors the "Keywords:" marker (unlike entities' "key entities" phrase,
+  matched anywhere) because the bare word is common enough in ordinary prose
+  that mid-sentence matching would comma-split real text into fake keywords.
+- **Deterministic fallback.** Frequency-ranked, stopword-filtered extraction
+  straight over the gist text — zero LLM calls, ever. Latin words: length≥3,
+  filtered against `suggestions/tokens.ts`'s `STOPWORDS` (exported additively
+  so a third stopword list wasn't forked). CJK: no segmentation library
+  exists in this codebase, so Han runs are windowed as sliding bigrams
+  (always) + sliding 4-grams (common compound-term length —
+  "神经网络"/"深度学习"/"人工智能" are all 4 characters); a count TIE between an
+  n-gram and its own substring breaks toward the LONGER span (by
+  construction, equal counts mean the longer span is fully supported).
+  `detectGistLanguage` is a 4th port of the same byte-identical Han-range/
+  share constants already ported twice (`nano/language.ts` →
+  `prototypeEvidence.ts`) — kept local rather than imported across the
+  package's own dependency direction (`workstreams/` already depends on
+  `enrichment/`, not the reverse).
+
+This composition means **the deterministic path IS the backfill path IS the
+zh path** — one function, not three. A gist with no "Keywords:" line (every
+gist saved before this PR, or a zh/mixed one where the line is never
+trusted) falls through identically. Normalization: lowercase always
+(a keyword is a feature key, not a display name — the one deliberate
+difference from `entityExtract.ts`'s casing-preserved names), trimmed,
+deduped, capped at `KEYWORD_MAX_PER_GIST=10` with overflow counted in
+`dropped`, never silently lost.
+
+**§2 — the maintained index.** `search-index/keywordIndexStore.ts` — same
+family as `searchQueryIndexStore.ts`/`captureTextFtsStore.ts`
+(`bun:sqlite`, WAL, additive `CREATE ... IF NOT EXISTS`). Two tables:
+`keyword_posting(keyword, page_key, observed_at_ms)` (the inverted index) and
+`keyword_page(page_key, keywords_json, source, updated_at_ms)` (the per-page
+reverse lookup, where `page_key` is the SAME `kind:id` key
+`contentEnrichment.ts`'s `GistLookup` already uses). `keywordsForPage`
+returns `undefined` for "never processed" vs. `[]` for "processed, found
+nothing" — the exact typed-emptiness distinction the backfill lane's
+idempotency depends on. Posting lists are capped at
+`KEYWORD_POSTING_CAP=500` per keyword (evict-oldest-by-`observedAtMs`) — a
+NEW precedent, since neither sibling store in this family bounds row count
+at write time (bounding there is done at the read call site); a keyword
+index needs it because an unbounded posting list for a common term would
+make every lookup of it an O(vault) scan, the same hub failure mode
+`entityIndex.ts`'s `ENTITY_HUB_MAX_REFS` exists to avoid one layer up.
+**Not wired into `connectionsMaterializer.ts`** (off-limits) — driven
+instead from two call sites, both outside that file: the live-ingest hook in
+`http/routes/enrichmentRoutes.ts`'s `POST /v1/enrichment/content` handler
+(one `ingestGistKeywords` call per freshly-accepted gist — true O(1) per
+event) and the retraction route (`resyncGistKeywordsAfterRetraction`, which
+re-reads the already-correct gist fold rather than re-deriving hash/
+timestamp retraction semantics itself). `enrichment/keywordIngest.ts` is the
+orchestration glue — kept OUT of `contentEnrichment.ts` on purpose, since
+that module's own header states it is a pure, side-effect-free fold and this
+one owns two SQLite handles plus an embedder call.
+
+**§3 — concept normalization.** `enrichment/keywordConcepts.ts` (pure) +
+`keywordConceptStore.ts` (persistence, same store family). Each DISTINCT
+keyword is embedded once (`recall/embedder.ts`'s existing `embed()`, e5
+`query:`-prefixed) and assigned to a concept via cosine-threshold
+(`DEFAULT_CONCEPT_COSINE_THRESHOLD=0.82`, a judgment call between this
+repo's two nearest precedents — `SECONDARY_AFFILIATION_MIN_COSINE=0.85` and
+`DEFAULT_TOPIC_COSINE_THRESHOLD=0.85` — flagged for golden-set tuning, same
+as every other unspecified numeric in this design) against INCREMENTAL
+centroids: online/leader-style assignment, not k-means (no fixed k, no
+reassignment pass). `foldConceptMember` is the incremental equivalent of
+`suggestions/centroid.ts`'s `meanNormalized` (now exported additively) — a
+weighted running mean, renormalized, so a concept never needs to retain
+every member's embedding. **Concept stability, precisely**: a keyword's
+assignment is idempotent (`assignKeyword` on an already-assigned keyword is
+a no-op, never double-folds the centroid — verified by
+`keywordConceptStore.test.ts`), and survives a store reopen (a near-
+duplicate keyword introduced after restart still joins the persisted
+centroid). Downstream consumption uses concept ids; raw keywords are kept
+only for display/naming, per the directive.
+
+**§4 — hybrid distance + naming, additive to `splitSuggestionEngine.ts`.**
+`SuggestionEvidenceItem` gained two optional fields (`conceptIds`,
+`keywords`) — absent on every item reproduces the pre-existing pure-cosine
+behavior exactly (proven: the original 8-test `splitSuggestionEngine.test.ts`
+suite is unchanged and green). `hybridSimilarity(left, right, weight)`
+formula:
+```
+both usable  -> similarity = (1 - weight) * cosine + weight * conceptJaccard
+concepts only -> similarity = conceptJaccard        (embedding term DROPPED,
+                                                      not zero-weighted)
+vectors only -> similarity = cosine                 (identical to pre-change)
+neither      -> similarity = 0
+```
+`weight` = `SIDETRACK_KEYWORD_CLUSTER_WEIGHT` (`resolveKeywordClusterWeight`,
+default `0.35`), same env-knob shape as `topic-revision.ts`'s
+`resolveTopicCosineThreshold` (named `_ENV` constant, range-validated,
+garbage/absent falls back silently). Zero-vector-coverage golden case (6
+pages, 2 keyword groups, no embeddings at all): `hybridSimilarity` degrades
+to pure `conceptJaccard` and the split comes out correct —
+`splitSuggestionHybridDistance.test.ts`. **Naming**: `keywordNameFor` (top-3
+shared RAW keywords by frequency, same tie-break as the existing
+`structuralNameFor`) is tried FIRST, falling back to the pre-existing
+title-token naming only when no member carries keywords — still no LLM
+naming, per the directive, just a more direct signal (a gist's keywords are
+already "what someone would search for"; a title's tokens are whatever words
+a junk/URL-shaped title happened to contain).
+
+**§5 — aggregator shadow entropy (the PR #373 blind spot).**
+`DomainAggregatorCounters` gained `keywordConceptEntropyBits` — Shannon
+entropy of a domain's keyword-CONCEPT distribution, folded incrementally (a
+new optional `keywordConceptIds` field on `AggregatorVisitObservation`, O(1)
+amortized, same discipline as every other counter in this module). SHADOW
+ONLY, diagnostic only — NOT consulted by `classifyLearnedAggregatorPage` /
+`isLearnedAggregatorHost`, same status as the pre-existing
+`firstPathSegmentEntropyBits`. Why it adds signal that one doesn't: path
+shape is a URL-STRUCTURE property a hub can normalize away (HN's uniform
+`/item`) or a blog can vary a lot without being an aggregator; keyword-
+concept entropy is a CONTENT-TOPIC property — a true aggregator's items span
+many unrelated concepts, a single-source blog's don't, independent of URL
+shape. Tested with a single-source fixture (entropy 0) vs. a 6-concept
+diverse fixture (entropy = log2(6), the maximum for that count), plus a
+regression proving the signal changes nothing about
+`isLearnedAggregatorHost` for a structurally non-hub domain
+(`learnedAggregatorKeywordEntropy.test.ts`). **Deferred, documented**:
+surfacing an aggregate of this in `workGraphHealth.ts`'s existing
+`aggregator.learned-stats-shadow` diagnostic, and populating
+`keywordConceptIds` on REAL observations in
+`ranker/learnedAggregatorStatsEvents.ts`'s event adapter — both require
+reading the keyword-concept store from a new call site and are presentation
+polish on top of an already-complete, already-tested shadow signal; left
+for the next PR rather than shipped shallow.
+
+**§6 — backfill.** `enrichment/keywordBackfillLane.ts` — same self-
+scheduling idiom as `page-evidence/backgroundEmbeddingLane.ts` (bounded
+`batchCap` per cycle, fast poll while backlog remains, slow poll once
+empty, `.unref()`'d timers) but simpler in one load-bearing respect: "is
+this page done" has a TRIVIAL answer here (`keywordIndexStore.hasPage`) —
+unlike an embedding's missing/failed/ready lifecycle, a keyword-index row
+either exists or it doesn't, so correctness never depends on a resumption
+cursor (only observability does — `KeywordBackfillProgress` persists
+`processedTotal` + per-page attempt counts, with PERMANENT quarantine after
+`maxAttemptsPerPage=3`, deliberately no cooldown-decay: a gist's text never
+changes on its own, so a page that fails deterministic extraction three
+times will fail it forever and retrying is pure waste — unlike
+`backgroundEmbeddingLane.ts`'s cooldown, which exists for a genuinely
+transient failure class (embedder warm-up races) that has no analogue
+here). `indexCandidate` is expected to be `keywordIngest.ts`'s
+`ingestGistKeywords` itself — no separate "backfill extraction," since
+`extractKeywords` already falls through to the deterministic path on its
+own for any gist with no Keywords line. `keywordBackfillCandidatesFromGistLookup`
+bounds the population (`SIDETRACK_KEYWORD_BACKFILL_POPULATION_CAP`,
+most-recent-first) — never a boot full-pass. **Not wired into
+`runtime/companion.ts`** (a concurrent sibling's active file) — ships as a
+standalone, fully-tested factory function, ready to splice in.
+
+**§7 — new-topic suggestions (the missing half of "suggest new categories
+AND splits").** Discovery: `splitSuggestionEngine.ts`'s `'new-category'`
+mode and `suggestionCandidateStore.ts`'s `kind` discriminator
+(`'split' | 'new-category'`) were ALREADY BUILT by the prior PR (#376) as
+generic clustering infrastructure — the directive's "kind discriminator
+(split | new-topic)" is the SAME discriminator, reused rather than forked
+under a second name (a `'new-topic'` value would have meant the same thing
+as `'new-category'` and split the discriminator space the sibling UI branch
+is about to bind to). What was genuinely missing, and is what this PR adds:
+- **Real unfiled-population wiring.** `workstreams/unfiledEvidence.ts`'s
+  `gatherUnfiledEvidence` is the structural INVERSE of
+  `prototypeEvidence.ts`'s `gatherWorkstreamEvidence` (same metadata-only
+  snapshot read, filters IN pages with no `currentAttribution.workstreamId`
+  instead of filtering to one workstream). `suggestionEvidenceFromUnfiled`
+  bounds it (`SIDETRACK_UNFILED_POPULATION_CAP`, default 500, most-recent-
+  first — the same idiom as §6's backfill cap and
+  `prototypeEvidence.ts`'s `selectEvidenceWithinBudget`) and joins keyword-
+  layer data. Embeddings are an OPTIONAL injected join (defaulting to none)
+  — live recall-v2 vector retrieval is explicitly DEFERRED, the identical
+  scope cut PR #376 made for its own evidence gathering ("real-data
+  wiring... touches files outside this PR's scope," recall-v2 being a
+  concurrently-developed sibling area); `hybridSimilarity` runs on pure
+  concept-Jaccard until that wiring lands, with zero behavior change needed
+  here when it does.
+- **Population-scoped decline memory** (additive to
+  `suggestionCandidateStore.ts`: a new `suggestion_candidate_decline` table
+  + `declineCandidate`/`declinedConceptSets`, the existing 5-method read API
+  untouched). Distinct from `declineMemory.ts`'s per-(subject,workstream)
+  decline: a new-topic candidate has no workstreamId until accepted, so
+  there is no X to say "declined workstream X." Instead the DECLINED
+  CLUSTER's own concept-id fingerprint is persisted; `isSuppressedByDecline`
+  (splitSuggestionEngine.ts) withholds a future candidate from
+  `newlyEmitted` whenever its concept-id set overlaps a declined fingerprint
+  at/above `DEFAULT_DECLINE_CONCEPT_OVERLAP_THRESHOLD=0.75` (concept-
+  Jaccard, not member-id Jaccard — new pages joining a declined TOPIC are
+  still the same declined topic). Suppression withholds the PERSISTED
+  `emitted` flag too (not just the one-shot `newlyEmitted` push), so a
+  cluster whose concept makeup later drifts enough to clear the decline can
+  re-attempt the emit transition rather than being frozen out forever by a
+  stale `wasEmitted:true`.
+- **Accept/decline routes**: new `http/routes/workstreamSuggestionsRoutes.ts`
+  (registered additively in `server.ts`, pinned order updated in
+  `routeTable.characterization.test.ts`) — `POST /v1/workstreams/
+  suggestions/new-topic/:fingerprint/accept` (create workstream + the SAME
+  3-event shape `visitsRoutes.ts`'s existing `/memberships` route already
+  uses — `workstream.suggestion.accepted` → `workstream.membership.set` →
+  `USER_ORGANIZED_ITEM` — applied to every member) and `.../decline`
+  (re-derives the candidate's concept-id set from the keyword layer at
+  decline time and persists it — no event append, matching this store's own
+  "derived stats, not event-sourced" precedent). WRITE-only, deliberately:
+  the sibling `feat/category-prototype-ux` branch owns "small READ routes
+  around suggestionCandidateStore" for the panel, so no read route was added
+  here to avoid overlap. `RouteMatch` gained one additive field
+  (`fingerprint`).
+- **Fixture**: 8 unfiled pages (2 clear 3-member groups + 2 noise
+  singletons) → exactly 2 new-topic candidates after the real 3-consecutive-
+  computation stability gate (not a shortcut) —
+  `splitSuggestionNewTopic.test.ts`, alongside decline-recurrence
+  (a declined cluster stays suppressed across further stable
+  recomputations, and a decline at one scope never leaks into another) and
+  an explicit incremental-no-recompute case (unchanged `revisionId` short-
+  circuits the whole pass, proven by handing it deliberately-wrong evidence
+  that is never looked at).
+
+**Files changed** (companion unless noted): NEW —
+`enrichment/keywordExtract.ts`, `keywordConcepts.ts`, `keywordConceptStore.ts`,
+`keywordIngest.ts`, `keywordBackfillLane.ts`, `search-index/
+keywordIndexStore.ts`, `workstreams/unfiledEvidence.ts`, `http/routes/
+workstreamSuggestionsRoutes.ts`, + one `.test.ts` per module (10 new test
+files). MODIFIED (additive) — `suggestions/tokens.ts` (export `STOPWORDS`),
+`suggestions/centroid.ts` (export `normalize`), `workstreams/
+splitSuggestionEngine.ts` (hybrid distance, keyword naming, decline
+suppression), `workstreams/suggestionCandidateStore.ts` (decline table),
+`ranker/learnedAggregatorStats.ts` (concept entropy field), `http/routes/
+enrichmentRoutes.ts` (live-ingest + retraction-resync hooks), `http/
+routeSupport.ts` (`RouteMatch.fingerprint`), `http/server.ts` (route
+registration), `gc/vaultLedger.ts` (2 new sidecar-db leaf names), `http/
+routeTable.characterization.test.ts` (pinned order). EXTENSION package,
+MODIFIED — `sidepanel/nano/titleSynthesis.ts` (`KEYWORDS_LINE_INSTRUCTION`
+appended to `GIST_PROMPT_PREFIX` and `GIST_SYNTHESIS_PROMPT_PREFIX`);
+verified against the existing 115-test suite covering gist synthesis,
+validation, and Chinese chunking — all green, no prompt-tuning regression.
+
+**Deviations, all documented rather than silent:** (1) the architecture
+correction in this section's opening (gist synthesis is browser-side, not
+`appleFmEngine.ts`). (2) `'new-category'` reused instead of adding a
+`'new-topic'` discriminator value. (3) `aggregator.learned-stats-shadow`
+health-panel surfacing and the real `keywordConceptIds` observation-adapter
+wiring deferred (§5). (4) Live recall-v2 embedding retrieval for unfiled
+evidence deferred (§7), matching PR #376's own identical scope cut. (5)
+`DEFAULT_CONCEPT_COSINE_THRESHOLD=0.82` and
+`DEFAULT_DECLINE_CONCEPT_OVERLAP_THRESHOLD=0.75` are judgment calls,
+flagged for golden-set tuning like every other unspecified numeric
+threshold in this design.
+
+`bun run build` clean (both packages); `bun run typecheck` clean modulo a
+pre-existing, unrelated repo-wide gap (`tsconfig.json` lacks `bun-types`, so
+every `bun:test`-importing spec — including ones this PR never touched,
+e.g. `entityExtract.test.ts` — fails module resolution under that specific
+config; `tsconfig.build.json`, the actual build gate, excludes all
+`*.test.ts` and is unaffected). See the PR for the full test run and exact
+counts.
