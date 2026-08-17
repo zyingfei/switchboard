@@ -5,15 +5,30 @@
 # emails and CI minutes for zero extra signal.
 #
 # What is NOT here:
-#   - e2e / Playwright (needs a live browser + companion vault)
+#   - e2e / Playwright (needs a live browser + companion vault) — see
+#     issue #143 and docs/CI.md for why, and what the `companion` job's
+#     src/integration/extensionCompanionSpine.test.ts test does instead
 #   - eval suites (eval:recall — cost-gated, needs model downloads)
-#   - build step (requires native binaries / wxt — out-of-scope for unit CI)
+#   - a browser-driven build step (wxt build IS exercised, in
+#     `package-smoke` below, but only as a real-artifact smoke check, not
+#     to run anything through an actual browser)
 #
 # Layout note: this is a Bun workspace — ALL binaries (tsc, vitest, wxt) are
 # hoisted to the repo-root node_modules/.bin. Steps that run from a package
 # working-directory must use ../../node_modules/.bin/<tool>.
 # Each job runs its own `bun install --frozen-lockfile` (fast, deterministic)
 # instead of a cross-job cache dance — reliability over seconds saved.
+#
+# Job inventory (name / blocking? / why) — see docs/CI.md for the full
+# blocking-vs-advisory contract and the `bun run verify` vs hosted-CI split:
+#   companion         blocking  typecheck + full `bun test` (includes the
+#                                extensionCompanionSpine.test.ts cross-
+#                                package smoke, task #31 / issue #143)
+#   extension         blocking  typecheck + vitest unit suite
+#   mcp               blocking  typecheck + vitest unit suite
+#   vector-real-dim   blocking  real 384-dim sqlite-vec suites (task #31)
+#   package-smoke     advisory  wxt build + companion dist boot/shutdown
+#                                (task #31; promote once proven stable)
 
 name: CI
 
@@ -163,3 +178,161 @@ jobs:
       - name: Test (vitest)
         working-directory: packages/sidetrack-mcp
         run: ../../node_modules/.bin/vitest run
+
+  # ---------------------------------------------------------------------------
+  # Companion vector store — REAL 384-dim sqlite-vec lane (task #31)
+  #
+  # The `companion` job above runs with SIDETRACK_SQLITE_LIB=off (Bun's
+  # built-in SQLite — no vec0 extension) so low-dimension fixtures elsewhere
+  # in that suite don't hit strict vec-column dimension enforcement (see
+  # that job's env comment). That means nothing in the blocking gate ever
+  # exercises sqlite-vec at the real embedding dimension (384 —
+  # recall/embedder.ts, RECALL_MODEL.embeddingDim) end to end — a real
+  # column-width mismatch between the manifest and the schema would pass
+  # the whole blocking gate silently. This job closes that gap: same
+  # ubuntu-latest image, WITHOUT the opt-out (ubuntu ships
+  # /usr/lib/x86_64-linux-gnu/libsqlite3.so — the exact fact that made the
+  # opt-out necessary above), scoped to the suites that are genuinely
+  # vector-dependent (touch docs_vec directly, or assert
+  # store.vectorBackendAvailable) — not the whole companion suite, which
+  # still carries low-dimension fixtures this lane isn't meant to fix.
+  #
+  # Local measurement (2026-08-17, real vec-capable
+  # /opt/homebrew/opt/sqlite/lib/libsqlite3.dylib, 3 repeated runs): 20
+  # tests / 5 files, 371-406ms total. Comfortably under this repo's
+  # 2-minute blocking bar — BLOCKING.
+  #
+  # Scope note: a wider combination (adding the HNSW-reconcile / Class-B
+  # connections child-process integration suites) was tried locally and hit
+  # an unrelated cross-file flake — a shared recall-v2 store singleton
+  # intermittently reporting vectorBackendAvailable=false only when those
+  # heavier suites ran first in the same process. That is not a real-
+  # dimension correctness issue, and chasing it would mean changing
+  # connectionsMaterializer.ts internals (out of scope here). Left as a
+  # followup; this job's scope is deliberately the reliable subset.
+  vector-real-dim:
+    name: Companion — real 384-dim sqlite-vec lane
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.3.14"
+
+      - name: Install (frozen lockfile)
+        run: bun install --frozen-lockfile
+
+      # No SIDETRACK_SQLITE_LIB override — setup-sqlite.ts's own candidate
+      # probe finds ubuntu's system libsqlite3 and loads sqlite-vec for
+      # real. The grep below fails loudly if it didn't: a silently
+      # degraded run here would pass vacuously and defeat the point of the
+      # job (see setup-sqlite.ts's candidate path list if this ever fires —
+      # it means ubuntu-latest stopped shipping libsqlite3.so at the
+      # expected multiarch path, and this job needs to move to
+      # runs-on: macos-latest instead, at the cost of a slower/pricier
+      # runner).
+      - name: Test — vector-dependent suites, real dimensions
+        working-directory: packages/sidetrack-companion
+        run: |
+          set -o pipefail
+          bun test \
+            src/recall-v2/store/canonical-vectors.test.ts \
+            src/recall-v2/store/host-purge.test.ts \
+            src/recall-v2/store/backfill-delta.test.ts \
+            src/recall-v2/store/vectorProjectionState.test.ts \
+            src/http/prototypeLaneWiring.test.ts \
+            2>&1 | tee vector-test.log
+          grep -q 'sqlite-vec loaded via bun-sqlite' vector-test.log || {
+            echo "sqlite-vec never loaded on this runner — the real-dim lane ran vacuously. See setup-sqlite.ts; this job may need runs-on: macos-latest.";
+            exit 1;
+          }
+          grep -Eq '^ *[1-9][0-9]* pass$' vector-test.log
+          grep -Eq '^ *0 fail$' vector-test.log
+
+  # ---------------------------------------------------------------------------
+  # Package smoke — real build artifacts, real process lifecycle (task #31)
+  #
+  # ADVISORY (continue-on-error): unlike the unit-test jobs above, this job
+  # exercises `wxt build` (real esbuild/rollup bundling, ~106MB of output
+  # including onnxruntime-web WASM) and a real `bun dist/cli.js` child
+  # process with signal handling — more exposed to environment-specific
+  # flake (bundler version drift, runner resource limits under process
+  # spawn) than a pure `bun test` unit run. Advisory first; promote to
+  # blocking once it has proven stable across real PR traffic — see
+  # docs/CI.md.
+  #
+  # What it proves that unit tests can't: that `wxt build` + `tsc -p
+  # tsconfig.build.json` + `stamp-build.mjs` actually produce a runnable
+  # dist/cli.js (not just typecheck-clean source), that /v1/version reports
+  # a real buildSha end to end (the #264 menu-bar-app stale-dist fix), and
+  # that the #374 shutdown-watchdog contract (SIGTERM -> closeAll() within
+  # SIDETRACK_SHUTDOWN_GRACE_MS, default 15s) holds for a real process, not
+  # a mocked one.
+  package-smoke:
+    name: Package smoke — build + boot + shutdown (advisory)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.3.14"
+
+      - name: Install (frozen lockfile)
+        run: bun install --frozen-lockfile
+
+      - name: Build extension artifact (wxt build)
+        working-directory: packages/sidetrack-extension
+        run: ../../node_modules/.bin/wxt build
+
+      - name: Build companion dist (tsc + stamp)
+        working-directory: packages/sidetrack-companion
+        run: |
+          ../../node_modules/.bin/tsc -p tsconfig.build.json
+          bun scripts/stamp-build.mjs
+
+      - name: Boot against an empty vault; check /v1/version buildSha; verify SIGTERM shutdown within grace
+        working-directory: packages/sidetrack-companion
+        run: |
+          set -euo pipefail
+          PORT=18271
+          VAULT="$(mktemp -d)"
+          LOG="$(mktemp)"
+
+          bun --smol dist/cli.js --vault "$VAULT" --port "$PORT" > "$LOG" 2>&1 &
+          PID=$!
+
+          READY=0
+          for _ in $(seq 1 60); do
+            if curl -s -f "http://127.0.0.1:${PORT}/v1/version" > /tmp/version-response.json; then
+              READY=1
+              break
+            fi
+            sleep 0.5
+          done
+          if [ "$READY" -ne 1 ]; then
+            echo "companion never answered /v1/version"; cat "$LOG"; kill -9 "$PID" 2>/dev/null || true; exit 1
+          fi
+          cat /tmp/version-response.json
+
+          BUILD_SHA=$(bun -e 'const b = require("/tmp/version-response.json"); console.log(b.data.buildSha ?? "");')
+          if [ -z "$BUILD_SHA" ] || [ "$BUILD_SHA" = "null" ]; then
+            echo "buildSha missing from /v1/version response"; kill -9 "$PID" 2>/dev/null || true; exit 1
+          fi
+          echo "buildSha=$BUILD_SHA"
+
+          kill -TERM "$PID"
+          GRACE_CEILING_S=20
+          EXITED=0
+          for _ in $(seq 1 $((GRACE_CEILING_S * 5))); do
+            if ! kill -0 "$PID" 2>/dev/null; then EXITED=1; break; fi
+            sleep 0.2
+          done
+          if [ "$EXITED" -ne 1 ]; then
+            echo "companion did not exit within ${GRACE_CEILING_S}s of SIGTERM (SIDETRACK_SHUTDOWN_GRACE_MS default 15000)"
+            kill -9 "$PID" 2>/dev/null || true; cat "$LOG"; exit 1
+          fi
+          echo "shutdown OK"
+          rm -rf "$VAULT" "$LOG" /tmp/version-response.json
