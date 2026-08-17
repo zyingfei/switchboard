@@ -1085,3 +1085,110 @@ leaving it to a third:
   `runtime/companion.ts`'s own boot/shutdown suite
   (`runtime/companion.test.ts`) passes unchanged with the new scheduler
   wired in.
+
+**§10 addendum #2 — keyword-backfill lane wiring (2026-08-17, follow-up
+fix).** Live-vault check (build 4f27316b, ~3h deployed) found
+`keyword-index.db` / `keyword-concepts.db` EMPTY — `0` rows, no keyword-index
+log marks ever — starving `suggestionRecomputeLane.ts`'s recompute pass of
+the keyword-concept features `hybridSimilarity` needs (§4). Root cause: this
+was the THIRD "engine without a caller" instance in the same delivery
+window (after `recomputeSuggestionCandidates` and the main-card membership
+chips, both already fixed) — `enrichment/keywordBackfillLane.ts`'s
+`createKeywordBackfillLane` was exported, fully unit-tested, and explicitly
+documented as "ready to splice in" (§6 above), but nothing in
+`runtime/companion.ts` ever called it.
+
+**Audit — every wiring verified or added, not just the one that was
+broken:**
+
+| Component | Exported from | Production caller | Status |
+|---|---|---|---|
+| `createKeywordBackfillLane` | `enrichment/keywordBackfillLane.ts` | `scheduleKeywordBackfillLoop` → `runtime/companion.ts` | **FIXED this PR** — was uncalled |
+| `ingestGistKeywords` (live ingest) | `enrichment/keywordIngest.ts` | `http/routes/enrichmentRoutes.ts`, `POST /v1/enrichment/content` handler | Verified wired (pre-existing) |
+| `resyncGistKeywordsAfterRetraction` | `enrichment/keywordIngest.ts` | `http/routes/enrichmentRoutes.ts`, `POST /v1/enrichment/retract` handler | Verified wired (pre-existing) |
+| `assignKeyword` (concept assignment) | `enrichment/keywordConceptStore.ts` | Called from `ingestGistKeywords` (itself wired per above) | Verified wired (pre-existing) |
+| `gatherUnfiledEvidence` / `suggestionEvidenceFromUnfiled` | `workstreams/unfiledEvidence.ts` | `suggestionRecomputeLane.ts`'s `buildDeps.gatherNewCategoryEvidence` → `scheduleSuggestionRecomputeLoop` → `runtime/companion.ts` | Verified wired (pre-existing, §10 addendum #1) |
+| `gatherWorkstreamEvidence` / `suggestionEvidenceFromWorkstreamItems` | `workstreams/prototypeEvidence.ts` / `splitEvidence.ts` | `suggestionRecomputeLane.ts`'s `buildDeps.gatherSplitEvidenceByWorkstream`; also `http/routes/workstreamsRoutes.ts` (serve path) and `workstreams/prototypeGeneration.ts` | Verified wired (pre-existing) |
+| `recomputeSuggestionCandidates` | `workstreams/splitSuggestionEngine.ts` | `suggestionRecomputeLane.ts`'s `runSuggestionRecomputeCycle` → `runtime/companion.ts` | Verified wired (pre-existing, §10 addendum #1) |
+
+No other exported-but-uncalled production machinery found in the #385
+delivery — the backfill lane was the only gap.
+
+**Fix, in `enrichment/keywordBackfillLane.ts` + `runtime/companion.ts`:**
+- `scheduleKeywordBackfillLoop(eventLog, vaultRoot, options?)` — added to the
+  END of `keywordBackfillLane.ts` (same file, same split as
+  `suggestionRecomputeLane.ts`: pure DI-only lane above, production
+  scheduler below). Opens its OWN `keywordIndexStore`/`keywordConceptStore`
+  handles (the "no shared singleton" idiom `keywordIngest.ts` established —
+  see `suggestionRecomputeLane.ts`'s header), `mkdir -p`'s
+  `_BAC/connections` itself first (self-sufficient — does not assume some
+  OTHER companion.ts component created that directory first), and calls the
+  lane's own self-scheduling `start()`. `indexCandidate` delegates to
+  `keywordIngest.ts`'s `ingestGistKeywords` — the SAME function the live-
+  ingest hook calls, so a backfilled page goes through the identical
+  extract+upsert+concept-assign path.
+- Env-gated: `SIDETRACK_KEYWORD_BACKFILL` (default ON; `'0'`/`'false'`
+  disables — zero handles opened, zero timers started, not merely a no-op
+  cycle). `listCandidates` additionally short-circuits to `[]` whenever
+  `keywordIngestEnabled()` (the SEPARATE `SIDETRACK_KEYWORD_INGEST` flag) is
+  off, rather than letting `indexCandidate` throw per-candidate — load-
+  bearing, because `maxAttemptsPerPage` quarantine has NO cooldown decay
+  (§6): treating a global ingest-disabled window as a per-candidate failure
+  would have permanently quarantined the entire backlog within 3 cycles
+  (~6s at the default `cycleIntervalMs`).
+- Startup delay `KEYWORD_BACKFILL_STARTUP_DELAY_MS=30s` (short, deliberately
+  — NOT the 10-minute delay `scheduleSuggestionRecomputeLoop`/
+  `schedulePrototypeGenerationLoop` use; the live vault's index was found
+  completely empty, so backfill should begin promptly), overridable via
+  `SIDETRACK_KEYWORD_BACKFILL_STARTUP_DELAY_MS` for tests.
+- **Audibility (binding requirement).** Every cycle — including a fully-idle
+  one — now emits `[keyword-backfill] cycle processed=N remaining=M
+  concepts=K` (added inside `runOnce()`, via a new optional
+  `conceptsTotal()` dep, best-effort — a concept-store read failure reports
+  `concepts=0` rather than suppressing the mark). One boot line states
+  enabled/disabled: `[keyword-backfill] enabled` or `[keyword-backfill]
+  disabled via SIDETRACK_KEYWORD_BACKFILL=0`. Silence is exactly how this
+  shipped broken for ~3 hours undetected.
+- **Shutdown (#374 lane-stop discipline).** `disposeKeywordBackfill()` is
+  pushed to `teardown[]` (startup-failure rollback) AND called explicitly in
+  `close()`'s pre-drain "stopping-lanes" block, alongside
+  `stopBodyEvidenceLane`/`stopBackgroundEmbeddingLane`. Not itself an event-
+  log-appending lane (writes only to its own keyword-index/concept-store
+  SQLite handles, never `eventLog.append*`), so it cannot cause the
+  SIGTERM-hang `awaitIdle()`-never-converges failure mode #374 fixed — but a
+  lane left ticking past `close()` is still a live timer + live SQLite
+  handles outliving the "shut down" process, so it is stopped explicitly
+  rather than relying on the unref'd-timer-dies-with-the-process assumption
+  alone.
+
+**Tests:**
+- `enrichment/keywordBackfillLane.test.ts` (extended) — env-flag defaults;
+  the audible per-cycle mark (including the idle case and a
+  `conceptsTotal()`-throws case); an end-to-end `scheduleKeywordBackfillLoop`
+  fixture — 3 gists seeded directly onto the event log (bypassing live
+  ingest, reproducing exactly the "gist predates the keyword layer"
+  backlog shape) are backfilled by a real cycle, `keyword-index.db` rows +
+  concepts appear, and the resulting `SuggestionEvidenceItem[]` (built the
+  same way `suggestionRecomputeLane.ts`'s join does) feeds a REAL
+  `hybridSimilarity` computation that correctly scores same-topic pages
+  higher than cross-topic ones — proving consumability, not just presence;
+  plus the disabled-flag no-op case.
+- `runtime/companion.test.ts` (extended) — a real `startCompanion()` boot
+  (25 seeded gists, `SIDETRACK_KEYWORD_BACKFILL_STARTUP_DELAY_MS=0`) proves
+  the boot line fires and a real cycle runs and durably indexes; a second
+  test proves `close()` stops the lane before its already-armed next cycle
+  (~2s out, since backlog > `batchCap`) fires — same shape as the existing
+  body-evidence-lane SIGTERM regression suite; a third test proves
+  `SIDETRACK_KEYWORD_BACKFILL=0` opens no handle and starts no timer at all.
+
+**Deviation from the original plan:** none beyond what's documented above.
+Scope was kept to exactly the reported gap — wiring the backfill lane and
+verifying/documenting the rest of the audit — no unrelated behavior changes
+to `splitSuggestionEngine.ts`'s stability/clustering defaults or any other
+production policy.
+
+`bun run build` clean; `bun run typecheck` clean modulo the same pre-
+existing repo-wide `bun:test` module-resolution gap noted in §10's landing
+note above (unrelated to this change, `tsconfig.build.json` unaffected).
+Full `bun test` for `packages/sidetrack-companion` green (see PR for the
+exact count).

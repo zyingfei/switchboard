@@ -18,6 +18,10 @@ import { readPageEvidence } from '../page-evidence/store.js';
 import type { PageContentExtractedPayload } from '../page-content/types.js';
 import type { AcceptedEvent } from '../sync/causal.js';
 import type { AppendInputObserved } from '../sync/eventLog.js';
+import { createEventLog } from '../sync/eventLog.js';
+import { loadOrCreateReplica } from '../sync/replicaId.js';
+import { appendContentEnrichmentEvent } from '../enrichment/contentEnrichment.js';
+import { createKeywordIndexStore } from '../search-index/keywordIndexStore.js';
 import { NAVIGATION_COMMITTED } from '../navigation/events.js';
 import { BROWSER_TIMELINE_OBSERVED } from '../timeline/events.js';
 import {
@@ -733,4 +737,155 @@ describe('startCompanion close() — SIGTERM shutdown drain', () => {
     },
     25_000,
   );
+});
+
+// Runtime-wiring regression coverage for the 2026-08-16 gap fix: enrichment/
+// keywordBackfillLane.ts's createKeywordBackfillLane had ZERO production
+// callers (keyword-index.db/keyword-concepts.db confirmed EMPTY on the live
+// vault). This proves scheduleKeywordBackfillLoop is ACTUALLY reached from
+// startCompanion's boot sequence (the boot line + a real cycle log fire) and
+// that close() honors the #374 lane-stop discipline (no further cycle after
+// shutdown) — same shape as the body-evidence SIGTERM suite above.
+describe('startCompanion keyword-backfill lane — boot wiring + SIGTERM stop', () => {
+  let vaultRoot: string;
+  let stubEmbedder: StubEmbedderHandle;
+  let companion: Awaited<ReturnType<typeof startCompanion>> | null = null;
+  let port = 39_950;
+  const prevStartupDelay = process.env['SIDETRACK_KEYWORD_BACKFILL_STARTUP_DELAY_MS'];
+
+  beforeEach(async () => {
+    stubEmbedder = installStubEmbedder();
+    vaultRoot = await mkdtemp(join(tmpdir(), 'startcompanion-keyword-backfill-'));
+    // Start the lane immediately (no 30s production delay) so a real cycle
+    // fires within this test's timeout.
+    process.env['SIDETRACK_KEYWORD_BACKFILL_STARTUP_DELAY_MS'] = '0';
+  });
+
+  afterEach(async () => {
+    if (companion !== null) await companion.close().catch(() => undefined);
+    companion = null;
+    stubEmbedder.restore();
+    if (prevStartupDelay === undefined) {
+      delete process.env['SIDETRACK_KEYWORD_BACKFILL_STARTUP_DELAY_MS'];
+    } else {
+      process.env['SIDETRACK_KEYWORD_BACKFILL_STARTUP_DELAY_MS'] = prevStartupDelay;
+    }
+    await rm(vaultRoot, { recursive: true, force: true });
+  });
+
+  it(
+    'boot emits the enabled line and a real cycle; close() stops it before the next re-armed cycle fires',
+    async () => {
+      // Seed MORE gists than the lane's default batchCap (20) — DIRECTLY
+      // onto the vault's durable event log, BEFORE the companion boots, and
+      // WITHOUT going through the live-ingest route hook (only
+      // enrichmentRoutes.ts's handler calls ingestGistKeywords, never
+      // appendContentEnrichmentEvent itself) — so the very first backfill
+      // cycle sees a real backlog LARGER than one batch. That is what makes
+      // the lane re-arm at its fast cycleIntervalMs (2s) instead of the
+      // idle interval (60s) — exactly the still-scheduled, still-mid-
+      // backlog state a live SIGTERM could land in, mirroring the body-
+      // evidence-lane suite above.
+      const replica = await loadOrCreateReplica(vaultRoot);
+      const seedEventLog = createEventLog(vaultRoot, replica);
+      for (let i = 0; i < 25; i += 1) {
+        await appendContentEnrichmentEvent(seedEventLog, {
+          payloadVersion: 1,
+          kind: 'url',
+          id: `https://keyword-backfill-wiring.example/${String(i)}`,
+          gist: `Backfill wiring fixture gist number ${String(i)} about a topic with enough words.`,
+          sourceContentHash: `hash-${String(i)}`,
+          model: 'test-model',
+          generatedAt: '2026-08-16T00:00:00.000Z',
+        });
+      }
+
+      let cycleLogCount = 0;
+      let sawEnabledLine = false;
+      const originalStdoutWrite = process.stdout.write.bind(process.stdout);
+      const countingWrite: typeof process.stdout.write = (chunk, ...rest) => {
+        if (typeof chunk === 'string') {
+          if (chunk.includes('[keyword-backfill] enabled')) sawEnabledLine = true;
+          if (chunk.includes('[keyword-backfill] cycle processed=')) cycleLogCount += 1;
+        }
+        // @ts-expect-error — forwarding the exact overload Node picked.
+        return originalStdoutWrite(chunk, ...rest);
+      };
+      process.stdout.write = countingWrite;
+
+      try {
+        companion = await startCompanion({
+          vaultPath: vaultRoot,
+          port: port++,
+          allowAutoUpdate: false,
+        });
+
+        // Boot line — audible enabled/disabled state (fix requirement #3).
+        expect(sawEnabledLine).toBe(true);
+
+        // Wait for the first real cycle to run (async handle-open + one
+        // batch of real ingestGistKeywords calls through the stub
+        // embedder).
+        const deadline = Date.now() + 8_000;
+        while (cycleLogCount < 1 && Date.now() < deadline) {
+          await new Promise((resolve) => setTimeout(resolve, 25));
+        }
+        expect(cycleLogCount).toBeGreaterThanOrEqual(1);
+        const cyclesBeforeClose = cycleLogCount;
+
+        // SIGTERM lands now — 5 items are still backlogged (25 seeded, 20
+        // batchCap), so the lane's OWN scheduler has already armed a
+        // second cycle ~2s out (DEFAULT_KEYWORD_BACKFILL_CONFIG.cycleIntervalMs).
+        await companion.close();
+
+        // The load-bearing assertion: wait past the moment the still-armed
+        // second cycle WOULD have fired and confirm it never did.
+        await new Promise((resolve) => setTimeout(resolve, 3_500));
+        expect(cycleLogCount).toBe(cyclesBeforeClose);
+
+        companion = null;
+      } finally {
+        process.stdout.write = originalStdoutWrite;
+      }
+
+      // Read-back: the two stores the lane fills are actually populated on
+      // disk, independent of the still-open companion (already closed).
+      const keywordIndex = await createKeywordIndexStore(vaultRoot);
+      try {
+        expect(keywordIndex.hasPage('url:https://keyword-backfill-wiring.example/0')).toBe(true);
+      } finally {
+        keywordIndex.close();
+      }
+    },
+    20_000,
+  );
+
+  it('SIDETRACK_KEYWORD_BACKFILL=0 disables the lane — boot logs the disabled line, no cycle ever fires', async () => {
+    const prevFlag = process.env['SIDETRACK_KEYWORD_BACKFILL'];
+    process.env['SIDETRACK_KEYWORD_BACKFILL'] = '0';
+    let sawDisabledLine = false;
+    let cycleLogCount = 0;
+    const originalStdoutWrite = process.stdout.write.bind(process.stdout);
+    const countingWrite: typeof process.stdout.write = (chunk, ...rest) => {
+      if (typeof chunk === 'string') {
+        if (chunk.includes('[keyword-backfill] disabled')) sawDisabledLine = true;
+        if (chunk.includes('[keyword-backfill] cycle processed=')) cycleLogCount += 1;
+      }
+      // @ts-expect-error — forwarding the exact overload Node picked.
+      return originalStdoutWrite(chunk, ...rest);
+    };
+    process.stdout.write = countingWrite;
+    try {
+      companion = await startCompanion({ vaultPath: vaultRoot, port: port++, allowAutoUpdate: false });
+      expect(sawDisabledLine).toBe(true);
+      await new Promise((resolve) => setTimeout(resolve, 500));
+      expect(cycleLogCount).toBe(0);
+      await companion.close();
+      companion = null;
+    } finally {
+      process.stdout.write = originalStdoutWrite;
+      if (prevFlag === undefined) delete process.env['SIDETRACK_KEYWORD_BACKFILL'];
+      else process.env['SIDETRACK_KEYWORD_BACKFILL'] = prevFlag;
+    }
+  });
 });

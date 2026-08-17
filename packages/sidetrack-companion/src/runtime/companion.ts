@@ -107,6 +107,7 @@ import { applyGcPlan, buildGcPlan } from '../gc/plan.js';
 import { sweepOrphanGenerations } from '../connections/generationBuffer.js';
 import { schedulePrototypeGenerationLoop } from '../workstreams/prototypeGeneration.js';
 import { scheduleSuggestionRecomputeLoop } from '../workstreams/suggestionRecomputeLane.js';
+import { scheduleKeywordBackfillLoop } from '../enrichment/keywordBackfillLane.js';
 import { createVaultWatcher, type VaultChangeEvent, type VaultWatcher } from '../vault/watcher.js';
 import { createVaultWriter } from '../vault/writer.js';
 import { COMPANION_VERSION } from '../version.js';
@@ -768,6 +769,22 @@ export const startCompanion = async (
       options.vaultPath,
     );
     teardown.push(disposeSuggestionRecompute);
+
+    // Keyword-index backfill (2026-08-16 gap fix — enrichment/
+    // keywordBackfillLane.ts's createKeywordBackfillLane had ZERO production
+    // callers: keyword-index.db/keyword-concepts.db were confirmed EMPTY on
+    // the live vault, starving the suggestion-recompute lane above of the
+    // keyword features recomputeSuggestionCandidates joins against. Same
+    // non-blocking shape as scheduleSuggestionRecomputeLoop: opens its OWN
+    // keyword-index/concept-store handles after a short startup delay
+    // (never blocks boot), and the lane's own self-scheduling loop (backlog-
+    // aware fast/idle cadence) takes over from there. Env-gated
+    // (SIDETRACK_KEYWORD_BACKFILL, default ON); the returned disposer is
+    // BOTH pushed to teardown[] (startup-failure rollback) and captured so
+    // close() can stop it explicitly pre-drain, below (#374 lane-stop
+    // discipline).
+    const disposeKeywordBackfill = scheduleKeywordBackfillLoop(baseEventLog, options.vaultPath);
+    teardown.push(disposeKeywordBackfill);
 
     // Reproject on startup if the projector logic has changed since
     // the last run. Writes a `_BAC/.projector-version` sentinel so
@@ -1886,6 +1903,13 @@ export const startCompanion = async (
         // The event producers — MUST be stopped before awaitIdle() below.
         stopBodyEvidenceLane?.();
         stopBackgroundEmbeddingLane?.();
+        // Not an event-log-appending lane (writes to its own keyword-index/
+        // concept-store SQLite handles, never eventLog.append*) — so it
+        // cannot itself cause the SIGTERM-hang awaitIdle() failure mode this
+        // block exists for. Stopped explicitly anyway (#374 lane-stop
+        // discipline): a lane left ticking past close() is still a live
+        // timer + live SQLite handles outliving the "shut down" process.
+        disposeKeywordBackfill();
         if (collectorFramework !== null) {
           try {
             await collectorFramework.close();

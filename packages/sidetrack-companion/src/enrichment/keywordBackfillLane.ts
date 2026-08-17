@@ -24,15 +24,24 @@
 // its caller to; the ONLY model call `ingestGistKeywords` makes is the
 // embedder (for concept assignment), which is not a generative call.
 //
-// NOT WIRED INTO runtime/companion.ts. That file is a concurrent sibling's
-// active area (see the module list in the PR description) — this lane is a
-// standalone, fully-tested factory function, ready to splice into the boot
-// sequence once that file is free, mirroring exactly how the sibling
-// category-multi-membership PR left its own recall-v2 evidence wiring as a
-// tested pure function rather than reaching into a file it didn't own.
+// WIRED INTO runtime/companion.ts via scheduleKeywordBackfillLoop (bottom of
+// this file) — same split as workstreams/suggestionRecomputeLane.ts: the pure
+// lane above stays DI-only and fully unit-tested without touching disk, and
+// the scheduler section below owns opening this vault's real store handles,
+// mirroring scheduleSuggestionRecomputeLoop's shape exactly (2026-08-16, gap
+// fix — createKeywordBackfillLane had zero production callers; see this PR's
+// landing note for the full wiring audit).
 
+import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
+import { basename, dirname, join } from 'node:path';
+
+import { createRevision } from '../domain/ids.js';
+import type { EventLog } from '../sync/eventLog.js';
 import type { EntityTitleEnrichedKind } from './events.js';
-import { parseGistLookupKey, type GistLookup } from './contentEnrichment.js';
+import { loadGistLookup, parseGistLookupKey, type GistLookup } from './contentEnrichment.js';
+import { ingestGistKeywords, keywordIngestEnabled } from './keywordIngest.js';
+import { createKeywordConceptStore, type KeywordConceptStore } from './keywordConceptStore.js';
+import { createKeywordIndexStore, type KeywordIndexStore } from '../search-index/keywordIndexStore.js';
 
 export interface KeywordBackfillCandidate {
   readonly pageKey: string;
@@ -54,6 +63,11 @@ export interface KeywordBackfillLaneDeps {
   readonly readProgress?: () => Promise<KeywordBackfillProgress | null>;
   /** Persist the progress cursor. Best-effort; a throw is swallowed. */
   readonly writeProgress?: (progress: KeywordBackfillProgress) => Promise<void>;
+  /** Best-effort total distinct concept count, read AFTER this cycle's
+   *  indexCandidate calls — folded into the audible per-cycle log line
+   *  (`concepts=`). Omitted or throwing -> 0; a concept-store read failure
+   *  must never fail or silence the cycle it's merely reporting on. */
+  readonly conceptsTotal?: () => number;
   readonly now?: () => number;
   readonly log?: (message: string) => void;
 }
@@ -79,6 +93,19 @@ export const DEFAULT_KEYWORD_BACKFILL_CONFIG: KeywordBackfillLaneConfig = {
   cycleIntervalMs: 2_000,
   idleIntervalMs: 60_000,
   maxAttemptsPerPage: 3,
+};
+
+// ---- flag -----------------------------------------------------------------
+
+export const KEYWORD_BACKFILL_ENV = 'SIDETRACK_KEYWORD_BACKFILL';
+
+/** Default ON — same kill-switch idiom as keywordIngest.ts's
+ *  keywordIngestEnabled(). '0'/'false' disables: scheduleKeywordBackfillLoop
+ *  opens no store handles and starts no timer at all when this is off (zero
+ *  cost), not merely a no-op cycle. */
+export const keywordBackfillEnabled = (): boolean => {
+  const raw = process.env[KEYWORD_BACKFILL_ENV];
+  return raw !== '0' && raw !== 'false';
 };
 
 export interface KeywordBackfillProgress {
@@ -203,6 +230,24 @@ export const createKeywordBackfillLane = (
     };
     await persist();
 
+    // Audible per-cycle mark — UNCONDITIONAL, including a fully-idle cycle
+    // (processed=0 remaining=0). Silence is how this lane shipped with zero
+    // production callers for hours undetected: an operator staring at logs
+    // could not tell "not wired" apart from "wired, quietly caught up" until
+    // this line existed. Best-effort concepts read (deps.conceptsTotal) — a
+    // failure there must not suppress the mark itself.
+    let conceptsTotal = 0;
+    try {
+      conceptsTotal = deps.conceptsTotal?.() ?? 0;
+    } catch {
+      conceptsTotal = 0;
+    }
+    log(
+      `[keyword-backfill] cycle processed=${String(indexed)} remaining=${String(
+        Math.max(0, backlog.length - indexed),
+      )} concepts=${String(conceptsTotal)}`,
+    );
+
     return { scanned: candidates.length, backlog: backlog.length, indexed, failed, quarantined };
   };
 
@@ -290,4 +335,220 @@ export const keywordBackfillCandidatesFromGistLookup = (
     id,
     gist,
   }));
+};
+
+// ---------------------------------------------------------------------------
+// Persisted progress artifact — small standalone JSON file, SAME atomic
+// write shape as page-evidence/store.ts's readBackgroundEmbeddingProgress /
+// writeBackgroundEmbeddingProgress (mkdir + tmp-file + rename; no shared
+// cross-module util exists in this codebase, each lane owns its own tiny
+// copy). Lives beside the two SQLite stores this lane fills
+// (_BAC/connections/keyword-index.db, keyword-concepts.db) — observability
+// only; hasIndexed alone is already sufficient + resumable for correctness
+// (see this file's header), so a corrupt/missing progress file just means a
+// cold processedTotal counter and a clean re-attempt budget, never lost work.
+// ---------------------------------------------------------------------------
+
+const keywordBackfillProgressPath = (vaultRoot: string): string =>
+  join(vaultRoot, '_BAC', 'connections', 'keyword-backfill-progress.json');
+
+const atomicWriteJson = async (path: string, value: unknown): Promise<void> => {
+  await mkdir(dirname(path), { recursive: true });
+  const tempPath = join(dirname(path), `.${basename(path)}.${createRevision()}.tmp`);
+  await writeFile(tempPath, `${JSON.stringify(value, null, 2)}\n`, 'utf8');
+  await rename(tempPath, path);
+};
+
+const readJsonFile = async <T>(path: string): Promise<T | null> => {
+  try {
+    return JSON.parse(await readFile(path, 'utf8')) as T;
+  } catch {
+    return null;
+  }
+};
+
+export const readKeywordBackfillProgress = async (
+  vaultRoot: string,
+): Promise<KeywordBackfillProgress | null> => {
+  const parsed = await readJsonFile<KeywordBackfillProgress>(
+    keywordBackfillProgressPath(vaultRoot),
+  );
+  if (parsed === null || parsed.schemaVersion !== 1) return null;
+  return parsed;
+};
+
+export const writeKeywordBackfillProgress = async (
+  vaultRoot: string,
+  progress: KeywordBackfillProgress,
+): Promise<void> => {
+  await atomicWriteJson(keywordBackfillProgressPath(vaultRoot), progress);
+};
+
+// ---------------------------------------------------------------------------
+// Companion background scheduler — the ACTUAL production wiring
+// (2026-08-16 gap fix). Same factory shape as
+// workstreams/suggestionRecomputeLane.ts's scheduleSuggestionRecomputeLoop:
+// the lane above is ALREADY self-scheduling (backlog-aware fast/idle cadence
+// baked into createKeywordBackfillLane's own start()/stop()), so this
+// wrapper's only job is opening THIS vault's own keyword-index/concept-store
+// handles (the same "no shared singleton" idiom keywordIngest.ts established
+// — see suggestionRecomputeLane.ts's header for why each production caller
+// keeps its own handle pair rather than reaching into another module's
+// private singleton), building the real deps, and starting/stopping the
+// lane.
+//
+// indexCandidate delegates to keywordIngest.ts's `ingestGistKeywords` — the
+// SAME function http/routes/enrichmentRoutes.ts's live-ingest hook calls for
+// a freshly-accepted gist — so a backfilled page goes through the identical
+// extract+upsert+concept-assign path, never a second implementation that
+// could drift from it.
+//
+// listCandidates SKIPS ENTIRELY (returns []) whenever keywordIngestEnabled()
+// is false, rather than letting indexCandidate throw for every candidate.
+// This is load-bearing: maxAttemptsPerPage quarantine has NO cooldown decay
+// (see KeywordBackfillLaneConfig's header — "fails it forever"). If an
+// operator flips SIDETRACK_KEYWORD_INGEST=0 for any reason (e.g. embedder
+// maintenance), treating that as a per-candidate FAILURE would permanently
+// quarantine the entire population-capped backlog within
+// maxAttemptsPerPage cycles — as little as ~6s apart at the default
+// cycleIntervalMs, far too fast a window for an operator to react to.
+// Skipping the listing instead means the lane goes idle and resumes
+// cleanly, with zero quarantine debt, the moment ingest is re-enabled.
+// ---------------------------------------------------------------------------
+
+/** Modest, NOT the hours-scale prototypeGeneration/suggestionRecompute
+ *  delay: this lane exists because the live keyword-index/concept-store
+ *  were found completely EMPTY (zero production caller — see this PR's
+ *  landing note), so backfill should begin promptly rather than wait
+ *  minutes. Still non-zero so it never competes with boot-critical work
+ *  (recall lock, HTTP listen) in the first moments. Overridable per-process
+ *  via SIDETRACK_KEYWORD_BACKFILL_STARTUP_DELAY_MS (tests use this to avoid
+ *  a real 30s wait). */
+export const KEYWORD_BACKFILL_STARTUP_DELAY_MS = 30_000;
+
+const resolveKeywordBackfillStartupDelayMs = (): number => {
+  const raw = process.env['SIDETRACK_KEYWORD_BACKFILL_STARTUP_DELAY_MS'];
+  if (raw === undefined || raw === '') return KEYWORD_BACKFILL_STARTUP_DELAY_MS;
+  const parsed = Number(raw);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : KEYWORD_BACKFILL_STARTUP_DELAY_MS;
+};
+
+export interface KeywordBackfillSchedulerHandles {
+  readonly keywordIndex: KeywordIndexStore;
+  readonly concepts: KeywordConceptStore;
+}
+
+const buildKeywordBackfillDeps = (
+  vaultRoot: string,
+  eventLog: EventLog,
+  handles: KeywordBackfillSchedulerHandles,
+  log: (message: string) => void,
+): KeywordBackfillLaneDeps => ({
+  listCandidates: async () => {
+    if (!keywordIngestEnabled()) return [];
+    const lookup = await loadGistLookup(vaultRoot, eventLog).catch(() => null);
+    if (lookup === null) return [];
+    return keywordBackfillCandidatesFromGistLookup(lookup);
+  },
+  hasIndexed: async (pageKey) => handles.keywordIndex.hasPage(pageKey),
+  indexCandidate: async (candidate) => {
+    const result = await ingestGistKeywords(vaultRoot, candidate.kind, candidate.id, candidate.gist);
+    if (!result.ingested) {
+      throw new Error(`keyword backfill: ingestGistKeywords did not ingest ${candidate.pageKey}`);
+    }
+  },
+  readProgress: () => readKeywordBackfillProgress(vaultRoot),
+  writeProgress: (progress) => writeKeywordBackfillProgress(vaultRoot, progress),
+  conceptsTotal: () => handles.concepts.stats().distinctConcepts,
+  log,
+});
+
+/**
+ * Start the production keyword-backfill scheduler for one vault. Env-gated
+ * (keywordBackfillEnabled — SIDETRACK_KEYWORD_BACKFILL, default ON): when
+ * off, emits the one boot line and returns a no-op disposer WITHOUT opening
+ * any store handle or starting any timer. When on, opens its own
+ * keyword-index/concept-store handles after a startup delay (never blocks
+ * companion boot — same non-blocking shape as
+ * scheduleSuggestionRecomputeLoop), builds the real deps, and starts the
+ * lane's own self-scheduling loop.
+ *
+ * Returns ONE disposer for BOTH: (a) teardown[] (startup-failure rollback),
+ * and (b) the explicit pre-drain "stopping-lanes" stop set in
+ * runtime/companion.ts's close() — the #374 lane-stop discipline this PR
+ * adds this lane to (it is not an event-log-appending lane like
+ * body-evidence/background-embedding, so it cannot itself cause the
+ * SIGTERM-hang awaitIdle() never-converges failure mode #374 fixed, but a
+ * lane left ticking past close() is still a live timer + live SQLite
+ * handles outliving the process that's supposedly shutting down, so it is
+ * stopped explicitly rather than left to the "unref'd timer dies with the
+ * process" assumption alone).
+ */
+export const scheduleKeywordBackfillLoop = (
+  eventLog: EventLog,
+  vaultRoot: string,
+  options?: {
+    readonly startupDelayMs?: number;
+    readonly config?: KeywordBackfillLaneConfig;
+    readonly log?: (message: string) => void;
+  },
+): (() => void) => {
+  const log =
+    options?.log ??
+    ((message: string): void => {
+      process.stdout.write(`${message}\n`);
+    });
+
+  if (!keywordBackfillEnabled()) {
+    log(`[keyword-backfill] disabled via ${KEYWORD_BACKFILL_ENV}=0`);
+    return () => undefined;
+  }
+  log('[keyword-backfill] enabled');
+
+  let lane: KeywordBackfillLane | null = null;
+  let handles: KeywordBackfillSchedulerHandles | null = null;
+  let disposed = false;
+
+  const startupTimer = setTimeout(() => {
+    void (async (): Promise<void> => {
+      try {
+        // Self-sufficient — do NOT depend on some OTHER companion.ts
+        // component (connectionsStore, the vault writer, …) having already
+        // created _BAC/connections by the time this fires. bun:sqlite's
+        // `new Database(path, {create:true})` only creates the missing
+        // FILE, never a missing PARENT directory, and this scheduler's
+        // startup delay is deliberately short (see
+        // KEYWORD_BACKFILL_STARTUP_DELAY_MS's header) — short enough that
+        // it is not safe to assume boot-order coincidence has created this
+        // directory first.
+        await mkdir(join(vaultRoot, '_BAC', 'connections'), { recursive: true });
+        const [keywordIndex, concepts] = await Promise.all([
+          createKeywordIndexStore(vaultRoot),
+          createKeywordConceptStore(vaultRoot),
+        ]);
+        if (disposed) {
+          // Disposed while the handles were opening — close them
+          // immediately rather than leaking, and never start the lane.
+          keywordIndex.close();
+          concepts.close();
+          return;
+        }
+        handles = { keywordIndex, concepts };
+        const deps = buildKeywordBackfillDeps(vaultRoot, eventLog, handles, log);
+        lane = createKeywordBackfillLane(deps, options?.config);
+        lane.start();
+      } catch (error) {
+        log(`[keyword-backfill] scheduler failed to start: ${String(error)}`);
+      }
+    })();
+  }, options?.startupDelayMs ?? resolveKeywordBackfillStartupDelayMs());
+  startupTimer.unref?.();
+
+  return () => {
+    disposed = true;
+    clearTimeout(startupTimer);
+    lane?.stop();
+    handles?.keywordIndex.close();
+    handles?.concepts.close();
+  };
 };
