@@ -355,6 +355,10 @@ interface RouteMatch {
   // URL-encoded entity name (GET /v1/entities/{name}). Encoded because entity
   // names carry spaces, slashes and punctuation straight from a model's prose.
   readonly entityName?: string;
+  // Suggestion-candidate fingerprint (workstreamSuggestionsRoutes.ts's
+  // new-topic accept/decline routes) — the same `fingerprint` field
+  // suggestionCandidateStore.ts persists a candidate under.
+  readonly fingerprint?: string;
 }
 
 export interface RouteDefinition {

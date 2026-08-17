@@ -99,6 +99,34 @@ export interface DomainAggregatorCounters {
    * often normalize path shape (HN's uniform `/item`), so this alone does
    * not reliably separate a hub from a single-source blog. */
   readonly firstPathSegmentEntropyBits: number;
+  /**
+   * SHADOW, DIAGNOSTIC ONLY — same status as firstPathSegmentEntropyBits,
+   * NOT consulted by classifyLearnedAggregatorPage / isLearnedAggregatorHost.
+   * Entropy of the domain's keyword-CONCEPT distribution (keywordConcepts.ts
+   * concept ids, folded from AggregatorVisitObservation.keywordConceptIds).
+   *
+   * WHY THIS ADDS SIGNAL THE PATH-SEGMENT ENTROPY DOESN'T (PR #373's named
+   * blind spot: "cannot distinguish single-source blogs from true
+   * aggregators"). Path shape is a URL-STRUCTURE property — a hub can
+   * normalize it away (HN's uniform `/item`) or a single-author blog can
+   * vary it a lot (dated permalinks, category prefixes) without being an
+   * aggregator at all. Keyword-concept entropy is a CONTENT-TOPIC property:
+   * a true aggregator's items span many unrelated concepts (low agreement
+   * page to page), while a single-source blog — even one with wildly
+   * different URL shapes — writes about a comparatively narrow, low-entropy
+   * set of concepts. Low entropy here is evidence FOR "coherent single
+   * source" independent of what the path segment entropy says; the two
+   * signals are complementary, not redundant, which is exactly the
+   * combination PR #373 asked for and did not have.
+   *
+   * 0 when the domain has no keyword-concept observations at all (not "low
+   * entropy" — see entropyBitsOf's own empty-input behavior). Zero,
+   * degenerate/near-zero, and "no data" are NOT distinguished by this single
+   * number; a caller that needs that distinction should also read
+   * domainStats' other counts (e.g. distinctUrlCount) alongside it — same
+   * caution firstPathSegmentEntropyBits's own doc comment implies.
+   */
+  readonly keywordConceptEntropyBits: number;
 }
 
 interface MutableUrlCounters {
@@ -123,6 +151,8 @@ interface MutableDomainCounters {
   firstPathSegmentCounts: Map<string, number>;
   maxQualifyingOutlinkFanout: number;
   hubCandidateCount: number;
+  /** SHADOW ONLY — see DomainAggregatorCounters.keywordConceptEntropyBits. */
+  keywordConceptCounts: Map<string, number>;
 }
 
 const freezeUrlCounters = (mutable: MutableUrlCounters): UrlAggregatorCounters => ({
@@ -214,6 +244,7 @@ export class AggregatorStatsState {
       maxQualifyingOutlinkFanout: mutable.maxQualifyingOutlinkFanout,
       hubCandidateCount: mutable.hubCandidateCount,
       firstPathSegmentEntropyBits: entropyBitsOf(mutable.firstPathSegmentCounts),
+      keywordConceptEntropyBits: entropyBitsOf(mutable.keywordConceptCounts),
     };
   }
 
@@ -246,6 +277,7 @@ export class AggregatorStatsState {
         firstPathSegmentCounts: new Map<string, number>(),
         maxQualifyingOutlinkFanout: 0,
         hubCandidateCount: 0,
+        keywordConceptCounts: new Map<string, number>(),
       };
       domainCounters.distinctUrlCount += 1;
       const segment = firstPathSegmentOf(canonicalUrl);
@@ -326,6 +358,25 @@ export class AggregatorStatsState {
       this.recordOutlink(observation.previousCanonicalUrl, observation.canonicalUrl, observation.observedAtMs);
     }
 
+    // SHADOW ONLY — see DomainAggregatorCounters.keywordConceptEntropyBits.
+    // `mutableUrl` above already created this URL's domain counters (if this
+    // is the URL's first sighting), so the lookup here always hits once any
+    // URL in the domain has been observed.
+    if (observation.keywordConceptIds !== undefined && observation.keywordConceptIds.length > 0) {
+      const hostname = hostnameOf(observation.canonicalUrl);
+      if (hostname !== null) {
+        const domainCounters = this.domainCounters.get(registrableDomainOf(hostname));
+        if (domainCounters !== undefined) {
+          for (const conceptId of observation.keywordConceptIds) {
+            domainCounters.keywordConceptCounts.set(
+              conceptId,
+              (domainCounters.keywordConceptCounts.get(conceptId) ?? 0) + 1,
+            );
+          }
+        }
+      }
+    }
+
     return this;
   }
 }
@@ -342,6 +393,12 @@ export interface AggregatorVisitObservation {
   readonly title?: string;
   readonly openerCanonicalUrl?: string;
   readonly previousCanonicalUrl?: string;
+  /** Concept ids (keywordConcepts.ts) for this page's gist keywords, when
+   *  the keyword layer has processed it. Additive shadow input (2026-08-16,
+   *  "gist keywords as sparse-data clustering features") — see
+   *  DomainAggregatorCounters.keywordConceptEntropyBits. Optional; omitted
+   *  on every observation reproduces this module's prior behavior exactly. */
+  readonly keywordConceptIds?: readonly string[];
 }
 
 export const createEmptyAggregatorStatsState = (): AggregatorStatsState => new AggregatorStatsState();
