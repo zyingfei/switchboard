@@ -37,9 +37,21 @@ describe('stableHash', () => {
     expect(hashes.size).toBe(inputs.length);
   });
 
-  it('produces an 8-character lowercase hex string', () => {
+  it('produces a 16-character lowercase hex string (64-bit digest)', () => {
     for (const input of ['', 'x', 'https://example.test/a very long url with spaces and stuff']) {
-      expect(stableHash(input)).toMatch(/^[0-9a-f]{8}$/u);
+      expect(stableHash(input)).toMatch(/^[0-9a-f]{16}$/u);
+    }
+  });
+
+  it('the two 32-bit halves are independent (not the same value repeated)', () => {
+    // A degenerate widening (e.g. the same 32-bit hash rendered twice) would
+    // still match the 16-char shape check above but buy zero extra collision
+    // resistance. Assert the two halves actually differ for a representative
+    // spread of inputs (astronomically unlikely to coincide by chance for
+    // two independently-seeded FNV-1a passes).
+    for (const input of ['a', 'https://example.test/page', 'some other input entirely']) {
+      const hash = stableHash(input);
+      expect(hash.slice(0, 8)).not.toBe(hash.slice(8, 16));
     }
   });
 });

@@ -22,6 +22,7 @@
 // Presentational only. It renders wherever GuessLanes renders (all lane states:
 // populated, empty, compact, full), always ABOVE the disclosure it controls.
 
+import { ATTRIBUTION_LANES, laneIdsInOrder } from './laneRegistry';
 import {
   type GuessGate,
   type GuessLane,
@@ -30,44 +31,40 @@ import {
   pipelineVerdictLine,
 } from './types';
 
-// Fixed render order + short labels for the base six lanes. This is the frozen
-// wire order (graph → recency); the strip ALWAYS renders these six in this
-// order regardless of which the payload happens to include, so the dots row is
-// a stable, scannable shape. The optional tail lanes are appended AFTER these
+// Fixed render order for the base six lanes. This is the frozen wire order
+// (graph → recency); the strip ALWAYS renders these six in this order
+// regardless of which the payload happens to include, so the dots row is a
+// stable, scannable shape. The optional tail lanes are appended AFTER these
 // six ONLY when the payload carries them — see OPTIONAL_LANE_ORDER + the
-// render. Short labels (vs GuessLanes' longer LANE_LABEL) keep the row on one
-// wrap-line in the narrow panel.
-const BASE_LANE_ORDER: readonly GuessLane[] = [
-  'graph',
-  'similarity',
-  'topic',
-  'title',
-  'domain',
-  'recency',
-];
-// The optional TAIL lanes, in wire order after the base six: 'content' (lane 7,
-// query-time retrieval) then 'ai' (lane 8, the same retrieval asked with the
-// gist alone). Each is rendered only when the payload actually carries it, so
-// an old companion / a disabled lane never gets a phantom hollow dot.
+// render.
 //
-// WHY A LIST, not a hard-coded `has('content')` check: the previous shape
-// appended exactly one optional chip and had no branch for 'ai', so a live
-// 8-lane payload rendered seven dots and the AI lane was invisible on the strip
-// even once the client parse kept it. A lane added to GuessLane that can arrive
-// after 'recency' belongs in this array — that is the single place the strip's
-// tail order is decided.
-const OPTIONAL_LANE_ORDER: readonly GuessLane[] = ['content', 'ai', 'prototype'];
-const LANE_SHORT_LABEL: Record<GuessLane, string> = {
-  graph: 'Graph',
-  similarity: 'Similar',
-  topic: 'Topic',
-  title: 'Title',
-  domain: 'Domain',
-  recency: 'Recent',
-  content: 'Content',
-  ai: 'AI',
-  prototype: 'Prototype',
-};
+// DERIVED from laneRegistry.ts (task #29): the `alwaysVisible` lanes, sorted
+// by `order`. Zero behavioral diff from the old hand-written list.
+const BASE_LANE_ORDER: readonly GuessLane[] = laneIdsInOrder(
+  (definition) => definition.alwaysVisible,
+);
+// The optional TAIL lanes, in wire order after the base six: 'content' (lane 7,
+// query-time retrieval), 'ai' (lane 8, the same retrieval asked with the gist
+// alone), 'prototype' (lane 9). Each is rendered only when the payload
+// actually carries it, so an old companion / a disabled lane never gets a
+// phantom hollow dot.
+//
+// DERIVED from laneRegistry.ts: the NON-`alwaysVisible` lanes, sorted by
+// `order`. This is the fix for the exact bug class that motivated this
+// registry — the previous hand-written array once appended exactly one
+// optional chip and had no branch for 'ai', so a live 8-lane payload rendered
+// seven dots and the AI lane was invisible on the strip even once the client
+// parse kept it; 'prototype' repeated the same failure a day later. A lane
+// added to laneRegistry.ts with `alwaysVisible: false` now appears here
+// automatically, in its registered `order`.
+const OPTIONAL_LANE_ORDER: readonly GuessLane[] = laneIdsInOrder(
+  (definition) => !definition.alwaysVisible,
+);
+// Short labels (vs GuessLanes' longer LANE_LABEL) keep the row on one
+// wrap-line in the narrow panel. DERIVED from laneRegistry.ts's shortLabel.
+const LANE_SHORT_LABEL: Record<GuessLane, string> = Object.fromEntries(
+  Object.entries(ATTRIBUTION_LANES).map(([lane, definition]) => [lane, definition.shortLabel]),
+) as Record<GuessLane, string>;
 
 const workstreamLabel = (
   workstreamId: string,

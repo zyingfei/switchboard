@@ -237,24 +237,50 @@ export const resolverTimelineEventsForCanonicalUrlsIndexed = async (
 // snapshotRevision to bust the entry when the underlying graph/timeline
 // signal actually changes is the SAME trust boundary the plain resolver
 // cache already relies on (it has no event/timeline fold at all).
-const FNV_OFFSET_BASIS_32 = 0x811c9dc5;
+// Two independent FNV-1a offset bases (perf/resolver-acceptance-harness,
+// task #32 EC-DIGEST WIDENING). A plain 32-bit FNV-1a digest is the SOLE
+// cache identity for the folded event-candidate set (see
+// eventCandidateCacheRevision below) — a 32-bit collision is a WRONG cache
+// HIT, not just a slow miss, so ~4 billion possible digests is not enough
+// headroom once a vault accumulates many distinct candidate sets over its
+// lifetime (birthday-bound collision risk climbs well before 2^32 sets).
+// Running FNV-1a TWICE over the same input with two different, unrelated
+// seeds and concatenating the two 32-bit outputs gives a 64-bit digest
+// without pulling in a crypto/hash dependency — the two passes are
+// independent enough (different seed, same avalanche-per-byte mixing) that
+// a collision requires BOTH halves to coincide, squaring the odds. `_B` is
+// deliberately NOT the FNV-1a-64 standard basis (this is not real FNV-64,
+// which processes 8 bytes/step differently) — it only needs to differ from
+// `_A` so the two 32-bit passes diverge.
+const FNV_OFFSET_BASIS_32_A = 0x811c9dc5;
+const FNV_OFFSET_BASIS_32_B = 0x9e3779b9;
 const FNV_PRIME_32 = 0x01000193;
 
-/** Deterministic, non-cryptographic string hash (FNV-1a, 32-bit) rendered
- *  as 8 lowercase hex chars. Used ONLY as a cache-key discriminator — never
- *  a security or dedup-uniqueness boundary — so an astronomically-unlikely
- *  collision costs a wrong cache HIT, not a security issue; the folded key
- *  still carries the full snapshotRevision, so a collision would need to
- *  also match a live revision to matter, and is self-healing on the next
- *  real graph move. */
-export const stableHash = (input: string): string => {
-  let hash = FNV_OFFSET_BASIS_32;
+const fnv1a32 = (input: string, seed: number): number => {
+  let hash = seed;
   for (let index = 0; index < input.length; index += 1) {
     hash ^= input.charCodeAt(index);
     hash = Math.imul(hash, FNV_PRIME_32);
   }
-  return (hash >>> 0).toString(16).padStart(8, '0');
+  return hash >>> 0;
 };
+
+/** Deterministic, non-cryptographic string hash — two 32-bit FNV-1a passes
+ *  (distinct offset bases, see above) concatenated into a 64-bit digest
+ *  rendered as 16 lowercase hex chars. Used ONLY as a cache-key
+ *  discriminator — never a security or dedup-uniqueness boundary — so an
+ *  astronomically-unlikely collision costs a wrong cache HIT, not a
+ *  security issue; the folded key still carries the full snapshotRevision,
+ *  so a collision would need to also match a live revision to matter, and
+ *  is self-healing on the next real graph move.
+ *
+ *  NOTE (no migration needed): old cache rows keyed under the prior 8-char
+ *  32-bit digest simply MISS once — the revision string is now 16 chars for
+ *  the same logical input, so it can never equal an old row's key — and the
+ *  miss re-populates the cache under the new 64-bit key on the next read. */
+export const stableHash = (input: string): string =>
+  fnv1a32(input, FNV_OFFSET_BASIS_32_A).toString(16).padStart(8, '0') +
+  fnv1a32(input, FNV_OFFSET_BASIS_32_B).toString(16).padStart(8, '0');
 
 /** Folds a (sorted, deduped) event-candidate URL set into a resolver-cache
  *  revision string. Order-invariant and duplicate-invariant by

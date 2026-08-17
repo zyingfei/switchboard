@@ -804,6 +804,48 @@ const resolverCandidateTimelineWindow = (): number => {
     : DEFAULT_RESOLVER_CANDIDATE_TIMELINE_WINDOW;
 };
 
+// Throttled soak-observability line for the bounded read below — parallel
+// to connections/snapshot.ts's [resolver.subgraph.truncated] (same 30s
+// throttle window, same reasoning: fires at most once per window regardless
+// of how many resolves truncate in it, so a hub-heavy batch cannot spam
+// stdout). The prior behavior silently dropped everything past `window`
+// with no signal at all; this makes that truncation audible without
+// changing what gets served. `targetUrls` is the batch's missed
+// event-candidate targets (the callers that triggered this read) — joined
+// (capped) under the `url=` key for grep-ability, matching the single-seed
+// convention the subgraph line uses even though this read is batch-shaped.
+const RESOLVER_CANDIDATE_WINDOW_TRUNCATION_LOG_THROTTLE_MS = 30_000;
+let lastResolverCandidateWindowTruncationLogAtMs = 0;
+const CANDIDATE_WINDOW_TRUNCATION_LOG_URL_CAP = 3;
+const logResolverCandidateWindowTruncated = (input: {
+  readonly targetUrls: readonly string[];
+  readonly window: number;
+}): void => {
+  const now = Date.now();
+  if (
+    now - lastResolverCandidateWindowTruncationLogAtMs <
+    RESOLVER_CANDIDATE_WINDOW_TRUNCATION_LOG_THROTTLE_MS
+  ) {
+    return;
+  }
+  lastResolverCandidateWindowTruncationLogAtMs = now;
+  const shown = input.targetUrls.slice(0, CANDIDATE_WINDOW_TRUNCATION_LOG_URL_CAP);
+  const suffix =
+    input.targetUrls.length > shown.length
+      ? `,+${String(input.targetUrls.length - shown.length)}more`
+      : '';
+  console.warn(
+    `[resolver.candidate-window.truncated] url=${shown.join(',')}${suffix} window=${String(input.window)}`,
+  );
+};
+
+// Test-only reset (mirrors runtime/sqlBudget.ts's resetSqlBudgetDiagnostics)
+// so a truncation-mark test never depends on module-load ordering against
+// whatever earlier test in the same file/run last tripped the throttle.
+export const resetResolverCandidateWindowTruncationLogForTest = (): void => {
+  lastResolverCandidateWindowTruncationLogAtMs = 0;
+};
+
 // The timeline events fed to resolverExpandedCandidateUrlsForCanonicalUrls.
 // Indexed + bounded when the typed store is available (readMostRecentByType,
 // events_type_accepted_at_idx — O(window) instead of O(all
@@ -816,9 +858,14 @@ const resolverCandidateTimelineWindow = (): number => {
 // merged-filter — `merged` no longer carries BROWSER_TIMELINE_OBSERVED at
 // all once the store is up, so filtering it here would silently return
 // nothing.
-const timelineEventsForCandidateGeneration = async (
+//
+// `targetUrls` (added alongside the truncation mark) is ONLY the missed
+// event-candidate targets driving this call, used for the log line above —
+// it plays no role in which events are read or returned.
+export const timelineEventsForCandidateGeneration = async (
   typedEventStore: Awaited<ReturnType<typeof eventStoreForContext>>,
   merged: readonly AcceptedEvent[],
+  targetUrls: readonly string[] = [],
 ): Promise<readonly AcceptedEvent[]> => {
   if (typedEventStore === null) {
     return merged.filter((event) => event.type === BROWSER_TIMELINE_OBSERVED);
@@ -835,7 +882,18 @@ const timelineEventsForCandidateGeneration = async (
     );
     return events;
   }
-  return typedEventStore.readMostRecentByType(BROWSER_TIMELINE_OBSERVED, window);
+  const events = typedEventStore.readMostRecentByType(BROWSER_TIMELINE_OBSERVED, window);
+  // `events.length === window` is the same "hit the cap" proxy the read
+  // itself uses (a LIMIT query has no cheap way to also learn whether more
+  // rows existed without a second COUNT query on the hot path) — it can
+  // under-fire only in the coincidental case where the vault's total
+  // BROWSER_TIMELINE_OBSERVED count exactly equals `window`, which is
+  // harmless (one soak cycle without a mark, self-correcting the moment one
+  // more such event lands).
+  if (events.length === window) {
+    logResolverCandidateWindowTruncated({ targetUrls, window });
+  }
+  return events;
 };
 
 // SWR serve-key for a batch-resolve item. Namespaced `|batch` (distinct from
@@ -1501,7 +1559,11 @@ export const routes: readonly RouteDefinition[] = [
           missedEventCandidateTargets.length === 0
             ? new Map<string, readonly string[]>()
             : resolverExpandedCandidateUrlsForCanonicalUrls(
-                await timelineEventsForCandidateGeneration(typedEventStore, merged),
+                await timelineEventsForCandidateGeneration(
+                  typedEventStore,
+                  merged,
+                  missedEventCandidateTargets,
+                ),
                 missedEventCandidateTargets,
               );
         const expandedCandidateUrls = [

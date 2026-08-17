@@ -1,0 +1,65 @@
+{
+  "graph": {
+    "order": 1,
+    "shortLabel": "Graph",
+    "longLabel": "Graph",
+    "behavior": "decision",
+    "alwaysVisible": true
+  },
+  "similarity": {
+    "order": 2,
+    "shortLabel": "Similar",
+    "longLabel": "Similar pages",
+    "behavior": "decision",
+    "alwaysVisible": true
+  },
+  "topic": {
+    "order": 3,
+    "shortLabel": "Topic",
+    "longLabel": "Topic",
+    "behavior": "decision",
+    "alwaysVisible": true
+  },
+  "title": {
+    "order": 4,
+    "shortLabel": "Title",
+    "longLabel": "Title match",
+    "behavior": "decision",
+    "alwaysVisible": true
+  },
+  "domain": {
+    "order": 5,
+    "shortLabel": "Domain",
+    "longLabel": "Domain history",
+    "behavior": "decision",
+    "alwaysVisible": true
+  },
+  "recency": {
+    "order": 6,
+    "shortLabel": "Recent",
+    "longLabel": "Recently active",
+    "behavior": "decision",
+    "alwaysVisible": true
+  },
+  "content": {
+    "order": 7,
+    "shortLabel": "Content",
+    "longLabel": "Content match",
+    "behavior": "decision",
+    "alwaysVisible": false
+  },
+  "ai": {
+    "order": 8,
+    "shortLabel": "AI",
+    "longLabel": "AI gist match",
+    "behavior": "decision",
+    "alwaysVisible": false
+  },
+  "prototype": {
+    "order": 9,
+    "shortLabel": "Prototype",
+    "longLabel": "Prototype match",
+    "behavior": "observe",
+    "alwaysVisible": false
+  }
+}
