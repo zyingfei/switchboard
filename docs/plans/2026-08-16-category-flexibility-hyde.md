@@ -1241,3 +1241,223 @@ leaving it to a third:
   `runtime/companion.ts`'s own boot/shutdown suite
   (`runtime/companion.test.ts`) passes unchanged with the new scheduler
   wired in.
+
+**§10 addendum #2 — keyword-backfill lane wiring (2026-08-17, follow-up
+fix).** Live-vault check (build 4f27316b, ~3h deployed) found
+`keyword-index.db` / `keyword-concepts.db` EMPTY — `0` rows, no keyword-index
+log marks ever — starving `suggestionRecomputeLane.ts`'s recompute pass of
+the keyword-concept features `hybridSimilarity` needs (§4). Root cause: this
+was the THIRD "engine without a caller" instance in the same delivery
+window (after `recomputeSuggestionCandidates` and the main-card membership
+chips, both already fixed) — `enrichment/keywordBackfillLane.ts`'s
+`createKeywordBackfillLane` was exported, fully unit-tested, and explicitly
+documented as "ready to splice in" (§6 above), but nothing in
+`runtime/companion.ts` ever called it.
+
+**Audit — every wiring verified or added, not just the one that was
+broken:**
+
+| Component | Exported from | Production caller | Status |
+|---|---|---|---|
+| `createKeywordBackfillLane` | `enrichment/keywordBackfillLane.ts` | `scheduleKeywordBackfillLoop` → `runtime/companion.ts` | **FIXED this PR** — was uncalled |
+| `ingestGistKeywords` (live ingest) | `enrichment/keywordIngest.ts` | `http/routes/enrichmentRoutes.ts`, `POST /v1/enrichment/content` handler | Verified wired (pre-existing) |
+| `resyncGistKeywordsAfterRetraction` | `enrichment/keywordIngest.ts` | `http/routes/enrichmentRoutes.ts`, `POST /v1/enrichment/retract` handler | Verified wired (pre-existing) |
+| `assignKeyword` (concept assignment) | `enrichment/keywordConceptStore.ts` | Called from `ingestGistKeywords` (itself wired per above) | Verified wired (pre-existing) |
+| `gatherUnfiledEvidence` / `suggestionEvidenceFromUnfiled` | `workstreams/unfiledEvidence.ts` | `suggestionRecomputeLane.ts`'s `buildDeps.gatherNewCategoryEvidence` → `scheduleSuggestionRecomputeLoop` → `runtime/companion.ts` | Verified wired (pre-existing, §10 addendum #1) |
+| `gatherWorkstreamEvidence` / `suggestionEvidenceFromWorkstreamItems` | `workstreams/prototypeEvidence.ts` / `splitEvidence.ts` | `suggestionRecomputeLane.ts`'s `buildDeps.gatherSplitEvidenceByWorkstream`; also `http/routes/workstreamsRoutes.ts` (serve path) and `workstreams/prototypeGeneration.ts` | Verified wired (pre-existing) |
+| `recomputeSuggestionCandidates` | `workstreams/splitSuggestionEngine.ts` | `suggestionRecomputeLane.ts`'s `runSuggestionRecomputeCycle` → `runtime/companion.ts` | Verified wired (pre-existing, §10 addendum #1) |
+
+No other exported-but-uncalled production machinery found in the #385
+delivery — the backfill lane was the only gap.
+
+**Fix, in `enrichment/keywordBackfillLane.ts` + `runtime/companion.ts`:**
+- `scheduleKeywordBackfillLoop(eventLog, vaultRoot, options?)` — added to the
+  END of `keywordBackfillLane.ts` (same file, same split as
+  `suggestionRecomputeLane.ts`: pure DI-only lane above, production
+  scheduler below). Opens its OWN `keywordIndexStore`/`keywordConceptStore`
+  handles (the "no shared singleton" idiom `keywordIngest.ts` established —
+  see `suggestionRecomputeLane.ts`'s header), `mkdir -p`'s
+  `_BAC/connections` itself first (self-sufficient — does not assume some
+  OTHER companion.ts component created that directory first), and calls the
+  lane's own self-scheduling `start()`. `indexCandidate` delegates to
+  `keywordIngest.ts`'s `ingestGistKeywords` — the SAME function the live-
+  ingest hook calls, so a backfilled page goes through the identical
+  extract+upsert+concept-assign path.
+- Env-gated: `SIDETRACK_KEYWORD_BACKFILL` (default ON; `'0'`/`'false'`
+  disables — zero handles opened, zero timers started, not merely a no-op
+  cycle). `listCandidates` additionally short-circuits to `[]` whenever
+  `keywordIngestEnabled()` (the SEPARATE `SIDETRACK_KEYWORD_INGEST` flag) is
+  off, rather than letting `indexCandidate` throw per-candidate — load-
+  bearing, because `maxAttemptsPerPage` quarantine has NO cooldown decay
+  (§6): treating a global ingest-disabled window as a per-candidate failure
+  would have permanently quarantined the entire backlog within 3 cycles
+  (~6s at the default `cycleIntervalMs`).
+- Startup delay `KEYWORD_BACKFILL_STARTUP_DELAY_MS=30s` (short, deliberately
+  — NOT the 10-minute delay `scheduleSuggestionRecomputeLoop`/
+  `schedulePrototypeGenerationLoop` use; the live vault's index was found
+  completely empty, so backfill should begin promptly), overridable via
+  `SIDETRACK_KEYWORD_BACKFILL_STARTUP_DELAY_MS` for tests.
+- **Audibility (binding requirement).** Every cycle — including a fully-idle
+  one — now emits `[keyword-backfill] cycle processed=N remaining=M
+  concepts=K` (added inside `runOnce()`, via a new optional
+  `conceptsTotal()` dep, best-effort — a concept-store read failure reports
+  `concepts=0` rather than suppressing the mark). One boot line states
+  enabled/disabled: `[keyword-backfill] enabled` or `[keyword-backfill]
+  disabled via SIDETRACK_KEYWORD_BACKFILL=0`. Silence is exactly how this
+  shipped broken for ~3 hours undetected.
+- **Shutdown (#374 lane-stop discipline).** `disposeKeywordBackfill()` is
+  pushed to `teardown[]` (startup-failure rollback) AND called explicitly in
+  `close()`'s pre-drain "stopping-lanes" block, alongside
+  `stopBodyEvidenceLane`/`stopBackgroundEmbeddingLane`. Not itself an event-
+  log-appending lane (writes only to its own keyword-index/concept-store
+  SQLite handles, never `eventLog.append*`), so it cannot cause the
+  SIGTERM-hang `awaitIdle()`-never-converges failure mode #374 fixed — but a
+  lane left ticking past `close()` is still a live timer + live SQLite
+  handles outliving the "shut down" process, so it is stopped explicitly
+  rather than relying on the unref'd-timer-dies-with-the-process assumption
+  alone.
+
+**Tests:**
+- `enrichment/keywordBackfillLane.test.ts` (extended) — env-flag defaults;
+  the audible per-cycle mark (including the idle case and a
+  `conceptsTotal()`-throws case); an end-to-end `scheduleKeywordBackfillLoop`
+  fixture — 3 gists seeded directly onto the event log (bypassing live
+  ingest, reproducing exactly the "gist predates the keyword layer"
+  backlog shape) are backfilled by a real cycle, `keyword-index.db` rows +
+  concepts appear, and the resulting `SuggestionEvidenceItem[]` (built the
+  same way `suggestionRecomputeLane.ts`'s join does) feeds a REAL
+  `hybridSimilarity` computation that correctly scores same-topic pages
+  higher than cross-topic ones — proving consumability, not just presence;
+  plus the disabled-flag no-op case.
+- `runtime/companion.test.ts` (extended) — a real `startCompanion()` boot
+  (25 seeded gists, `SIDETRACK_KEYWORD_BACKFILL_STARTUP_DELAY_MS=0`) proves
+  the boot line fires and a real cycle runs and durably indexes; a second
+  test proves `close()` stops the lane before its already-armed next cycle
+  (~2s out, since backlog > `batchCap`) fires — same shape as the existing
+  body-evidence-lane SIGTERM regression suite; a third test proves
+  `SIDETRACK_KEYWORD_BACKFILL=0` opens no handle and starts no timer at all.
+
+**Deviation from the original plan:** none beyond what's documented above.
+Scope was kept to exactly the reported gap — wiring the backfill lane and
+verifying/documenting the rest of the audit. (Two further scope additions —
+liberal suggestion-stability gating and a new-label hint on batch-resolve —
+landed in the SAME PR as coordinator-directed follow-ups; see the next
+addendum for both, kept as a clearly separated addition rather than folded
+silently into this one.)
+
+`bun run build` clean; `bun run typecheck` clean modulo the same pre-
+existing repo-wide `bun:test` module-resolution gap noted in §10's landing
+note above (unrelated to this change, `tsconfig.build.json` unaffected).
+Full `bun test` for `packages/sidetrack-companion` green (see PR for the
+exact count).
+
+**§10 addendum #3 — liberal suggestion gating + new-label hint (2026-08-17,
+same PR, coordinator-directed follow-up).**
+
+**(1) Liberal suggestion gating.** The stability gate that decides how many
+CONSECUTIVE stable computations a split/new-category candidate must survive
+before it is ever allowed to emit (`recomputeSuggestionCandidates`'s
+`stabilityMinConsecutive`, §4 above) was a flat `3`. Made env-tunable
+(`SIDETRACK_SUGGESTION_STABILITY`, `resolveSuggestionStabilityMinConsecutive`
+in `workstreams/splitSuggestionEngine.ts`) and the DEFAULT lowered to `1` —
+a qualifying candidate now surfaces on its first computation. Rationale:
+population-scoped decline memory (`declineCandidate`/`declinedConceptSets`,
+§7) makes a wrong suggestion nearly free to dismiss — one click, and that
+concept-set never resurfaces for the scope+kind again — so the 2-extra-
+cycle wait the old gate imposed on every GOOD candidate (minutes, at
+`suggestionRecomputeLane.ts`'s cadence) was withholding value to guard
+against a cost the decline UI already makes cheaper than the gate itself.
+`minClusterMembers` also gained an env knob
+(`SIDETRACK_SUGGESTION_MIN_MEMBERS`, `resolveSuggestionMinClusterMembers`)
+but its DEFAULT is UNCHANGED (still `HDBSCAN_TOPIC_MIN_SAMPLES + 1` = 4) and
+floored at `SUGGESTION_MIN_MEMBERS_FLOOR` (`HDBSCAN_TOPIC_MIN_SAMPLES` = 3,
+never settable below — a cluster smaller than the density primitive's own
+min-samples isn't a cluster by that primitive's own definition) — unlike
+stability, "how big must a cluster be" did not loosen, only "how many times
+must it look the same" did.
+
+Verified the `GET /v1/workstreams/suggestions` read surface has NO hidden
+second gate: its filter is exactly `candidate.emitted && !candidate.dismissed`
+(`http/routes/workstreamsRoutes.ts`) — `emitted` IS the stability-gated
+flag, so a candidate the engine emits under the new liberal default is
+immediately visible, proven by a new route-level test that runs the REAL
+engine (not a hand-built store row) and fetches it back same-request.
+
+Tests: the two original stability-mechanism tests
+(`splitSuggestionEngine.test.ts`) now pass `stabilityMinConsecutive: 3`
+explicitly (proving the MECHANISM is unchanged, only the bare-call default
+moved) and are renamed to say so; `splitSuggestionNewTopic.test.ts`'s shared
+options constant does the same (every test in that file is specifically
+about the 3-round cadence); new tests prove (a) a qualifying candidate
+emits on its bare-default first computation, (b) a declined signature stays
+suppressed even under the liberal default while an unrelated fresh cluster
+in the same cycle still emits on ITS first computation (decline memory
+beats liberal stability), (c) the GET-route immediate-visibility case above,
+and (d) env-parsing for both new resolvers (default/override/garbage/
+below-floor).
+
+**(2) New-label hint.** Additive, companion-side-only wire field on the
+batch-resolve response (`UrlResolutionResult.newLabelHint?: {name,
+keywords}`, `tabsession/newLabelHint.ts`, attached by `http/server.ts`'s
+`finalizeBatchResolveResults`) — panel rendering is a separate, already-
+in-flight change building against this contract; this PR ships the
+computation + wire shape only. Present when, for one URL: (a) NO existing
+workstream reached confidence — reusing, byte-for-byte, the SAME
+"genuinely no confident pick" condition `tabsession/laneFallback.ts`'s
+`applyLaneFallbackGuess` already established
+(`fusedCandidates.length === 0 && decision.gate?.reason === 'no-candidates'`),
+checked AFTER `applyLaneDecisions` so a page the lane-fallback guess
+successfully rescued is correctly NOT hinted; AND (b) the page carries
+`SIDETRACK_NEW_LABEL_HINT`-gated (default ON), so a keyword-store hiccup or
+an explicit disable costs nothing (`newLabelHintForPage` never throws, and
+the flag check happens before any store handle opens). `name` is the top-3
+keywords joined (same convention `splitSuggestionEngine.ts`'s
+`keywordNameFor` uses for cluster naming, applied here to one page's own
+terms). Lazy per-vault `KeywordIndexStore` singleton — a THIRD independent
+production caller of that store (after `keywordIngest.ts` and
+`workstreamSuggestionsRoutes.ts`), same "no shared singleton across
+modules" idiom.
+
+**Decline-exclusion, load-bearing, reused not reinvented.**
+`declineMemory.ts`'s own header documents the EXACT live bug this hint
+could have reintroduced: `gate.reason === 'no-candidates'` ALSO fires for a
+URL the user explicitly declined ("not in any stream"), and
+`applyLaneFallbackGuess`/`applyLaneCorroboration` both learned the hard way
+that re-suggesting on a declined page reads the decline as an invitation.
+The new-label-hint attachment in `finalizeBatchResolveResults` applies the
+SAME `isUrlDeclined(laneContext.declines, canonicalUrl)` guard those two
+lanes use, before ever reaching the keyword lookup — a page the user
+declined never gets a "make a new category" prompt either.
+
+Self-sufficiency note: `newLabelHintForPage`'s handle-opening `mkdir -p`s
+`_BAC/connections` itself (same defensive fix already applied to
+`scheduleKeywordBackfillLoop` above) — harmless in production (boot always
+creates that directory long before the HTTP listener starts accepting
+requests) but caught a real race in the new route-level tests against a
+freshly-created test vault.
+
+**Tests:**
+- `tabsession/newLabelHint.test.ts` (new) — pure `computeNewLabelHint`
+  (null below the 2-keyword floor, top-3 naming, full keyword list
+  preserved); env-flag defaults; per-vault lookup (present/absent by
+  indexed-keyword-count, flag-off no-op, lazy-singleton reuse).
+- `http/visitsRoutes.test.ts` (extended, `POST /v1/visits/batch-resolve —
+  newLabelHint` block) — weak lanes (edgeless snapshot, `gate.reason ===
+  'no-candidates'`) + >=2 keywords -> present; a strong existing-workstream
+  match (direct `closest_visit` -> `visit_in_workstream` asserted edge
+  chain, keywords present too, isolating the variable) -> absent; no
+  keywords indexed -> absent even with weak lanes; a declined URL -> absent
+  even with weak lanes + keywords; `SIDETRACK_NEW_LABEL_HINT=0` -> absent
+  for an otherwise-qualifying page.
+
+`bun run build` clean. Full `bun test` for `packages/sidetrack-companion`
+green (see PR for the exact count); the newly-touched suites
+(`splitSuggestionEngine.test.ts`, `splitSuggestionHybridDistance.test.ts`,
+`splitSuggestionNewTopic.test.ts`, `suggestionRecomputeLane.test.ts`,
+`http/workstreamsRoutes.test.ts`, `tabsession/newLabelHint.test.ts`,
+`http/visitsRoutes.test.ts`, `http/server.test.ts`,
+`http/routeTable.characterization.test.ts`,
+`http/batchResolveShape.characterization.test.ts`, `tabsession/
+resolver.test.ts`, `tabsession/laneFallback.test.ts`, `tabsession/
+laneCorroboration.test.ts`, `tabsession/declineMemory.test.ts`,
+`http/resolveSwrRoutes.test.ts`) reran green in isolation.

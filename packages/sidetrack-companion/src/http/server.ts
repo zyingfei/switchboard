@@ -46,7 +46,7 @@ import {
   type AppendContentLaneDeps,
   type ContentLaneStore,
 } from '../tabsession/contentLane.js';
-import { declineMemoryFromMerged, type DeclineLookup } from '../tabsession/declineMemory.js';
+import { declineMemoryFromMerged, isUrlDeclined, type DeclineLookup } from '../tabsession/declineMemory.js';
 import { guessLanesEnabled } from '../tabsession/guessLanes.js';
 import {
   applyLaneCorroboration,
@@ -60,6 +60,7 @@ import {
   type LanePredictionInput,
   type LanePrequentialSummary,
 } from '../tabsession/lanePrequential.js';
+import { newLabelHintEnabled, newLabelHintForPage } from '../tabsession/newLabelHint.js';
 import {
   appendPrototypeLane,
   type AppendPrototypeLaneDeps,
@@ -1020,6 +1021,7 @@ const finalizeBatchResolveResults = async (
   titleHints: ReadonlyMap<string, string>,
   synthesizedTitleFor: (canonicalUrl: string) => string | undefined,
   gistFor: (canonicalUrl: string) => string | undefined,
+  vaultRoot: string,
 ): Promise<void> => {
   const prototypeDeps = prototypeLaneDepsFromContent(contentDeps);
   for (const canonicalUrl of urls) {
@@ -1069,6 +1071,29 @@ const finalizeBatchResolveResults = async (
     // the lanes themselves, this runs AFTER the resolver-cache write, so
     // nothing it produces is ever persisted.
     results[canonicalUrl] = applyLaneDecisions(results[canonicalUrl]!, canonicalUrl, laneContext);
+
+    // New-label hint (SIDETRACK_NEW_LABEL_HINT, default ON —
+    // tabsession/newLabelHint.ts). Checked LAST, against the FINAL
+    // post-lane-decisions result: a page the lane-fallback guess just
+    // rescued is correctly NOT hinted (it found something), and a page the
+    // user explicitly declined ("not in any stream" — see
+    // declineMemory.ts's header on why gate.reason === 'no-candidates'
+    // fires for that case too) is excluded by the SAME isUrlDeclined guard
+    // applyLaneFallbackGuess/applyLaneCorroboration both apply — re-
+    // prompting "make a new category" on a page the user just refused a
+    // category for would read the decline as an invitation, exactly the
+    // live bug declineMemory.ts's header documents for the sibling lanes.
+    if (
+      newLabelHintEnabled() &&
+      !isUrlDeclined(laneContext.declines, canonicalUrl) &&
+      results[canonicalUrl]!.fusedCandidates.length === 0 &&
+      results[canonicalUrl]!.decision.gate?.reason === 'no-candidates'
+    ) {
+      const hint = await newLabelHintForPage(vaultRoot, canonicalUrl);
+      if (hint !== null) {
+        results[canonicalUrl] = { ...results[canonicalUrl]!, newLabelHint: hint };
+      }
+    }
   }
 };
 
@@ -1689,6 +1714,7 @@ export const routes: readonly RouteDefinition[] = [
               titleHints,
               synthesizedTitleFor,
               gistFor,
+              requireVaultRoot(context),
             );
           }
           // One-line timing diag (SIDETRACK_HTTP_LOG=1): the whole content-lane
@@ -1762,6 +1788,7 @@ export const routes: readonly RouteDefinition[] = [
         titleHints,
         synthesizedTitleFor,
         gistFor,
+        requireVaultRoot(context),
       );
       const fallbackPredictions = stampLanePredictionOpportunities(results, uniqueUrls);
       recordLanePredictionsBestEffort(requireVaultRoot(context), fallbackPredictions, requestId);

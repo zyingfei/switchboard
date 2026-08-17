@@ -29,6 +29,7 @@ import {
   type PolicyGate,
 } from './policy.js';
 import { buildSimilarityEvidence } from './similarity.js';
+import type { NewLabelHint } from './newLabelHint.js';
 import type { TabSessionProjection } from './projection.js';
 
 const TAB_SESSION_PREFIX = 'tab-session:';
@@ -485,6 +486,16 @@ export interface UrlResolutionResult {
   // Every lane's own view (SIDETRACK_GUESS_LANES, default ON). Present ⇒ ALWAYS
   // all six lanes in the fixed GUESS_LANE_ORDER; omitted when the flag is off.
   readonly lanes?: readonly GuessLaneResult[];
+  // "Start a new category" affordance data (SIDETRACK_NEW_LABEL_HINT,
+  // default ON — see tabsession/newLabelHint.ts). Attached by
+  // http/server.ts's finalizeBatchResolveResults, NOT here — this module
+  // never populates it itself, the field exists on the type purely as the
+  // wire contract. Present only when NO existing workstream reached
+  // confidence for this page (the SAME "genuinely no confident pick"
+  // condition applyLaneFallbackGuess uses — fusedCandidates empty AND
+  // decision.gate?.reason === 'no-candidates' — decline-excluded the same
+  // way that lane is) AND the page carries >=2 keywords; absent otherwise.
+  readonly newLabelHint?: NewLabelHint;
 }
 
 const urlNegativeSeeds = (input: ResolveUrlAttributionInput): Map<string, number> => {
