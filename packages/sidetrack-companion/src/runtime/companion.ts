@@ -106,6 +106,7 @@ import { enforceRetention } from '../vault/auditRetention.js';
 import { applyGcPlan, buildGcPlan } from '../gc/plan.js';
 import { sweepOrphanGenerations } from '../connections/generationBuffer.js';
 import { schedulePrototypeGenerationLoop } from '../workstreams/prototypeGeneration.js';
+import { scheduleSuggestionRecomputeLoop } from '../workstreams/suggestionRecomputeLane.js';
 import { createVaultWatcher, type VaultChangeEvent, type VaultWatcher } from '../vault/watcher.js';
 import { createVaultWriter } from '../vault/writer.js';
 import { COMPANION_VERSION } from '../version.js';
@@ -750,6 +751,23 @@ export const startCompanion = async (
       hygieneStatus,
     );
     teardown.push(disposePrototypeGeneration);
+
+    // Split/new-topic suggestion recompute (docs/plans/2026-08-16-category-
+    // flexibility-hyde.md §4/§7) — the PRODUCTION caller
+    // recomputeSuggestionCandidates never had (confirmed 2026-08-17): the
+    // engine (PR #376) and its panel UI (PR #384) both existed with nothing
+    // ever invoking it. Reuses the same already-open connectionsStore +
+    // baseEventLog as the prototype-generation loop above; opens its own
+    // small keyword-layer + candidate-store handles (see
+    // suggestionRecomputeLane.ts's header). Idle-cycle cadence, entirely off
+    // the request path; a failed cycle never crashes the companion (the
+    // lane's own try/catch, same discipline as every scheduler here).
+    const disposeSuggestionRecompute = scheduleSuggestionRecomputeLoop(
+      connectionsStore,
+      baseEventLog,
+      options.vaultPath,
+    );
+    teardown.push(disposeSuggestionRecompute);
 
     // Reproject on startup if the projector logic has changed since
     // the last run. Writes a `_BAC/.projector-version` sentinel so

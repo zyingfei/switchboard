@@ -861,3 +861,63 @@ e.g. `entityExtract.test.ts` — fails module resolution under that specific
 config; `tsconfig.build.json`, the actual build gate, excludes all
 `*.test.ts` and is unaffected). See the PR for the full test run and exact
 counts.
+
+**§9 addendum — production recompute scheduler (2026-08-17, same PR).**
+Post-review finding: neither `recomputeSuggestionCandidates` (PR #376) nor
+this PR's own §7 real-data wiring had a PRODUCTION CALLER — confirmed by
+cross-checking PR #384 (panel UI: membership chips, suggestion cards,
+dismiss), whose own landing note states plainly that wiring a recompute
+pass is deferred to "a future PR." Closed the gap in this PR rather than
+leaving it to a third:
+
+- `workstreams/splitEvidence.ts` — sibling adapter to `unfiledEvidence.ts`,
+  turning `prototypeEvidence.ts`'s `gatherWorkstreamEvidence` output into
+  `SuggestionEvidenceItem[]` for `'split'` mode (same "embeddings optional,
+  deferred" contract, same most-recent-first population cap).
+- `workstreams/suggestionRecomputeLane.ts` — the scheduler.
+  `computeSuggestionEvidenceRevision` hashes one scope's evidence
+  (member ids + keyword sets, order-independent) into the `revisionId`
+  `recomputeSuggestionCandidates` already dirty-marks against — the SAME
+  `"<count>:<sha256>"` shape `prototypeGeneration.ts`'s `evidenceWatermark`
+  uses. `runSuggestionRecomputeCycle` covers BOTH kinds in one bounded pass
+  (every workstream with ≥1 filed page for `'split'`, plus the always-
+  considered vault-wide unfiled pool for `'new-category'`), bounding
+  ACTUAL re-clustering (not cheap dirty-checks) to `batchCap` scopes/cycle.
+  `createSuggestionRecomputeLane` self-schedules (fast poll while backlog
+  remains, slow poll once caught up), and
+  `scheduleSuggestionRecomputeLoop(connectionsStore, eventLog, vaultRoot)`
+  is the actual production entry point — wired into
+  `runtime/companion.ts` immediately after `schedulePrototypeGenerationLoop`
+  (same disposer-into-`teardown[]` contract), reusing the SAME already-open
+  `connectionsStore`/`baseEventLog`, opening its own small keyword-layer +
+  candidate-store handles.
+- **Wiring `runtime/companion.ts` directly** (not left "ready to splice,"
+  unlike this PR's other schedulers) is itself a deviation worth naming:
+  the original plan deferred touching that file because a sibling branch's
+  active-file list (checked 2026-08-16) included `runtime/*`. Re-checked
+  2026-08-17 against PR #384's ACTUAL diff (the authoritative, current
+  state, not the earlier snapshot) — it touches
+  `splitSuggestionEngine.ts`/`suggestionCandidateStore.ts` (a real,
+  expected merge-conflict surface, see below) but NOT `runtime/*`,
+  `page-evidence/*`, or `generationBuffer.ts`. With that risk gone and the
+  coordinator flagging "no caller = the whole feature stays dead" as
+  blocking, wiring in directly was the right call.
+- **Known merge-conflict surface, flagged rather than avoided**: PR #384
+  ALSO adds a per-fingerprint `dismissed`/`dismissedAtMs` field to
+  `SuggestionCandidateRecord` (sticky across recomputes via the engine's
+  existing Jaccard member-overlap match) — a DIFFERENT, complementary
+  decline mechanism from this PR's population-scoped, concept-overlap
+  `declineCandidate`/`declinedConceptSets` (§7). The two key differently
+  (exact/overlapping MEMBER ids vs. CONCEPT ids) and can coexist without
+  contradiction; whoever merges second should keep BOTH additive column
+  sets on `suggestionCandidateStore.ts`'s schema and BOTH suppression
+  checks in `recomputeSuggestionCandidates`, not pick one.
+- Tests: `splitEvidence.ts` reuses `unfiledEvidence.ts`'s already-tested
+  join/bound shape (no separate suite); `suggestionRecomputeLane.test.ts`
+  covers dirty-marking (unchanged evidence -> skipped, changed evidence ->
+  re-clustered), `batchCap` bounding across multiple cycles without
+  dropping backlog, both kinds populating the store in one real
+  (non-mocked) end-to-end cycle, and per-scope failure isolation.
+  `runtime/companion.ts`'s own boot/shutdown suite
+  (`runtime/companion.test.ts`) passes unchanged with the new scheduler
+  wired in.
