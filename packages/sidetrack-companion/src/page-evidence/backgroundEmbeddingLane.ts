@@ -155,7 +155,7 @@ export interface BackgroundEmbeddingLaneConfig {
 }
 
 export const DEFAULT_BACKGROUND_EMBEDDING_CONFIG: BackgroundEmbeddingLaneConfig = {
-  batchCap: 8,
+  batchCap: 16,
   cycleIntervalMs: 4_000,
   idleIntervalMs: 60_000,
   maxAttemptsPerRecord: 3,
@@ -163,6 +163,44 @@ export const DEFAULT_BACKGROUND_EMBEDDING_CONFIG: BackgroundEmbeddingLaneConfig 
   // tight loop, short enough that a warmup-race victim recovers within a
   // session instead of staying dead for 90 min.
   quarantineCooldownMs: 30 * 60_000,
+};
+
+// SIDETRACK_EMBED_BATCH (2026-08-17) — override the per-cycle visit cap.
+//
+// WHY 16, not the old default of 8: this cap used to bound the DISK WRITE
+// COST of a cycle too, because every embedded record's completion path did
+// TWO full-file rewrites of the shared embed cache (chunk vectors + doc
+// vector) — see embeddingCache.ts's WRITE PATH note. Doubling the batch cap
+// under the OLD write path would have doubled the traced ~350MB/min disk
+// write rate. Now that the cache writes are O(batch) appends instead of
+// O(cache-size) rewrites (same change, same date), the batch cap is free to
+// track only the real constraint: per-record embed latency (~4s on the
+// Apple FM engine; see docs/plans/2026-08-15-foundation-program.md and the
+// on-device-engines memory note) against how long the lane may hold a
+// cycle before yielding to a drain-active check (the loop re-checks
+// `isDrainActive` BETWEEN records, so a larger cap costs at most one more
+// ~4s record of drain latency, not the whole batch). At batchCap=16 and
+// ~4s/embed that is a ~64s worst-case cycle — acceptable because drain
+// pauses are checked per-record, not per-cycle. A 2,102-item backlog at
+// 16/cycle (vs. the observed ~1 real embed/cycle) drains in hours, not
+// days. Bounds: [1, 64] — 64 as a sanity ceiling against a misconfigured
+// value pegging the embedder child for minutes at a time.
+const MIN_EMBED_BATCH = 1;
+const MAX_EMBED_BATCH = 64;
+
+/** Parse SIDETRACK_EMBED_BATCH (or any raw string) into a valid batchCap.
+ *  Unset/blank/non-numeric/non-positive → the default. Out-of-range values
+ *  clamp rather than error — a bad env var should degrade, not crash boot. */
+export const resolveEmbedBatchCapFromEnv = (
+  raw: string | undefined,
+  fallback: number = DEFAULT_BACKGROUND_EMBEDDING_CONFIG.batchCap,
+): number => {
+  if (raw === undefined) return fallback;
+  const trimmed = raw.trim();
+  if (trimmed.length === 0) return fallback;
+  const parsed = Number(trimmed);
+  if (!Number.isFinite(parsed) || parsed <= 0) return fallback;
+  return Math.min(MAX_EMBED_BATCH, Math.max(MIN_EMBED_BATCH, Math.floor(parsed)));
 };
 
 export interface BackgroundEmbeddingProgress {

@@ -1804,3 +1804,125 @@ this task's binding constraint (verified by re-reading it, never edited).
 
 PR: perf(store): in-place publishes for the child-writer drain channel
 (branch `perf/in-place-child-drain`).
+
+**2026-08-17 — disk-wear addendum: embed-cache write amplification killed
++ embed lane batched (perf/embed-cache-write-amp).** Not an F1–F7 item;
+filed here per the "binding plan tracks reality" rule — same disk-wear
+theme as F1's log compaction, different chokepoint.
+
+*Traced evidence (user, 60s fs trace on the test companion, 2026-08-16/17).*
+~350MB/min of writes, dominated by two paths: `_BAC/recall/v2/index.sqlite`
+(+WAL) and `_BAC/recall/embed-cache.*`. `embed-cache.bin` was 14MB live; the
+page-evidence background embed lane (unblocked the day before by #382) was
+draining a 2,102-item backlog. Hypothesis to verify: the embed cache was
+being fully rewritten every cycle.
+
+*Verified write pattern.* Confirmed by reading `embeddingCache.ts`: `put`/
+`putMany` read the WHOLE cache file, mutated one in-memory `Map`, then did a
+tmp-write + atomic rename of the ENTIRE map back to disk — on every call,
+regardless of batch size. `page-evidence/embedding.ts`'s
+`writePageEvidenceDocEmbedding` called the cache TWICE per embedded page
+(once via `putMany` for the chunk vectors, once via `put` for the doc
+vector), so one embedded record cost TWO full-file rewrites: O(cache-size)
+disk I/O to persist O(1) new data. Confirmed by a timed fixture
+(`createEmbeddingCache` + 2,102 sequential single-entry `put` calls,
+matching the traced backlog size): the OLD read-modify-full-rewrite design
+would have written **~3,381MB total** to land a 3.22MB final cache (the sum
+of the file's size after every write, since every write rewrote the whole
+file) — a live measurement of the quadratic-in-entries shape, not an
+estimate. Separately checked `_BAC/recall/v2/index.sqlite`
+(`recall-v2/store/sqlite.ts`, not modified — owned by another in-flight
+agent): `journal_mode = WAL` + prepared per-row `INSERT`/upsert statements
+for `upsertDocument`/`upsertVector`/`upsertChunkVector`, no full-table
+rewrite or reindex on the write path. That store's contribution to the
+traced volume is legitimate O(work) (one embed → one row upsert, WAL pages
+only the changed page) scaling with embed throughput, not a second
+amplification bug — left untouched.
+
+*Chosen design: append-only log + threshold-triggered compaction*, not a
+new file format or a migration. The on-disk record format (`u32 headerLen +
+JSON header`, then repeated `u32 hashLen + hash + dim*float32` records) was
+already safe for a duplicate-key log — the read path folds records into a
+`Map` sequentially, so a later record for the same hash already overwrote
+an earlier one in memory. That meant zero migration: `put`/`putMany` now
+APPEND only the incoming batch's encoded bytes when the on-disk model
+identity is unchanged (one `appendFile` of just the new records); a first
+write or a model-identity change still does a full rewrite, but of a fresh
+(small) map, which was never the expensive path. Superseded on-disk records
+(re-embeds, `migrateModel` runs) are tracked as accumulating "stale bytes"
+per cache path; once they cross `compactionStaleBytesThreshold` (default
+2MB), the next write compacts instead of appending, reclaiming the dead
+space — the "periodic compaction" the file's own docstring had named as a
+TODO for years. Crash safety: an append is not a single atomic rename, so
+`readCacheFileUncached` now treats an incomplete trailing record (not
+enough bytes left in the file for one more full record) as end-of-file
+instead of discarding the whole parse — every record fully written before a
+crash is still read back; the worst case is re-embedding the last in-flight
+batch, acceptable because this file is a CACHE (the lifecycle rebuilds the
+index from source content, never from this file). Two design options
+offered by the task (batched write-behind; migrate to a small sqlite table)
+were not chosen: write-behind would still write O(cache-size) per flush,
+just less often (a constant-factor win, not the asymptotic fix the
+`entries=N, NOT 20×file-size` acceptance bar calls for); a sqlite migration
+would have meant touching schema/dependency surface for no gain once the
+append design was available for free from the existing format.
+
+*Batching.* The lane's default `batchCap` (visits per 4s cycle) raised
+8 → 16, and made overridable via `SIDETRACK_EMBED_BATCH` (env, clamped to
+[1, 64], degrades to the default on unset/blank/non-numeric/≤0 rather than
+failing boot) — see `resolveEmbedBatchCapFromEnv` in
+`backgroundEmbeddingLane.ts`. Raising the cap was unsafe under the OLD
+write path (it would have linearly multiplied the ~350MB/min rate); safe
+now that a cache write costs O(batch), not O(cache-size). At 16/cycle and
+the Apple-engine ~4s/embed cost (see the on-device-engines memory note),
+worst-case cycle latency is ~64s, acceptable because the lane re-checks
+`isDrainActive` between records (a larger cap costs at most one more
+record of drain latency, not the whole batch). A 2,102-item backlog at
+16/cycle (vs. the previously observed ~1 real embed/cycle) drains in hours,
+not days.
+
+*Audibility.* `embeddingCache.ts` gained an optional throttled `log` hook
+(`options.log`, default no-op, following the same DI convention as the
+background-embedding lane) emitting `[embed-cache] flushed entries=N
+bytes=M kind=append|compact path=…` — pending entries/bytes accumulate
+across throttled-away flushes so the line is never missing volume, only
+coalesced. Wired to stdout at the traced hot path
+(`page-evidence/embedding.ts`'s two `createEmbeddingCache` call sites), not
+at the low-level module's default — `embeddingCache.ts` has too many
+scattered callers across the codebase (`vectorCorpus.ts`,
+`connections/visitSimilarity.ts`, `sync/contract/recallMaterializer.ts`,
+`recall-v2/store/backfill.ts`) to default all of them to stdout without a
+much larger, out-of-scope plumbing change; noted here as a deliberate
+deviation rather than a silent gap.
+
+*Test-companion maintenance.* `docs/runbooks/sidetrack-companion-
+maintenance.sh` §1 (restart-on-mem/uptime) covered only the daily companion
+(:17373); the test companion (:17374) had zero automatic restart coverage —
+live footprint measured 2,488M on 2026-08-15 with nothing to catch it. §1
+is now a shared `check_and_restart_companion` function applied to both
+companions with identical `MEM_LIMIT_MB=3000` / `MAX_UPTIME_DAYS=2`
+thresholds. Per the file's existing sync convention (see its "NOT YET
+SYNCED" header note): the coordinator copies the changed sections into the
+live launchd script at `$HOME/.sidetrack-companion-maintenance.sh` at
+deploy time — this PR only changes the repo copy.
+
+*Verification.* New `embeddingCacheWriteAmplification.test.ts`: write-
+volume regression (20 puts after a 200-entry baseline write far less than
+20× the file size, and a single put after a 500-entry cache writes ~1
+record, not the whole file), compaction reclaims space once the stale-byte
+threshold is crossed, throttled-log format + coalescing, and two crash-
+safety cases (truncated trailing record recovers all prior entries without
+throwing; truncated header degrades to an absent cache, not a throw — both
+still writable afterward). `resolveEmbedBatchCapFromEnv` covered directly
+in `backgroundEmbeddingLane.test.ts` (defaults, clamping, fractional
+flooring, custom fallback). Existing `embeddingCache.test.ts`,
+`vectorCorpus.test.ts` (`migrateModel`/`rollbackMigration`, unchanged —
+still full-rewrite, used rarely), `embeddingCacheReuse.test.ts`, and
+`backgroundEmbeddingLaneThroughput.test.ts` all pass unmodified against the
+new write path. `src/recall-v2/store/sqlite.ts`,
+`src/tabsession/prototypeLane.ts`, and
+`src/sync/contract/connectionsMaterializer.ts` untouched, per this task's
+binding constraint.
+
+PR: perf(recall): O(delta) embed-cache writes + batched embed lane +
+test-companion maintenance (branch `perf/embed-cache-write-amp`).

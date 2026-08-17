@@ -20,6 +20,16 @@ const defaultEmbed: PageEvidenceEmbedder = async (texts) =>
 
 const MAX_EMBED_TEXT_CHARS = 100_000;
 
+// Audibility (2026-08-17): this module is the hot path the disk-wear trace
+// pointed at (the background embed lane calls writePageEvidenceDocEmbedding
+// once per backlog record). embeddingCache.ts itself defaults its flush log
+// to a no-op — the low-level module has too many scattered callers across
+// the codebase to default to stdout there — so the caller that matters for
+// write-volume attribution wires it explicitly here.
+const embeddingCacheLog = (message: string): void => {
+  process.stdout.write(`${message}\n`);
+};
+
 const embeddingDisabled = (): boolean => {
   const raw = process.env['SIDETRACK_PAGE_EVIDENCE_DOC_EMBEDDINGS'];
   return raw === '0' || raw?.toLowerCase() === 'false';
@@ -124,7 +134,7 @@ const embedChunksThroughSharedCache = async (
   const model = VECTOR_CORPUS_MODEL_KEY;
   let cache: ReturnType<typeof createEmbeddingCache> | null = null;
   try {
-    cache = createEmbeddingCache(vaultRoot, ref.dimensions);
+    cache = createEmbeddingCache(vaultRoot, ref.dimensions, { log: embeddingCacheLog });
     await cache.migrateModel(LEGACY_VECTOR_CACHE_MODEL_KEY, VECTOR_CORPUS_MODEL_KEY);
   } catch {
     cache = null;
@@ -201,7 +211,7 @@ export const writePageEvidenceDocEmbedding = async (
     canonicalUrl: payload.canonicalUrl,
     contentHash: payload.content.contentHash,
   });
-  const cache = createEmbeddingCache(vaultRoot, ref.dimensions);
+  const cache = createEmbeddingCache(vaultRoot, ref.dimensions, { log: embeddingCacheLog });
   const existing = await cache.get({
     ...VECTOR_CORPUS_MODEL_KEY,
     embedTextHash: ref.vectorId,

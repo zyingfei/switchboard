@@ -4,6 +4,7 @@ import {
   DEFAULT_BACKGROUND_EMBEDDING_CONFIG,
   createBackgroundEmbeddingLane,
   isBackgroundEmbeddingBacklog,
+  resolveEmbedBatchCapFromEnv,
   type BackgroundEmbeddingCandidate,
   type BackgroundEmbeddingLaneDeps,
 } from './backgroundEmbeddingLane.js';
@@ -591,5 +592,46 @@ describe('createBackgroundEmbeddingLane audible failures', () => {
     );
     const result = await lane.runOnce();
     expect(result.failedByReason).toEqual({ threw: 1 });
+  });
+});
+
+// SIDETRACK_EMBED_BATCH — env override for the per-cycle batch cap. Raising
+// this was safe only AFTER the embed-cache write path stopped rewriting the
+// whole cache file per record (embeddingCache.ts's append-only design);
+// this suite just proves the env parsing/clamping is correct, independent
+// of the write-path fix (covered in embeddingCacheWriteAmplification.test.ts).
+describe('resolveEmbedBatchCapFromEnv', () => {
+  it('defaults to the lane default when unset, blank, or non-numeric', () => {
+    expect(resolveEmbedBatchCapFromEnv(undefined)).toBe(
+      DEFAULT_BACKGROUND_EMBEDDING_CONFIG.batchCap,
+    );
+    expect(resolveEmbedBatchCapFromEnv('')).toBe(DEFAULT_BACKGROUND_EMBEDDING_CONFIG.batchCap);
+    expect(resolveEmbedBatchCapFromEnv('   ')).toBe(DEFAULT_BACKGROUND_EMBEDDING_CONFIG.batchCap);
+    expect(resolveEmbedBatchCapFromEnv('not-a-number')).toBe(
+      DEFAULT_BACKGROUND_EMBEDDING_CONFIG.batchCap,
+    );
+  });
+
+  it('honors a valid in-range value', () => {
+    expect(resolveEmbedBatchCapFromEnv('4')).toBe(4);
+    expect(resolveEmbedBatchCapFromEnv('32')).toBe(32);
+  });
+
+  it('floors fractional values', () => {
+    expect(resolveEmbedBatchCapFromEnv('12.7')).toBe(12);
+  });
+
+  it('degrades zero/negative values to the default rather than disabling the lane', () => {
+    expect(resolveEmbedBatchCapFromEnv('0')).toBe(DEFAULT_BACKGROUND_EMBEDDING_CONFIG.batchCap);
+    expect(resolveEmbedBatchCapFromEnv('-5')).toBe(DEFAULT_BACKGROUND_EMBEDDING_CONFIG.batchCap);
+  });
+
+  it('clamps an out-of-range value to [1, 64] instead of erroring', () => {
+    expect(resolveEmbedBatchCapFromEnv('9999')).toBe(64);
+    expect(resolveEmbedBatchCapFromEnv('0.4')).toBe(1);
+  });
+
+  it('a custom fallback is used instead of the lane default', () => {
+    expect(resolveEmbedBatchCapFromEnv(undefined, 5)).toBe(5);
   });
 });
