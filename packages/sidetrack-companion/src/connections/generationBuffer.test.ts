@@ -24,6 +24,7 @@ import {
   sweepOrphanGenerations,
   withPublishLock,
   writePointer,
+  type SqliteLikeDb,
 } from './generationBuffer.js';
 
 const sqliteIt = process.versions['bun'] === undefined ? it.skip : it;
@@ -307,6 +308,9 @@ describe('generationBuffer', () => {
 
   // reconcileLegacyToPublished (blocker: rollback): refreshes current.db from
   // the latest published gen so a downgrade serves the CURRENT graph.
+  const openReadwrite = (path: string): SqliteLikeDb =>
+    new Database(path, { readwrite: true }) as unknown as SqliteLikeDb;
+
   sqliteIt('reconcileLegacyToPublished refreshes current.db from the published gen', async () => {
     dir = await mkdtemp(join(tmpdir(), 'genbuf-reconcile-'));
     // A frozen legacy seed (what current.db held at migration time).
@@ -319,15 +323,62 @@ describe('generationBuffer', () => {
     genDb.close();
     writePointer(dir, genNew);
 
-    const from = reconcileLegacyToPublished(dir);
+    const from = reconcileLegacyToPublished(dir, openReadwrite);
     expect(from).toBe(genNew);
     // current.db now reflects the published gen, not the stale seed. The legacy
     // store opens current.db READWRITE (its role is writable), so it can create
     // the -shm a copied WAL-mode db needs — read it back the same way.
     expect(readMarker(join(dir, 'current.db'), false)).toBe('served-new');
-    // Idempotent: a second call on the unchanged pointer is a no-op.
-    expect(reconcileLegacyToPublished(dir)).toBeNull();
+    // Idempotent: a second call on genuinely unchanged content is a no-op.
+    expect(reconcileLegacyToPublished(dir, openReadwrite)).toBeNull();
   });
+
+  // 2026-08-16 (in-place child-drain channel widening) regression: under
+  // in-place publish the SAME gen id can receive many publishes, each
+  // potentially leaving content committed to its -wal sidecar but not yet
+  // folded into the main .db file (in-place publish defers its own
+  // checkpoint). A raw copyFileSync of the main file alone — the pre-
+  // widening implementation — would silently serve STALE content on
+  // downgrade. This proves reconcileLegacyToPublished (a) checkpoints the
+  // source before copying, so an un-checkpointed in-place write IS picked
+  // up, and (b) does NOT treat a repeat call against the SAME gen id as a
+  // no-op once that gen's content has changed again.
+  sqliteIt(
+    'reconcileLegacyToPublished picks up in-place content changes on the SAME gen id (not stale, not falsely idempotent)',
+    async () => {
+      dir = await mkdtemp(join(tmpdir(), 'genbuf-reconcile-inplace-'));
+      const gen = composeGenId(1, 'inplace');
+      const genPath = generationDbPath(dir, gen);
+      seedDb(genPath, 'v1');
+      const seedHandle = new Database(genPath, { readwrite: true });
+      checkpointTruncate(seedHandle);
+      seedHandle.close();
+      writePointer(dir, gen);
+
+      const first = reconcileLegacyToPublished(dir, openReadwrite);
+      expect(first).toBe(gen);
+      expect(readMarker(join(dir, 'current.db'), false)).toBe('v1');
+
+      // An in-place-style write on the SAME gen id: a WAL-mode connection
+      // commits a change WITHOUT checkpointing (mirrors #acquireInPlaceWriteHandle
+      // deferring its own checkpoint) — the main .db file alone is now stale
+      // relative to its own -wal sidecar.
+      const writer = new Database(genPath, { readwrite: true });
+      writer.exec('PRAGMA journal_mode = WAL;');
+      writer.query("UPDATE metadata SET data = 'v2' WHERE key = 'marker'").run();
+      writer.close(); // closes WITHOUT a checkpoint — content lives in -wal
+
+      // Same gen id, but the content changed — must NOT be treated as a
+      // stale no-op, and must reflect v2 (proving the pre-copy checkpoint
+      // picked up the un-checkpointed write).
+      const second = reconcileLegacyToPublished(dir, openReadwrite);
+      expect(second).toBe(gen);
+      expect(readMarker(join(dir, 'current.db'), false)).toBe('v2');
+
+      // Idempotent again once nothing further changed.
+      expect(reconcileLegacyToPublished(dir, openReadwrite)).toBeNull();
+    },
+  );
 
   // -------------------------------------------------------------------------
   // Cross-process in-flight shadow markers (the 2026-07-29 "disk I/O error" P0).
