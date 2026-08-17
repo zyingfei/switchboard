@@ -104,13 +104,18 @@ import { createTimelineStore } from '../timeline/projection.js';
 import { createVaultWriter } from '../vault/writer.js';
 
 // Extension's REAL wire-adjacent code — see the provenance note above.
+// `.js` specifiers pointing at `.ts` source, matching this package's own
+// node16/nodenext moduleResolution convention (every other import in this
+// file does the same, e.g. `from '../http/server.js'`) — Bun resolves
+// `.js` -> sibling `.ts` the same way across a package boundary as within
+// one (verified: `bun test` resolves these cleanly).
 import {
   PRIORITY_STREAMS,
   partitionEdgeEventDrainBatch,
-} from '../../../sidetrack-extension/src/background/storage/edge-event-drain.ts';
-import type { BufferedEvent } from '../../../sidetrack-extension/src/background/storage/in-memory-event-buffer.ts';
-import { createPageContentClient } from '../../../sidetrack-extension/src/companion/pageContentClient.ts';
-import type { PageContentExtractedPayload } from '../../../sidetrack-extension/src/companion/pageContentClient.ts';
+} from '../../../sidetrack-extension/src/background/storage/edge-event-drain.js';
+import type { BufferedEvent } from '../../../sidetrack-extension/src/background/storage/in-memory-event-buffer.js';
+import { createPageContentClient } from '../../../sidetrack-extension/src/companion/pageContentClient.js';
+import type { PageContentExtractedPayload } from '../../../sidetrack-extension/src/companion/pageContentClient.js';
 
 const CANONICAL_URL = 'https://spine.test/article';
 const PAGE_TITLE = 'Cross-package CI spine fixture article';
