@@ -1257,29 +1257,80 @@ of whether the BLENDED score cleared the contrast-margin gate, because the
 whole point is measuring whether each source alone would have been right
 even on pages the blend called too close.
 
-**Deviation, stated plainly — ready-to-splice, not live-wired.** Two request-
-scoped inputs (`pageConceptIds` — the page's own resolved concept ids;
-`canonicalUrl`/`vaultRoot` — for per-source recording) are additive,
-OPTIONAL fields on `BuildPrototypeLaneInput`/`AppendPrototypeLaneDeps`,
-fully implemented and fully tested by calling `buildPrototypeLane`/
-`appendPrototypeLane` directly with them populated — but `http/server.ts`'s
-ONE live call site (`finalizeBatchResolveResults`, line ~1061) is NOT
-updated to pass them in this PR. This mirrors the exact "ready-to-splice"
-precedent this doc's own §8/§10 landing notes already established twice for
-an identical situation (a feature complete and tested, deferred from a
-shared/concurrently-active file): here, `server.ts` is not on the flagged
-concurrent-branch file list, but touching it is still a coordination risk
-this task's own brief asked to avoid ("any shared-file need flagged, not
-edited"). The follow-up splice is three lines: thread `canonicalUrl` and
-`vaultRoot` into the existing `appendPrototypeLane(result, { title, gist },
-prototypeDeps)` call, and compute `pageConceptIds` via
-`keywordIndexStore.keywordsForPage` + `keywordConceptStore.conceptIdsForKeywords`
-before it. The recall-v2 STORE HANDLE itself needs no server.ts change at
-all — `PrototypeLaneStore`'s interface gained the keyword-profile read
-methods as OPTIONAL members, and the SAME concrete `SqliteRecallStore`
-instance `contentDeps.store` already casts to `PrototypeLaneStore`
-satisfies the wider shape automatically once `sqlite.ts` implements them
-(which it does, in this PR).
+**Revision (2026-08-17): live-wired, not deferred.** The first version of
+this landing note deferred `http/server.ts`'s call site as "ready-to-splice"
+— reasoned as a coordination-risk avoidance, mirroring this doc's own §8/§10
+precedent for a file another branch was actively editing. That reasoning did
+not hold up under review: unwired-but-fully-tested machinery has a live
+track record in this exact program of shipping dead (the keyword backfill
+lane, the suggestion-recompute lane, and the membership-chips surface all
+landed fully tested and then sat unreachable in production until a
+follow-up PR noticed and wired them — three separate incidents, not one).
+`server.ts` was also never actually on the flagged concurrent-branch file
+list (`companion.ts`/`visitsRoutes.ts`/`splitSuggestionEngine.ts`/
+`keywordBackfillLane.ts`/panel — server.ts is none of these), so the
+deferral was avoiding a risk that did not exist. Wired for real, same PR:
+
+- `finalizeBatchResolveResults` (`server.ts`) and its helper
+  `prototypeLaneDepsFromContent` both gained a `vaultRoot: string` parameter
+  (both of `finalizeBatchResolveResults`'s call sites already had
+  `requireVaultRoot(context)` in scope for other reasons — a one-line
+  addition at each). Inside the per-URL loop, `appendPrototypeLane`'s input
+  now carries the real `canonicalUrl`, and `pageConceptIds` is resolved via
+  a new cached-only peek, `peekPrototypeKeywordConceptIds(vaultRoot,
+  canonicalUrl)`.
+- **New**: `workstreams/prototypeKeywordLaneLookup.ts` — a request-time
+  keyword-concept lookup cache mirroring `recall-v2/pipeline.ts`'s
+  `peekRecallV2Store`/`warmRecallV2Store` pattern EXACTLY (module-level
+  cache keyed by vaultRoot, `warmPrototypeKeywordLayer` opens
+  fire-and-forget, `peekPrototypeKeywordConceptIds` never opens a fresh
+  handle on the request path — a cold-start resolve degrades to
+  `pageConceptIds: undefined`, pure vector scoring, until the layer warms
+  and the next resolve finds it, the identical "next one finds the handle"
+  contract every other lane-side store cache in this codebase already
+  uses). `prototypeLaneDepsFromContent` calls `warmPrototypeKeywordLayer`
+  on every invocation (idempotent no-op once warm), the same warm-on-miss
+  idiom `buildContentLaneDeps` already uses for the recall-v2 store.
+  (A near-identical per-request keyword-store-caching precedent already
+  existed in `http/routes/workstreamSuggestionsRoutes.ts`'s `ensureHandles`
+  — confirmed independently during review — so this is not a novel pattern
+  for this codebase, just a second instance of an established one.)
+- The recall-v2 STORE HANDLE itself needed no server.ts change —
+  `PrototypeLaneStore`'s interface gained the keyword-profile read methods
+  as OPTIONAL members, and the SAME concrete `SqliteRecallStore` instance
+  `contentDeps.store` already casts to `PrototypeLaneStore` satisfies the
+  wider shape automatically.
+
+**Proof, not just unit tests on the modules.** New
+`http/prototypeLaneWiring.test.ts` — a route-level integration test using
+the same real in-process `createCompanionHttpServer`/`startHttpServer`
+harness `batchResolveShape.characterization.test.ts` established for the
+sqlite-store resolve path. It seeds the keyword-index/concept stores and a
+medoid prototype + keyword profile directly into the vault (through the
+SAME module-level singleton caches — `recall-v2/pipeline.ts`'s
+`storeCache`, `prototypeKeywordLaneLookup.ts`'s `cache` — the production
+route reads, not a mocked store injected into the route's own dependency
+graph), fires a real `POST /v1/visits/batch-resolve`, and asserts on:
+(1) the served `prototype` lane candidate's `why` string names the matched
+concept (`"...matches duckdb from this workstream's pages"`) — provable
+only if `pageConceptIds` reached `buildPrototypeLane` through a REAL
+`peekPrototypeKeywordConceptIds` call inside the route handler; (2) a
+`prototype:medoid` AND a `prototype:keyword` prediction land in the real
+`lane-prequential.jsonl` on disk, keyed to the real canonical URL — provable
+only if the route threaded the real `canonicalUrl`/`vaultRoot` into
+`appendPrototypeLane`'s deps. Uses the deterministic test embedder
+(`SIDETRACK_TEST_EMBEDDER=1`, `recall/embedder.ts`) so the seeded prototype
+vector and the live query embed are guaranteed bit-identical (cosine
+similarity exactly 1.0) with no ONNX load and no fragile "close enough"
+tuning. One environment-specific catch, worth naming for future test
+authors: `bun:sqlite`'s `setCustomSQLite` (the call that makes sqlite-vec
+available at all — `recall-v2/store/setup-sqlite.ts`) can only run once per
+process and must be triggered by an early import; a standalone run of this
+file without that import reports "vector backend unavailable" even with
+correct data seeded (harmless in a full suite run, where an earlier test
+file happens to trigger it first) — fixed by importing
+`setup-sqlite.ts`'s `installCustomSqlite` at the top of the new test file,
+the same precedent two existing recall-v2 store tests already use.
 
 **§5 — regeneration, no manual migration.**
 `PROTOTYPE_EMBEDDING_SCHEMA_VERSION` bumped 1→2. `WorkstreamGenerationState`
@@ -1327,7 +1378,10 @@ this phase's changes cannot affect it.
 `workstreams/prototypeMedoids.ts`+`.test.ts`,
 `workstreams/prototypeKeywordProfile.ts`+`.test.ts`,
 `workstreams/prototypeKeywordProfileBuild.ts`+`.test.ts`,
-`workstreams/prototypeContrastMargin.ts`+`.test.ts`. MODIFIED —
+`workstreams/prototypeContrastMargin.ts`+`.test.ts`,
+`workstreams/prototypeKeywordLaneLookup.ts`+`.test.ts` (the live request-time
+keyword-lookup cache), `http/prototypeLaneWiring.test.ts` (the route-level
+integration proof). MODIFIED —
 `workstreams/events.ts` (additive `angle`/`sourceMemberUrl` fields),
 `workstreams/prototypeGeneration.ts` (medoid tier, expansion-tier rewrite,
 version-bump dirty-marking, keyword-profile tick wiring),
@@ -1339,19 +1393,37 @@ production API), `workstreams/prototypeStatus.test.ts` (fixture gained
 `tabsession/lanePrequential.ts` (additive `recordRawLanePredictions`),
 `tabsession/prototypeLane.ts` (angle-bucketed aggregation, keyword blend,
 contrast-margin gate, per-source recording, richer why-strings),
-`tabsession/prototypeLane.test.ts` (rewritten + extended). NOT touched, as
-scoped: `companion.ts`, `visitsRoutes.ts`, `splitSuggestionEngine.ts`,
-`keywordBackfillLane.ts`, any panel/extension file, `http/server.ts` (the
-one deferred, documented splice above).
+`tabsession/prototypeLane.test.ts` (rewritten + extended), `http/server.ts`
+(`finalizeBatchResolveResults`/`prototypeLaneDepsFromContent` gained
+`vaultRoot`; the `appendPrototypeLane` call site now passes real
+`canonicalUrl`/`pageConceptIds` — see the live-wiring revision above). NOT
+touched, as scoped: `companion.ts`, `visitsRoutes.ts`,
+`splitSuggestionEngine.ts`, `keywordBackfillLane.ts`, any panel/extension
+file.
 
-Full `bun test`: **3626 pass / 8 skip / 0 fail** across 3634 tests, 399
-files (164s). `npm run build` (`tsc -p tsconfig.build.json`) clean. Bun
-itself (v1.3.14) panics with a C++ exception on process EXIT after the test
-summary already printed "0 fail" — the SAME pre-existing engine-level crash
-this doc's own §8 landing note documented ("this indicates a bug in Bun, not
-your code"), not a test failure and not caused by this phase. This phase's
-own new/changed suites (`prototypeMedoids.test.ts`,
+Full `bun test` (post-wiring, final run): **3631 pass / 8 skip / 0 fail**
+across 3639 tests, 401 files (175s) — 5 more passing tests and 2 more files
+than the pre-wiring run (3626/399), exactly matching the 5 new tests /
+2 new files this wiring phase added
+(`prototypeKeywordLaneLookup.test.ts` ×4, `http/prototypeLaneWiring.test.ts`
+×1). `npm run build` (`tsc -p tsconfig.build.json`) clean throughout,
+including after the wiring change. One transient log line worth naming so a
+future reader does not mistake it for a real failure: the connections
+materializer suite logs `[connections] drain failed: disk full` /
+`catchUp failed: disk full` mid-run — a DELIBERATE fault-injection case in
+that suite (unrelated to this phase), not an actual disk-space exhaustion;
+confirmed via `df -h` showing 8.4GB stably free throughout the run, and the
+final tally is 0 fail. Bun itself (v1.3.14) panics with a C++ exception on
+process EXIT after the test summary already printed "0 fail" — the SAME
+pre-existing engine-level crash this doc's own §8 landing note documented
+("this indicates a bug in Bun, not your code"), not a test failure and not
+caused by this phase. This phase's own new/changed suites (`prototypeMedoids.test.ts`,
 `prototypeKeywordProfile.test.ts`, `prototypeKeywordProfileBuild.test.ts`,
 `prototypeContrastMargin.test.ts`, `prototypeGeneration.test.ts`,
-`prototypeLane.test.ts`, `prototypeStatus.test.ts` — 93 tests total) were
-also run repeatedly in isolation, clean every time, no flakes observed.
+`prototypeLane.test.ts`, `prototypeStatus.test.ts`,
+`prototypeKeywordLaneLookup.test.ts`, `http/prototypeLaneWiring.test.ts` —
+98 tests total) were run repeatedly in isolation, clean every time, no
+flakes observed — including the new route-level integration test, which
+depends on real sqlite-vec + a real in-process HTTP server and was run
+several times back-to-back specifically to rule out timing flakiness before
+landing.

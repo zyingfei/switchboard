@@ -65,6 +65,7 @@ import {
   type AppendPrototypeLaneDeps,
   type PrototypeLaneStore,
 } from '../tabsession/prototypeLane.js';
+import { peekPrototypeKeywordConceptIds, warmPrototypeKeywordLayer } from '../workstreams/prototypeKeywordLaneLookup.js';
 import type { UrlResolutionResult } from '../tabsession/resolver.js';
 import { BROWSER_TIMELINE_OBSERVED } from '../timeline/events.js';
 import { boundArgsSummary, runWithAuditContext, type AuditContext } from '../vault/auditContext.js';
@@ -1004,12 +1005,21 @@ const memoizedJoinSnapshot = async (
 // they need). No second store handle is opened.
 const prototypeLaneDepsFromContent = (
   contentDeps: AppendContentLaneDeps,
-): AppendPrototypeLaneDeps => ({
-  store: contentDeps.store as unknown as PrototypeLaneStore | undefined,
-  ...(contentDeps.embed === undefined ? {} : { embed: contentDeps.embed }),
-  embedderUsable: contentDeps.embedderUsable,
-  guessLanesEnabled: contentDeps.guessLanesEnabled,
-});
+  vaultRoot: string,
+): AppendPrototypeLaneDeps => {
+  // Same warm-on-miss idiom buildContentLaneDeps already uses for the
+  // recall-v2 store (~line 642) — fire-and-forget, never blocks THIS
+  // resolve; the keyword-profile blend degrades to pure vector scoring
+  // until a later resolve finds the warm handle (prototypeKeywordLaneLookup.ts).
+  warmPrototypeKeywordLayer(vaultRoot);
+  return {
+    store: contentDeps.store as unknown as PrototypeLaneStore | undefined,
+    ...(contentDeps.embed === undefined ? {} : { embed: contentDeps.embed }),
+    embedderUsable: contentDeps.embedderUsable,
+    guessLanesEnabled: contentDeps.guessLanesEnabled,
+    vaultRoot,
+  };
+};
 
 const finalizeBatchResolveResults = async (
   results: Record<string, UrlResolutionResult>,
@@ -1020,8 +1030,9 @@ const finalizeBatchResolveResults = async (
   titleHints: ReadonlyMap<string, string>,
   synthesizedTitleFor: (canonicalUrl: string) => string | undefined,
   gistFor: (canonicalUrl: string) => string | undefined,
+  vaultRoot: string,
 ): Promise<void> => {
-  const prototypeDeps = prototypeLaneDepsFromContent(contentDeps);
+  const prototypeDeps = prototypeLaneDepsFromContent(contentDeps, vaultRoot);
   for (const canonicalUrl of urls) {
     // Two lanes per URL now (content + ai), each a vector KNN plus an FTS
     // query plus a workstream join — all synchronous sqlite. This loop runs
@@ -1056,11 +1067,18 @@ const finalizeBatchResolveResults = async (
     // break keeps this loop's per-URL cost from compounding into one
     // uninterruptible tick across a whole batch.
     await yieldToEventLoop();
-    // Lane 9 — pure vector match against offline-generated prototypes. NO
-    // LLM call on this path (see prototypeLane.ts's header).
+    // Lane 9 — vector KNN against offline-generated prototypes, blended with
+    // the keyword-profile signal when the keyword layer is warm (v2, §11).
+    // NO LLM call on this path (see prototypeLane.ts's header). The concept-
+    // id lookup is a cached-only peek (prototypeKeywordLaneLookup.ts) — never
+    // opens a store on this path, degrades to undefined (pure vector
+    // scoring) before the layer is warm or for an un-indexed page.
+    const pageConceptIds = await peekPrototypeKeywordConceptIds(vaultRoot, canonicalUrl).catch(
+      () => undefined,
+    );
     results[canonicalUrl] = await appendPrototypeLane(
       results[canonicalUrl]!,
-      { title, gist },
+      { canonicalUrl, title, gist, ...(pageConceptIds === undefined ? {} : { pageConceptIds }) },
       prototypeDeps,
     );
     // The decision layer over the lanes just appended: the corroboration
@@ -1689,6 +1707,7 @@ export const routes: readonly RouteDefinition[] = [
               titleHints,
               synthesizedTitleFor,
               gistFor,
+              requireVaultRoot(context),
             );
           }
           // One-line timing diag (SIDETRACK_HTTP_LOG=1): the whole content-lane
@@ -1762,6 +1781,7 @@ export const routes: readonly RouteDefinition[] = [
         titleHints,
         synthesizedTitleFor,
         gistFor,
+        requireVaultRoot(context),
       );
       const fallbackPredictions = stampLanePredictionOpportunities(results, uniqueUrls);
       recordLanePredictionsBestEffort(requireVaultRoot(context), fallbackPredictions, requestId);
