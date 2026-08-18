@@ -179,7 +179,7 @@ describe('buildPrototypeLane — contrast-margin gate (the day-one three-way-tie
       embedderUsable: true,
     });
     expect(lane.candidates).toEqual([]);
-    expect(lane.emptyReason).toContain('no clearly closer workstream');
+    expect(lane.emptyReason).toContain('too close to call');
   });
 
   it('a lone candidate always passes the margin gate — nothing to contrast against', async () => {
@@ -314,7 +314,7 @@ describe('buildPrototypeLane — sentence-level scoring (§12)', () => {
       embedderUsable: true,
     });
     expect(poolOnlyLane.candidates).toEqual([]);
-    expect(poolOnlyLane.emptyReason).toContain('no clearly closer workstream');
+    expect(poolOnlyLane.emptyReason).toContain('too close to call');
 
     // WITH sentence vectors: ws-a's prototype (p-a) sentences EXACTLY match
     // the page's own two sentences; ws-b's prototype (p-b) sentences are
