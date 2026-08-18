@@ -72,6 +72,6 @@ describe('contrastMarginEmptyReason — transparency in the honest-empty case', 
     ]);
     const reason = contrastMarginEmptyReason(result);
     expect(reason).toContain('0.82');
-    expect(reason).toContain('no clearly closer workstream');
+    expect(reason).toContain('too close to call');
   });
 });

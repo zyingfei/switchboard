@@ -90,6 +90,6 @@ export const applyContrastMargin = (
  *  (the brief's explicit requirement: "raw values still available in the why
  *  for transparency" even when the lane declines to name a winner). */
 export const contrastMarginEmptyReason = (result: ContrastMarginResult): string =>
-  `no clearly closer workstream (top ${result.topScore.toFixed(2)}, ` +
-  `cross-workstream mean ${result.crossWorkstreamMean.toFixed(2)}, ` +
-  `margin ${result.margin.toFixed(2)} < ${CONTRAST_MARGIN_MIN.toFixed(2)})`;
+  `too close to call — best list scores ${result.topScore.toFixed(2)}, ` +
+  `but a typical list scores ${result.crossWorkstreamMean.toFixed(2)} for this page ` +
+  `(gap ${result.margin.toFixed(2)}, needs ${CONTRAST_MARGIN_MIN.toFixed(2)})`;
