@@ -1,5 +1,20 @@
 // Per-process kernel disk-IO + memory counters via proc_pid_rusage
-// (macOS libproc, no root needed). Reused pattern from
+// (macOS libproc, no root needed).
+//
+// DARWIN-ONLY, BY DESIGN — proc_pid_rusage is a macOS/BSD libproc API
+// with no Linux equivalent implemented here (Linux has its own per-pid
+// counters at /proc/[pid]/io, a different mechanism this module does not
+// attempt to bridge). `readProcRusage` returns `null` on every other
+// platform (checked below) rather than throwing, so a caller running on
+// CI's Ubuntu runner gets an honest "no data" (zero) instead of a crash —
+// see scripts/read-amplification-harness.test.ts's platform-gated
+// assertions for how the one caller that runs in CI handles that.
+// Real read-amplification measurement is a local macOS tool (see
+// docs/plans/2026-08-15-foundation-program.md's read-amplification
+// landing note); CI's job for the harness is proving its OWN
+// orchestration doesn't crash, not reproducing the measurement.
+//
+// Reused pattern from
 // docs/runbooks/sidetrack-diskwear-hourly.sh (ops/proc-rusage-telemetry,
 // 2026-08-17 user-validated methodology) — that script established
 // offsets 18/19 (BigUint64Array words) as ri_diskio_bytesread /

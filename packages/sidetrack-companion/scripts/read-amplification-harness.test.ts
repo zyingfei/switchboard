@@ -178,8 +178,25 @@ describe('read-amplification-harness.ts end-to-end smoke test', () => {
       for (const phase of report.phases) {
         expect(phase.bytesRead).toBeGreaterThanOrEqual(0);
       }
-      expect(report.totals.bytesRead).toBeGreaterThan(0);
-      expect(report.totals.peakResidentSizeMB).toBeGreaterThan(0);
+      // The numeric kernel-counter values are Darwin-only (CI diagnosis,
+      // 2026-08-17 PR #400: this failed on the Ubuntu companion job —
+      // NOT a missing dist/, which was already built and used correctly;
+      // proc_pid_rusage, scripts/lib/procRusage.ts, is a macOS/BSD
+      // libproc API with no Linux path implemented, so readProcRusage
+      // returns null for every pid there and the tracker's totals are
+      // honestly 0, not garbage). Assert the real invariant per platform
+      // rather than skip the whole real-spawn smoke test on Linux — the
+      // orchestration (seed+run subprocesses, real companion boot, JSON
+      // report shape, phase names) is fully platform-independent and
+      // stays exercised in CI either way; only the kernel-counter
+      // magnitude is macOS-specific.
+      if (process.platform === 'darwin') {
+        expect(report.totals.bytesRead).toBeGreaterThan(0);
+        expect(report.totals.peakResidentSizeMB).toBeGreaterThan(0);
+      } else {
+        expect(report.totals.bytesRead).toBeGreaterThanOrEqual(0);
+        expect(report.totals.peakResidentSizeMB).toBeGreaterThanOrEqual(0);
+      }
     },
     90_000,
   );
