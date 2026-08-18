@@ -19,6 +19,7 @@ import { readFile, stat } from 'node:fs/promises';
 import type { IncomingMessage } from 'node:http';
 import { join } from 'node:path';
 
+import { forEachChunkOfTypesSealAware } from '../analytics/sealedScan.js';
 import { isAllowed, readTrust, type WorkstreamWriteTool } from '../auth/workstreamTrust.js';
 import { SqliteConnectionsStore, type ConnectionsStore } from '../connections/snapshot.js';
 import {
@@ -1019,7 +1020,14 @@ export const readEventsFromStoreOrLog = async (
     }
   };
   if (types !== undefined && types.length > 0) {
-    await store.forEachChunkOfTypes(types, collect, 2000);
+    // Sealed/hot watermark-split router (analytics/sealedScan.ts, design
+    // note "Columnar scan routing" 2026-08-18) — grep-verified safe for
+    // every readEventsFromStoreOrLog caller: none read event.deps/target/
+    // hlc (see that module's header for the fields it cannot carry from
+    // sealed history). Inert unless SIDETRACK_EVENT_SEAL=1.
+    await forEachChunkOfTypesSealAware(context.vaultRoot, store, types, collect, 2000, {
+      consumer: 'readEventsFromStoreOrLog',
+    });
   } else {
     await store.forEachChunk(collect, 2000);
   }

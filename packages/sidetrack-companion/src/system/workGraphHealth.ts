@@ -83,6 +83,7 @@ import { BROWSER_TIMELINE_OBSERVED } from '../timeline/events.js';
 import type { AcceptedEvent } from '../sync/causal.js';
 import { getCaughtUpSharedEventStore } from '../sync/eventStore.js';
 import type { EventLog } from '../sync/eventLog.js';
+import { forEachChunkOfTypesSealAware } from '../analytics/sealedScan.js';
 import {
   USER_ENGAGEMENT_RELABELED,
   USER_FLOW_CONFIRMED,
@@ -564,12 +565,21 @@ const readEventsForHealth = async (
     return (await eventLog.readMerged()).filter((event) => typeSet.has(event.type));
   }
   const events: AcceptedEvent[] = [];
-  await store.forEachChunkOfTypes(
+  // Sealed/hot watermark-split router (analytics/sealedScan.ts, design note
+  // "Columnar scan routing" 2026-08-18) — grep-verified safe: every caller
+  // of readEventsForHealth folds only type/payload/acceptedAtMs/dot/
+  // aggregateId, never event.deps/target/hlc, and this runs in the parent
+  // process (companion.ts's health tick, systemRoutes.ts's /v1/system/
+  // health), never the reconcile child. Inert unless SIDETRACK_EVENT_SEAL=1.
+  await forEachChunkOfTypesSealAware(
+    vaultRoot,
+    store,
     types,
     (chunk) => {
       for (const event of chunk) events.push(event);
     },
     2000,
+    { consumer: 'workGraphHealth.readEventsForHealth' },
   );
   return events;
 };

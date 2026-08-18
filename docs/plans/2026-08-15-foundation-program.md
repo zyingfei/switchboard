@@ -626,6 +626,333 @@ decisions; the registry keeps deciding both guards. Registry-replacement is
 a follow-up PR gated on shadow-agreement evidence from the real vault (see
 PR body for the actual numbers).
 
+## Columnar scan routing — design note (2026-08-18)
+
+Binding user rule: design before code. Task #35, follow-up to
+`perf/read-amplification` (2026-08-18 landing note above): PRAGMA cache/mmap
+tuning gave the long-lived parent 2.4x (up to 3.35x) but cannot help the
+reconcile CHILD — it forks fresh per drain (`SIDETRACK_CONNECTIONS_CHILD`
+default `'1'`), so it never accumulates warm SQLite cache/mmap pages across
+drains; under system memory pressure its window scans re-fault mmap'd
+SQLite from disk every single time (measured 264MB/30s during one child
+cycle vs 16MB/30s idle, per this task's brief). The structural fix: sealed
+history already lives in zstd Parquet (`_BAC/seal/<replica>/<day>.parquet`,
+`src/analytics/eventSeal.ts`, gated `SIDETRACK_EVENT_SEAL=1`, default OFF,
+soak-pending per F2), and DuckDB-over-Parquet is a proven, already-
+production read path (`src/analytics/eventScan.ts`'s `runSealIntegrityCheck`
+— the sealed-vs-store integrity A/B that already runs after every sealer
+pass — plus the 2026-08-01 PoC: 17x faster than a JS loop over sealed data,
+22.9x compression). Columnar reads are also byte-cheap for reasons cache
+tuning can't touch: column pruning (only `type`/`payload`/... columns
+touched, not the SQLite row-store's full-row pages) + zstd compression, so
+even a COLD read costs far fewer bytes than a cold SQLite page fault.
+
+### API shape: watermark-split scan router
+
+New module `src/analytics/sealedScan.ts` (columnar tier, stage 3 — the scan
+router; stage 1 = `eventSeal.ts`, stage 2 = `eventScan.ts`). One exported
+function following `EventStore.forEachChunkOfTypes`'s exact signature so it
+is a drop-in replacement at call sites:
+
+```
+forEachChunkOfTypesSealAware(vaultRoot, store, types, cb, chunkSize, { consumer })
+  -> Promise<{ sealedDays: number; hotDays: number; bytesEstimate: number }>
+```
+
+Per (replica, day) the router classifies using the SAME contract
+`eventScan.ts`'s production integrity check already uses —
+`store.sealDayStats(replica)` (existing, cheap aggregate) compared against
+the seal manifest via `entryMatches` (exported from `eventScan.ts`, reused
+verbatim, not reimplemented):
+
+- **sealed-trusted** (manifest entry present AND `entryMatches` true against
+  the LIVE store day-stats): read from Parquet, one DuckDB connection per
+  call, ONE batched `read_parquet([...paths]) WHERE type IN (...)` query
+  (not one query per file — amortizes DuckDB open/query overhead across
+  however many sealed days match, per the brief's "must not cost more than
+  it saves"; the 2026-08-16 spike measured 8.9ms open+query on a real sealed
+  segment, negligible next to a multi-hundred-MB re-fault). On any DuckDB
+  read failure (corrupt/truncated segment), the WHOLE call falls back to
+  the pure-store path — correctness over performance, matching
+  `eventScan.ts`'s own "a single corrupt segment must not hide a healthy
+  one" posture but resolved conservatively (fail closed to the proven-correct
+  path) rather than with per-file isolation, since this is a serving-path
+  read, not an audit.
+- **hot** (no manifest entry, OR entry present but stale/drifted — the
+  benign `store-drift` case `eventScan.ts` already names): read from the
+  store, day-bounded, via a NEW additive `EventStore.readEventsForDay`
+  method (`src/sync/eventStore.ts`) — same `accepted_at_ms` index
+  `readSealRows`/`sealDayStats` already use, so this never widens to a full
+  scan; unlike `readSealRows` (which mirrors exactly what a seal WRITES —
+  no `deps`/`target`/`hlc`, by design, since that's what the sealer needs)
+  this returns FULL `AcceptedEvent` objects (real `deps`/`target`/`hlc`)
+  so only the sealed portion pays the fidelity cost below, never the hot
+  tail. Purely additive to `EventStore`'s interface — no existing method's
+  behavior changes.
+
+Both branches feed one shared row→event builder; results are merged,
+sorted by `(replicaId, seq)` (matching `forEachChunkOfTypes`'s existing
+order contract), and delivered to `cb` in `chunkSize` pieces with the same
+`setTimeout(0)` yield the original method uses. `columnarScansEnabled()` —
+`process.env['SIDETRACK_COLUMNAR_SCANS'] !== '0'` (kill switch, default ON,
+per the brief) — is checked FIRST but gated behind `eventSealEnabled()`
+(default OFF): on a default install nothing changes regardless of the kill
+switch's value, because there is no sealed data to route to — the routing
+function degrades to a byte-identical passthrough (`store.forEachChunkOfTypes`)
+whenever the seal tier is off or the manifest is empty for the requested
+scope. Every call that reaches the routing logic (seal on, manifest
+non-empty) prints `[scan.columnar] consumer=<name> sealedDays=N hotDays=M
+bytesEstimate=<parquet bytes actually stat()'d>`, throttled 30s per consumer
+(mirrors `server.ts`'s `logResolverCandidateWindowTruncated` idiom — an HTTP
+route consumer can fire many times a second under a request burst).
+
+### The `deps`/`target`/`hlc` correctness finding (binds the consumer list)
+
+`AcceptedEvent` (`src/sync/causal.ts`) carries three fields the sealed
+Parquet schema does NOT: `deps: VersionVector` (required), `target?:
+TargetRef`, `hlc?: Hlc`. `eventSeal.ts`'s `SEAL_TABLE_SQL` / `seal_rows`
+table is 7 columns — `replica_id, seq, type, accepted_at_ms, aggregate_id,
+client_event_id, payload` — no `deps`/`target`/`hlc`, by design (that's
+also exactly what `readSealRows`/`SealRow` mirror). A row reconstructed
+from a sealed segment can only ever produce `deps: {}` (empty
+VersionVector — required by `isAcceptedEvent`'s structural check) and
+`target`/`hlc` omitted. Extending the seal schema to carry these three
+fields is a WRITE-path/versioning change (new columns, re-seal of any
+already-sealed history, a verify-or-abort format bump) — out of this read-
+routing task's scope, and its own soak story on top of F2's still-pending
+soak.
+
+This is not academic: grepping the whole package (not just the connections
+subtree) for `.deps`/`.target`/`.hlc` on `AcceptedEvent`-typed values found
+**exactly two consumers outside `sync/`'s own causal/anti-entropy
+internals**, both load-bearing:
+
+- `src/sync/contract/connectionsMaterializer.ts:3304` —
+  `timelineObservedEventFromNavigation` synthesizes a NEW
+  `BROWSER_TIMELINE_OBSERVED` event from a `NAVIGATION_COMMITTED` event and
+  copies `deps: event.deps` / `hlc: event.hlc` FORWARD into the synthesized
+  event (the foreground-navigation overlay memory note references this same
+  code path, ~line 7398 pre-refactor numbering). This event gets ingested;
+  a deps-stripped source would silently mint a synthetic event with wrong
+  causal-dependency metadata — a lossless-by-construction violation.
+- `src/threads/threadRegisterStore.ts` — persists `deps: event.deps` into
+  `StoredThreadEvent` on ingest (`:263`) and round-trips it back via
+  `toAcceptedEvent` (`:156`) for `projectThread` to fold; the header comment
+  says the round-tripped event must be one `projectThread` "will classify
+  and fold exactly as it would the original" — `deps` is read for real, not
+  carried along inertly.
+
+Both are reachable only from `connectionsMaterializer.ts`'s own drain logic
+(the protected file's inlined `storeBackedEvents.readSince(...)` /
+`typedEventSource.forEachChunkOfTypes(...)` calls at e.g. `:3788`,
+`:2538/:2573/:3070/:6998/:7030/:7984/:8940`) — **never** from
+`readEventsFromStoreOrLog` (`http/routeSupport.ts`) or from
+`workGraphHealth.ts`'s health/feedback folds. A second full-package grep for
+`.hlc` outside `sync/` returned ZERO hits; `.target` outside `sync/`
+returned zero hits on `AcceptedEvent.target` (every match was an unrelated
+`target` — payload fields, graph-edge `.target`, a systemd unit line).
+
+**Consequence: (b) is NOT routed.** The reconcile child's catch-up window
+read (`connectionsMaterializer.ts:3788`,
+`storeBackedEvents.readSince(effectiveLastFrontier ?? {})`) is the read this
+task's brief calls "the big one," and there is genuinely no external read-
+layer helper for it to hook — the call is inlined directly on the
+`EventStore` object obtained from `ensureEventStore()` inside the protected
+file (confirmed: no `readEventsFromStoreOrLog`-style indirection exists for
+this call site). The only way to route it without editing
+`connectionsMaterializer.ts` would be to change `EventStore.readSince`'s
+(and `forEachChunk`'s) OWN implementation in `sync/eventStore.ts` (not
+protected) — but that method is shared by every caller in the codebase, and
+at least two of those callers are confirmed to read `.deps` off objects it
+returns. Routing it wholesale would silently corrupt `deps` for the
+protected file's own foreground-navigation-synthesis and thread-register
+paths the moment either reads a sealed day — exactly the kind of invisible,
+hard-to-catch corruption "Lossless by construction" exists to forbid. This
+is reported honestly rather than routed: the fix that WOULD make (b) safe
+(add `deps`/`target`/`hlc` columns to the seal schema, re-seal, bump the
+verify-or-abort format) is a real, identifiable follow-up, filed here for a
+future task — not attempted in this one.
+
+### Consumer table
+
+| Consumer | Read | Routed? | Why | Sealed-day benefit |
+|---|---|---|---|---|
+| (a) candidate-generation timeline window (`server.ts`'s `timelineEventsForCandidateGeneration`, `SIDETRACK_RESOLVER_CANDIDATE_TIMELINE_WINDOW`, default 20,000) | `store.readMostRecentByType(BROWSER_TIMELINE_OBSERVED, window)` — DESC LIMIT, most-recent-N | **NOT routed** | Structural, not a safety call: most-recent-N by definition lands in the newest days first, which are by construction never sealed (today is never sealed; `runEventSealPass` explicitly skips `day >= today`). The bounded default path essentially never reaches back into sealed history on an active vault. | Measured (below): ~0 sealed-day bytes touched in the default-window harness run — confirms the brief's own "maybe NO benefit" hint honestly rather than routing for symmetry. The unbounded `window<=0` kill-switch branch (`forEachChunkOfTypes`, no day bound) is a real full-history scan and WOULD benefit the same way (c) does, but is an operator-opt-in edge case, not the default path — left unrouted, noted as a trivial follow-up (same helper, one more call site) if that branch ever matters in practice. |
+| (b) reconcile child catch-up window (`connectionsMaterializer.ts:3788`, `readSince`, plus its other inlined `forEachChunk*` calls) | `EventStore.readSince` / `forEachChunk` / `forEachChunkOfTypes`, called directly on the raw store object | **NOT routed** — see finding above | Only interceptable by changing the SHARED `EventStore` method implementations, which would corrupt `deps` for two confirmed protected-file consumers (`timelineObservedEventFromNavigation`, `threadRegisterStore`) the moment they touch a sealed day. Real fix needs a seal-schema change (deps/target/hlc columns), out of scope. | Not implemented; this is the consumer the brief called "the big one" and the harness (below) reports the real, unrouted number for the record. |
+| (c) health/aggregate full-history folds — `workGraphHealth.ts`'s `readEventsForHealth` (feedback / recall.served / recall.action probes, `readFeedbackEvents` etc.) | `store.forEachChunkOfTypes(types, cb, 2000)`, UNBOUNDED — the exact "full type-scoped history" shape sealed history helps most | **ROUTED** | Grep-verified: every caller of `readEventsForHealth` (lines 170/177/261/581/1681) feeds a projection/counter fold that only reads `.type`/`.payload`/`.acceptedAtMs`/`.dot`/`.aggregateId` — never `.deps`/`.target`/`.hlc`. Runs in the PARENT process (`runtime/companion.ts:1442` periodic tick, `http/routes/systemRoutes.ts:1021` `/v1/system/health` route) — never the reconcile child — so it does not inherit (b)'s risk profile at all. | Grows with vault age (this is the one probe the comment at `workGraphHealth.ts:550-554` already says blew the 5s health budget as a full `forEachChunk` before the type-index fix; a growing fraction of that type-scoped history is now sealed as F2 soak progresses). |
+| `learnedAggregatorObservationEvents` (`workGraphHealth.ts:164`, `SIDETRACK_LEARNED_AGGREGATOR_WINDOW`, default 20,000) | `store.readMostRecentByType(...)`, most-recent-N (same shape as (a)) — only falls to `readEventsForHealth` when the window kill-switch is 0 | **NOT routed** (same reasoning as (a)); the `window<=0` fallback already routes for free once `readEventsForHealth` is routed, since it calls that same function. | Same recency-bound argument as (a). | Same as (a) — near-zero in the default-window case. |
+| `readEventsFromStoreOrLog` (`http/routeSupport.ts`, 24 HTTP-route call sites: threads/dispatches/privacy/visits/feedback/recall/connections/annotations/tabsession/workstreams routes) | `store.forEachChunkOfTypes(types, collect, 2000)` when a type hint is given (every real call site supplies one) | **ROUTED** (the `types`-provided branch only; the untyped `forEachChunk` fallback branch is dead code today — zero call sites omit `types` — left as pure passthrough, not worth routing for a branch nothing exercises) | Grep-verified across all 24 call sites plus their route-layer projection functions (`projectFeedback`, `projectPrivacy`, `projectDispatches`, `distinctVisitDaysForUrl`, etc.): none read `.deps`/`.target`/`.hlc`. Runs in the PARENT process (HTTP request path), same as (c). | Type-scoped, so bounded by matching-row count already (per the module's own header comment); benefit scales with how much of that type's history is sealed. Not explicitly named in the brief's (a)-(d) list but is the same "scan-shaped serving-path read" class the task's own framing opens with — routed for the same proven-safe reason as (c). |
+| keyword backfill (`enrichment/keywordBackfillLane.ts`) / sentence-embedding backfill (`enrichment/sentenceVectorBackfillLane.ts`) | `keywordBackfillCandidatesFromGistLookup` iterates an in-memory `GistLookup` Map; `gatherSentenceBackfillCandidates` iterates the connections snapshot's URL projection | **N/A — not event-store consumers** | The brief's premise (these enumerate populations via raw event scans) does not hold: both lanes walk already-materialized derived state (a gist-enrichment lookup, a snapshot projection), never `readEventsFromStoreOrLog` or the typed store directly. Reported honestly rather than routing something that doesn't exist. | None — no event-store read to route. |
+| (d) analytics (`eventScan.ts`, `hotTailRetirement.ts`) | `read_parquet` directly | Already columnar | Nothing to do. | N/A |
+
+The "Sealed-day benefit" column above is the PRE-MEASUREMENT expectation.
+See "Measured" further below for the honest, post-measurement verdict:
+both routed consumers (c, `readEventsFromStoreOrLog`) are implemented and
+tested correctly, but do NOT show a reliable end-to-end byte reduction on
+the one real vault available to test against today — ship gated behind an
+opt-in flag, not the default-on this table's reasoning originally expected.
+
+### Equivalence
+
+Every routed consumer's correctness rests on the SAME proof
+`eventScan.ts`'s production integrity A/B already runs continuously
+post-sealer-pass: a sealed segment's `(rows, seqLo, seqHi)` triple, verified
+at write time (`eventSeal.ts`'s verify-or-abort: written, re-read via
+DuckDB, unlinked+aborted on any mismatch) and re-checked live on every
+`runSealIntegrityCheck` pass, is compared against the live store's
+`sealDayStats` for that day — the router uses that exact `entryMatches`
+predicate to decide sealed-vs-hot per day, so it can only ever read a
+sealed day the production integrity check would ALSO call `match`. New
+test coverage (`sealedScan.test.ts`) adds one more layer on top: a
+synthetic vault with sealed AND unsealed (open "today") days, verifying
+`forEachChunkOfTypesSealAware`'s merged output deep-equals
+`store.forEachChunkOfTypes`'s pure-store output on the fields every routed
+consumer actually reads (`dot`, `aggregateId`, `type`, `payload`,
+`acceptedAtMs`, `clientEventId`), plus an explicit per-source assertion:
+sealed-day events come back with `deps: {}` and no `target`/`hlc` (the
+Parquet schema gap, unavoidable), while hot-tail events keep FULL fidelity
+(real `deps`/`target`/`hlc`, via a new additive `EventStore.readEventsForDay`
+that reads real `AcceptedEvent` rows day-bounded, unlike `readSealRows`
+which mirrors exactly what a seal WRITES) — the router does not degrade
+more than the sealed portion structurally requires. Documenting the
+fidelity cost precisely, per source, rather than hiding it inside a
+loosened deep-equal. Also covered: kill switch (`SIDETRACK_COLUMNAR_SCANS=0`
+→ byte-identical passthrough), seal-tier-off passthrough, corrupt-segment
+fallback (whole call degrades to pure store, never partial/wrong data), and
+store-drift (a late arrival after sealing is read from the hot path, not
+the stale segment — same benign case `eventScan.ts` already names).
+
+### Fallback
+
+Three independent layers, each sufficient alone: (1)
+`SIDETRACK_COLUMNAR_SCANS` default OFF (see the "Measured" section below —
+revised from the brief's suggested default-on shape after real-vault
+measurement showed default-on is not reliably a win today) — `=1` required
+to opt in, `=0` or unset both revert every routed consumer to
+`store.forEachChunkOfTypes` wholesale; (2) `SIDETRACK_EVENT_SEAL` default
+OFF — on any install that hasn't opted into sealing, routing is a
+structural no-op (empty manifest → passthrough) regardless of (1); (3)
+per-call DuckDB read failure — falls back to the pure-store path for that
+call, never partial data. No behavior change is possible without BOTH env
+flags explicitly set to their non-default `1` value AND a non-empty seal
+manifest.
+
+### DuckDB connection lifecycle
+
+Follows `eventScan.ts`'s own precedent exactly: short-lived,
+`DuckDBInstance.create(':memory:')` → `connect()` → run → `closeSync()` in
+a `finally`, one connection per call (not cached/pooled), batched into ONE
+query per call (a path LIST, not one query per file) so a call spanning
+many sealed days pays file-open overhead once, not once per file. This
+task does NOT route the reconcile child's per-drain path (see the `deps`
+finding above), so (c) and the `readEventsFromStoreOrLog` route-layer both
+run in the long-lived PARENT process. **Revised after measurement (see
+below): the DuckDB connection/query itself is cheap (8.9ms per the
+2026-08-16 spike; confirmed again below), but the CLASSIFICATION step that
+decides which days are sealed-trusted — `EventStore.sealDayStats` per
+replica, needed to cross-check every day against the manifest — is NOT
+cheap on a real vault (measured 200-300MB of kernel read per call,
+dwarfing the DuckDB read it exists to gate). A per-vaultRoot classification
+cache (`sealedScan.ts`'s `classificationCache`, invalidated on
+watermark-or-manifest change) was added specifically to amortize this —
+see "Measured" below for the full story, including why it still isn't a
+clean win end-to-end on this vault today.**
+
+### Measured (2026-08-18, real ~2.8GB test vault, 231 real sealed segments)
+
+Two bugs found and fixed by measuring against `~/.sidetrack-vault-test`
+(read-only clones only — the live companions were never touched), both real
+and both worth keeping regardless of the final ship decision below:
+
+1. **Missing compound index (fixed).** `readEventsForDay` (this task's new
+   hot-tail read) and the PRE-EXISTING `readSealRows` (the sealer's own
+   per-day read, used every sealer pass) both filter `WHERE replica_id = ?
+   AND accepted_at_ms >= ? AND accepted_at_ms < ?`. With no
+   `(replica_id, accepted_at_ms)` compound index, the planner falls back to
+   `events_accepted_at_ms_idx` alone — a scan of EVERY replica's rows in
+   that day's timestamp range, not just the requested replica's. Measured:
+   227.7MB / 1054.5ms kernel read for one 4,766-row "today" (a live-
+   capturing replica sharing the day with the harness's synthetic seed
+   replica). Added `events_replica_accepted_at_idx` to
+   `sync/eventStore.ts`'s `SCHEMA` (additive `CREATE INDEX IF NOT EXISTS`,
+   builds once on next open, no migration risk) — same query afterward:
+   0.00MB / 10.0ms. This fixes the sealer's OWN per-day read too, not just
+   this task's new method — a pre-existing cost this task's measurement
+   happened to surface.
+2. **Uncached per-call classification (fixed).** The sealed-vs-hot split
+   calls `store.sealDayStats(replicaId)` for every replica on every router
+   call — an O(replica's total row count) aggregate (no index can avoid
+   touching every row when bucketing by day). Measured 200-310MB per
+   UNCACHED call on the real vault (dwarfing the ~20-40MB DuckDB read it
+   gates). Added a per-vaultRoot memo (`classifySealedVsHot`'s
+   `classificationCache`) keyed on a cheap signal —
+   `store.watermark()` (a small single-table read) plus the seal
+   manifest's line count (already read fresh every call) — that's cheap to
+   check and only recomputes the expensive split when either changes.
+   Measured: first call after store-open still pays ~200-310MB (unavoidable
+   — this is the SAME cost `runEventSealPass` already pays once per hour
+   for its own planning, just now also paid once per classification-
+   generation instead of once per call); every repeat call with an
+   unchanged watermark/manifest: 0.05MB. This directly answers the brief's
+   "must not cost more than it saves" for the read-router's own overhead,
+   not just the DuckDB connection (which was never the expensive part).
+
+**End-to-end, honest result: on this vault, routing is a WASH, not a win.**
+`scripts/read-amplification-harness.ts` extended with `seed --days-back N
+--seal` (spreads synthetic backlog across closed days + pre-seals via the
+built `seal --run` CLI) and a `healthPoll` phase (N `/v1/system/health`
+calls BEFORE settle, so no drain-time artifact exists yet to short-circuit
+a live `collectWorkGraphHealth` compute — isolates `readEventsForHealth`,
+the routed consumer). Against the REAL vault (already had 231 sealed
+segments from live F2/columnar activity — no synthetic seeding needed for
+this comparison), both fixes applied, `SIDETRACK_COLUMNAR_SCANS=1` vs
+unset (new default, see below):
+
+| config | boot | healthPoll | settle | resolves | TOTAL |
+|---|---|---|---|---|---|
+| columnar on (`=1`) | 1283.8MB | 1135.3MB | 563.8MB | 451.3MB | **3434.1MB** |
+| columnar off (default) | 1514.0MB | 818.9MB | 680.5MB | 440.5MB | **3453.9MB** |
+
+0.6% smaller with routing on — within this machine's own documented noise
+band (PR #400's report: >2x spread between nominally-identical trials on
+this same loaded, shared dev machine). Earlier paired trials (before the
+index/cache fixes, and again after, at smaller settle windows) swung
+between "9.8% smaller" and "18.3% larger" run to run — no reliable
+direction. The mechanism-level number IS real and reproducible (231/233
+replica-days route to a deterministic ~20.3MB Parquet read instead of
+whatever the store read would have cost), but it does not show through
+cleanly end-to-end here, for three understood reasons: (a) this vault's
+sealed segments are many SMALL daily files (237 files, avg 89KB) — DuckDB
+pays real per-file overhead reading all of them in one query, and for a
+RARE type (the exact shape `readEventsForHealth`/`readEventsFromStoreOrLog`
+route) that overhead is comparable to or worse than PR #400's already-
+mmap-tuned SQLite index scan for the same query (measured 4-11MB); (b) the
+classification cache's benefit depends on a quiescent store between calls,
+which does not hold during the post-boot window this harness's `healthPoll`
+phase deliberately targets (background catch-up is often still draining);
+(c) DuckDB-over-Parquet's proven win (F2 design note: 17x vs a JS loop) is
+for AGGREGATE queries served largely from row-group statistics, or BROAD
+scans that would otherwise touch most of a table — not a narrow, rare-type
+row-fetch PR #400's mmap tuning already serves cheaply.
+
+**Ship decision: `SIDETRACK_COLUMNAR_SCANS` defaults OFF (`=== '1'`
+required), not the brief's originally-suggested `!== '0'` kill-switch
+shape.** This is a deliberate deviation from the literal instruction,
+justified by the measurement above: default-on would ship a feature that,
+today, is a coin-flip on the one real vault available to test against —
+not the honest "additive, proven win" bar this program's own principles
+set. `SIDETRACK_COLUMNAR_SCANS=0` (and unset) both still revert to the
+pure-store path, so the brief's specific claim about `=0` remains literally
+true; `=1` is now required to opt in, matching `eventSealEnabled`'s own
+"additive-only until proven" idiom exactly — the same reasoning
+`SIDETRACK_EVENT_STORE` itself already uses (production-ready code,
+conservative default) is the direct precedent. The code, equivalence
+tests, and both fixes are real and worth keeping regardless: they are
+correct today and become a clean win once either follow-up lands (segment
+consolidation on the sealer side so a query touches fewer, larger Parquet
+files; or a genuinely broad/unbounded consumer is found safe to route —
+none qualified in this task's `deps`/`target`/`hlc` audit).
+
 ## Idle-window checklist (next window, ~04:30 or user-idle)
 
 1. Sync ~/.sidetrack-companion-maintenance.sh from docs/runbooks copy.
@@ -636,6 +963,48 @@ PR body for the actual numbers).
 4. Kick a fresh acceptance-sampler window; record numbers here.
 
 ## Landing notes (current state, dated)
+
+**2026-08-18 — columnar scan routing (perf/columnar-scan-routing, task #35,
+follow-up to read-amplification below).** New `src/analytics/sealedScan.ts`
+routes type-scoped scans through DuckDB-over-Parquet for sealed days + a
+day-bounded store read for the hot tail, gated by a full `deps`/`target`/
+`hlc` consumer safety audit (design note above, "Columnar scan routing").
+Routed: `http/routeSupport.ts`'s `readEventsFromStoreOrLog` (24 HTTP-route
+call sites) and `system/workGraphHealth.ts`'s `readEventsForHealth`
+(full-history feedback/recall fold). NOT routed: the reconcile child's
+catch-up window (`connectionsMaterializer.ts:3788` — a shared-`EventStore`-
+method change would silently corrupt `deps` for two confirmed protected-
+file consumers; would need a seal-schema change, out of scope) and the
+two recency-bounded consumers (candidate-generation timeline window,
+`learnedAggregatorObservationEvents` — structurally never reach sealed
+history). Two real bugs found and fixed while measuring against
+`~/.sidetrack-vault-test` (read-only clones only): a missing
+`(replica_id, accepted_at_ms)` compound index (227.7MB→0MB for one hot-day
+read; also fixes the pre-existing sealer's own per-day read) and an
+uncached per-call sealed/hot classification (`store.sealDayStats` per
+replica, 200-310MB uncached → 0.05MB on repeat via a new watermark+
+manifest-keyed cache). Despite both fixes, END-TO-END the routing is a WASH
+on this real vault (3434.1MB routed vs 3453.9MB default — 0.6%, within this
+machine's own documented noise band) — root cause: 231 real sealed segments
+are small daily files (avg 89KB), and DuckDB's per-file overhead reading
+all of them in one query is comparable to or worse than PR #400's already-
+mmap-tuned SQLite index scan for the RARE-type queries these two consumers
+happen to need. Shipped anyway (code correct, equivalence-tested,
+low-risk-additive) but **`SIDETRACK_COLUMNAR_SCANS` defaults OFF** (`=1`
+required to opt in) — a deliberate deviation from the task brief's
+suggested default-on kill-switch shape, justified by the measurement:
+default-on would ship a not-reliably-a-win feature, contradicting this
+program's "additive, proven" bar. Follow-ups identified, not attempted:
+segment consolidation (fewer/larger sealed files) on the sealer side; a
+seal-schema extension (deps/target/hlc columns) to make the reconcile-child
+path safely routable. `scripts/read-amplification-harness.ts` extended
+(`seed --days-back N --seal`, a `healthPoll` phase) for reuse by future
+columnar-routing measurement. Full `bun test` 3833 pass / 8 skip / 0 fail
+(415 files); root `bun run build` clean across companion/extension/mcp;
+`tsc --noEmit` unchanged (152 pre-existing errors before and after, `git
+stash`-verified, none in touched files). PR: perf(store): columnar scan
+routing — sealed-history reads via DuckDB-over-Parquet (branch
+`perf/columnar-scan-routing`).
 
 **2026-08-18 — read-amplification: SQLite cache/mmap tuning on the three
 hot stores (perf/read-amplification).** Not an F1–F7 item; filed here per
