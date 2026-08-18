@@ -146,6 +146,16 @@ export interface EventStore {
    *  writes. Day bounds are UTC-midnight accepted_at_ms bounds, matching
    *  sealDayStats bucketing. */
   readonly readSealRows: (replicaId: string, day: string) => readonly SealRow[];
+  /** Retained rows for one replica-day ordered by seq, as FULL AcceptedEvent
+   *  objects (unlike readSealRows, which mirrors exactly what a seal WRITES
+   *  — no deps/target/hlc, by design). Day-bounded via the same
+   *  accepted_at_ms index readSealRows/sealDayStats use. Added for
+   *  analytics/sealedScan.ts's hot-tail read: the columnar scan router reads
+   *  sealed days from Parquet (which cannot carry deps/target/hlc — see that
+   *  module's header) and must not ALSO degrade the unsealed/hot tail's
+   *  fidelity just because the sealed portion has to. Purely additive —
+   *  no existing method's behavior changes. */
+  readonly readEventsForDay: (replicaId: string, day: string) => readonly AcceptedEvent[];
   readonly close: () => void;
 }
 
@@ -275,6 +285,19 @@ const SCHEMA = `
   CREATE INDEX IF NOT EXISTS events_aggregate_idx ON events(aggregate_id, replica_id, seq);
   CREATE INDEX IF NOT EXISTS events_type_idx ON events(type, replica_id, seq);
   CREATE INDEX IF NOT EXISTS events_type_accepted_at_idx ON events(type, accepted_at_ms);
+  -- Columnar scan routing (2026-08-18): readSealRows/sealDayStats/
+  -- readEventsForDay all filter WHERE replica_id = ? AND accepted_at_ms
+  -- BETWEEN lo AND hi. Without a compound (replica_id, accepted_at_ms)
+  -- index, the planner falls back to events_accepted_at_ms_idx alone —
+  -- a scan of EVERY replica's rows in the day's timestamp range, not just
+  -- the requested replica's — measured 227MB/1054ms read for a single
+  -- 4,766-row hot day on a real multi-replica vault (a live capturing
+  -- replica's "today" plus the harness's own synthetic replica sharing
+  -- the same day). This index makes the lookup a direct lo/hi seek scoped
+  -- to one replica. Pre-existing queries (readSealRows, the sealer's own
+  -- per-day read) get this fix for free — it was never specific to this
+  -- task's new readEventsForDay.
+  CREATE INDEX IF NOT EXISTS events_replica_accepted_at_idx ON events(replica_id, accepted_at_ms);
   CREATE TABLE IF NOT EXISTS ingest_watermark (
     replica_id TEXT PRIMARY KEY,
     max_seq INTEGER NOT NULL
@@ -1057,6 +1080,19 @@ export const createEventStore = async (vaultRoot: string): Promise<EventStore> =
     }));
   };
 
+  const readEventsForDay = (replicaId: string, day: string): readonly AcceptedEvent[] => {
+    const { lo, hi } = dayBoundsMs(day);
+    const rows = db
+      .query(
+        `SELECT ${SELECT_COLUMNS}
+           FROM events
+          WHERE replica_id = ? AND accepted_at_ms >= ? AND accepted_at_ms < ?
+          ORDER BY seq`,
+      )
+      .all(replicaId, lo, hi);
+    return rowsToEvents(rows);
+  };
+
   return {
     ingest: (event) => {
       ingest(event);
@@ -1079,6 +1115,7 @@ export const createEventStore = async (vaultRoot: string): Promise<EventStore> =
     watermark,
     sealDayStats,
     readSealRows,
+    readEventsForDay,
     close: () => {
       db.close?.();
     },

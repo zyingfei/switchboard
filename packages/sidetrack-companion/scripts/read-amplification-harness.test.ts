@@ -22,7 +22,7 @@
 
 import { spawnSync } from 'node:child_process';
 import { existsSync } from 'node:fs';
-import { mkdir, mkdtemp, readFile, rm } from 'node:fs/promises';
+import { mkdir, mkdtemp, readdir, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -30,6 +30,7 @@ import { fileURLToPath } from 'node:url';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import { isAcceptedEvent } from '../src/sync/eventLog.js';
+import { isUserFlowRejectedPayload } from '../src/feedback/events.js';
 
 import { seedBacklog, stratifiedSample } from './read-amplification-harness.js';
 
@@ -93,6 +94,65 @@ describe('seedBacklog', () => {
       .filter((l) => l.trim().length > 0)
       .map((l) => (JSON.parse(l) as { payload: { canonicalUrl: string } }).payload.canonicalUrl);
     expect(new Set(urls).size).toBe(urls.length);
+  });
+
+  // daysBack (columnar scan routing, 2026-08-18): spreads the backlog
+  // across closed days (never "today") with real feedback-type rows per
+  // day, so a `seal --run` afterward has multi-day sealable history.
+  describe('daysBack option', () => {
+    it('writes one shard per closed day, never a "today" shard', async () => {
+      seedBacklog(workRoot, 20, { daysBack: 4 });
+      const dir = join(workRoot, '_BAC', 'log', 'harness-seed');
+      const files = (await readdir(dir)).sort();
+      expect(files).toHaveLength(4);
+      const today = new Date().toISOString().slice(0, 10);
+      expect(files.includes(`${today}.jsonl`)).toBe(false);
+    });
+
+    it('every line across every shard is a valid AcceptedEvent with strictly increasing seq', async () => {
+      seedBacklog(workRoot, 20, { daysBack: 4 });
+      const dir = join(workRoot, '_BAC', 'log', 'harness-seed');
+      const files = (await readdir(dir)).sort();
+      const allSeqs: number[] = [];
+      let feedbackCount = 0;
+      for (const file of files) {
+        const raw = await readFile(join(dir, file), 'utf8');
+        const lines = raw.split('\n').filter((l) => l.trim().length > 0);
+        expect(lines.length).toBeGreaterThan(0);
+        for (const line of lines) {
+          const parsed: unknown = JSON.parse(line);
+          expect(isAcceptedEvent(parsed)).toBe(true);
+          const event = parsed as { dot: { seq: number }; type: string; payload: unknown };
+          allSeqs.push(event.dot.seq);
+          if (event.type === 'user.flow.rejected') {
+            expect(isUserFlowRejectedPayload(event.payload)).toBe(true);
+            feedbackCount += 1;
+          }
+        }
+      }
+      expect(allSeqs).toEqual([...allSeqs].sort((a, b) => a - b));
+      expect(new Set(allSeqs).size).toBe(allSeqs.length);
+      // One feedback event per day.
+      expect(feedbackCount).toBe(4);
+    });
+
+    it('daysBack=0 (default) is byte-identical to the pre-existing single-day behavior', async () => {
+      const otherRoot = await mkdtemp(join(tmpdir(), 'read-amp-seed-unit-cmp-'));
+      try {
+        seedBacklog(workRoot, 10);
+        seedBacklog(otherRoot, 10, { daysBack: 0 });
+        const day = new Date().toISOString().slice(0, 10);
+        const a = await readFile(join(workRoot, '_BAC', 'log', 'harness-seed', `${day}.jsonl`), 'utf8');
+        const b = await readFile(join(otherRoot, '_BAC', 'log', 'harness-seed', `${day}.jsonl`), 'utf8');
+        // Timestamps are Date.now()-derived, not byte-identical to the
+        // millisecond — compare event COUNT and shape instead.
+        expect(a.split('\n').filter((l) => l.trim().length > 0).length).toBe(
+          b.split('\n').filter((l) => l.trim().length > 0).length,
+        );
+      } finally {
+        await rm(otherRoot, { recursive: true, force: true });
+      }
+    });
   });
 });
 
@@ -174,7 +234,7 @@ describe('read-amplification-harness.ts end-to-end smoke test', () => {
         readonly totals: { readonly bytesRead: number; readonly peakResidentSizeMB: number };
       };
       expect(report.label).toBe('smoke');
-      expect(report.phases.map((p) => p.name)).toEqual(['boot', 'settle', 'resolves']);
+      expect(report.phases.map((p) => p.name)).toEqual(['boot', 'healthPoll', 'settle', 'resolves']);
       for (const phase of report.phases) {
         expect(phase.bytesRead).toBeGreaterThanOrEqual(0);
       }

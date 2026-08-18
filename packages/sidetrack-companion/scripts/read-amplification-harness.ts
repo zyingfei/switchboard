@@ -27,20 +27,34 @@
 // `run` clones --seed-base into its own scratch dir (never mutates it),
 // starts ONE real companion process (child_process.spawn, not an
 // in-process import — must be the real boot path), and attributes kernel
-// disk-IO bytes to three phases via a process-TREE rusage tracker (the
+// disk-IO bytes to four phases via a process-TREE rusage tracker (the
 // connections materializer reconcile runs in a forked child by default,
 // cli.ts: SIDETRACK_CONNECTIONS_CHILD='1' unless a test opts out — a
 // parent-pid-only measurement would silently drop most of the
 // connections-generation-db read volume):
-//   1. boot      — process spawn → first /v1/version 200 (drains the
-//                  seeded backlog's catch-up-critical path; NOT the full
-//                  backlog since serve-stale reads never await catch-up).
-//   2. settle    — fixed wall-clock window with no HTTP traffic, letting
-//                  the connections drain / topic pass / embed-lane
-//                  background cycles run to (approximate) completion.
-//   3. resolves  — N GET /v1/visits/:url/resolve calls against real
-//                  projection URLs (stratified sample, mirrors
-//                  scripts/resolver-acceptance.ts).
+//   1. boot       — process spawn → first /v1/version 200 (drains the
+//                   seeded backlog's catch-up-critical path; NOT the full
+//                   backlog since serve-stale reads never await catch-up).
+//   1b. healthPoll — N GET /v1/system/health calls, BEFORE settle (so no
+//                   drain-time artifact exists yet to short-circuit a live
+//                   compute) — isolates workGraphHealth.ts's
+//                   readEventsForHealth, the columnar-scan-routing task's
+//                   (perf/columnar-scan-routing, 2026-08-18) routed
+//                   full-history health/feedback fold.
+//   2. settle     — fixed wall-clock window with no HTTP traffic, letting
+//                   the connections drain / topic pass / embed-lane
+//                   background cycles run to (approximate) completion.
+//   3. resolves   — N GET /v1/visits/:url/resolve calls against real
+//                   projection URLs (stratified sample, mirrors
+//                   scripts/resolver-acceptance.ts).
+//
+// `seed --days-back N --seal` (columnar scan routing, 2026-08-18) spreads
+// the synthetic backlog across N closed calendar days (instead of all on
+// "today") and pre-seals them via the built `seal --run` CLI subcommand, so
+// a `run` cloned from that seed-base has real `_BAC/seal/*.parquet`
+// segments on disk — the precondition for SIDETRACK_COLUMNAR_SCANS to route
+// anything at all. `--days-back 0` (default) keeps today's exact prior
+// behavior (single day, unsealable, columnar routing a structural no-op).
 //
 // Safety: refuses to run against the live daily vault path, same guard as
 // resolver-acceptance.ts. Only ever reads --source/--seed-base; all
@@ -260,36 +274,126 @@ const resolveOnce = async (handle: CompanionHandle, canonicalUrl: string): Promi
 
 const SEED_REPLICA_ID = 'harness-seed';
 const BROWSER_TIMELINE_OBSERVED = 'browser.timeline.observed';
+const USER_FLOW_REJECTED = 'user.flow.rejected';
 
-const seedBacklog = (vaultRoot: string, count: number): void => {
-  const day = new Date().toISOString().slice(0, 10);
+// `daysBack` (columnar scan routing, 2026-08-18) — when omitted/0, behavior
+// is BYTE-IDENTICAL to before (all `count` events on "today", one shard,
+// timeline-only): every existing caller/test keeps working unchanged. When
+// > 0, spreads `count` timeline events evenly across `daysBack` CLOSED
+// calendar days ending YESTERDAY (never "today" — matches
+// eventSeal.ts's runEventSealPass, which never seals the open day), one
+// shard file per day, so `seal --run` (sealSeedBase below) has real
+// multi-day history to seal. Also writes one USER_FLOW_REJECTED event per
+// day — a real feedback type (src/feedback/events.ts), the same shape
+// workGraphHealth.ts's readEventsForHealth folds — so the columnar-routed
+// health-fold consumer has real matching rows spanning sealed history to
+// read, not an empty type-scoped scan that would be cheap either way.
+const seedBacklog = (
+  vaultRoot: string,
+  count: number,
+  options: { readonly daysBack?: number } = {},
+): void => {
+  const daysBack = Math.max(0, Math.floor(options.daysBack ?? 0));
   const dir = join(vaultRoot, '_BAC', 'log', SEED_REPLICA_ID);
   mkdirSync(dir, { recursive: true });
-  const lines: string[] = [];
-  const baseMs = Date.now() - count * 1000;
-  for (let i = 1; i <= count; i += 1) {
-    const observedAt = new Date(baseMs + i * 1000).toISOString();
-    const url = `https://harness.read-amp.test/seed/${String(i)}`;
-    const event = {
-      clientEventId: `harness-seed-${String(i)}`,
-      dot: { replicaId: SEED_REPLICA_ID, seq: i },
-      deps: {},
-      aggregateId: observedAt.slice(0, 10),
-      type: BROWSER_TIMELINE_OBSERVED,
-      payload: {
-        eventId: `harness-seed-${String(i)}`,
-        url,
-        canonicalUrl: url,
-        title: `Read-amp harness seed ${String(i)}`,
-        observedAt,
-        transition: 'activated',
-        provider: 'generic',
-      },
-      acceptedAtMs: baseMs + i * 1000,
-    };
-    lines.push(JSON.stringify(event));
+
+  if (daysBack === 0) {
+    const day = new Date().toISOString().slice(0, 10);
+    const lines: string[] = [];
+    const baseMs = Date.now() - count * 1000;
+    for (let i = 1; i <= count; i += 1) {
+      lines.push(JSON.stringify(timelineEvent(i, baseMs + i * 1000)));
+    }
+    writeFileSync(join(dir, `${day}.jsonl`), `${lines.join('\n')}\n`, 'utf8');
+    return;
   }
-  writeFileSync(join(dir, `${day}.jsonl`), `${lines.join('\n')}\n`, 'utf8');
+
+  // Spread across [daysBack .. 1] days ago, i.e. never today. Events per
+  // day distributed evenly (remainder to the earliest days).
+  const perDay = Math.floor(count / daysBack);
+  let remainder = count - perDay * daysBack;
+  let seq = 0;
+  for (let daysAgo = daysBack; daysAgo >= 1; daysAgo -= 1) {
+    const dayStartMs = Date.parse(
+      `${new Date(Date.now() - daysAgo * 24 * 60 * 60 * 1000).toISOString().slice(0, 10)}T09:00:00.000Z`,
+    );
+    const day = new Date(dayStartMs).toISOString().slice(0, 10);
+    const thisDayCount = perDay + (remainder > 0 ? 1 : 0);
+    if (remainder > 0) remainder -= 1;
+    const lines: string[] = [];
+    // One feedback-type event per day FIRST (distinct seq, still causally
+    // valid — this seed writes directly to a synthetic replica's shard, no
+    // ordering contract beyond strictly-increasing per-replica seq).
+    seq += 1;
+    lines.push(JSON.stringify(feedbackEvent(seq, dayStartMs, day)));
+    for (let i = 0; i < thisDayCount; i += 1) {
+      seq += 1;
+      lines.push(JSON.stringify(timelineEvent(seq, dayStartMs + (i + 1) * 1000)));
+    }
+    writeFileSync(join(dir, `${day}.jsonl`), `${lines.join('\n')}\n`, 'utf8');
+  }
+};
+
+const timelineEvent = (seq: number, acceptedAtMs: number): object => {
+  const observedAt = new Date(acceptedAtMs).toISOString();
+  const url = `https://harness.read-amp.test/seed/${String(seq)}`;
+  return {
+    clientEventId: `harness-seed-${String(seq)}`,
+    dot: { replicaId: SEED_REPLICA_ID, seq },
+    deps: {},
+    aggregateId: observedAt.slice(0, 10),
+    type: BROWSER_TIMELINE_OBSERVED,
+    payload: {
+      eventId: `harness-seed-${String(seq)}`,
+      url,
+      canonicalUrl: url,
+      title: `Read-amp harness seed ${String(seq)}`,
+      observedAt,
+      transition: 'activated',
+      provider: 'generic',
+    },
+    acceptedAtMs,
+  };
+};
+
+const feedbackEvent = (seq: number, acceptedAtMs: number, day: string): object => ({
+  clientEventId: `harness-seed-feedback-${String(seq)}`,
+  dot: { replicaId: SEED_REPLICA_ID, seq },
+  deps: {},
+  aggregateId: `harness-seed-feedback-${day}`,
+  type: USER_FLOW_REJECTED,
+  payload: {
+    payloadVersion: 1,
+    relationKind: 'closest_visit',
+    fromId: `harness-seed-from-${day}`,
+    toId: `harness-seed-to-${day}`,
+    reason: 'other',
+  },
+  acceptedAtMs,
+});
+
+// Pre-seals a `seed`d vault (columnar scan routing, 2026-08-18): spawns the
+// BUILT `seal` CLI subcommand (same dist/ entrypoint contract as
+// companionEntrypoint — the sealer's own DuckDB write path needs no
+// reconcile-child fork, but this keeps ONE built-artifact contract for the
+// whole script) with SIDETRACK_EVENT_STORE=1 SIDETRACK_EVENT_SEAL=1, so the
+// seed-base a `run` clones from already has real `_BAC/seal/*.parquet`
+// segments on disk — cloning (cp -Rc) then carries them forward into every
+// trial, matching the seed/run split's own "seed once, clone per trial"
+// design.
+const sealSeedBase = (vaultRoot: string): void => {
+  const result = spawnSync(
+    process.execPath,
+    [companionEntrypoint(), 'seal', '--vault', vaultRoot, '--run', '--json'],
+    {
+      env: { ...process.env, SIDETRACK_EVENT_STORE: '1', SIDETRACK_EVENT_SEAL: '1' },
+      encoding: 'utf8',
+    },
+  );
+  if (result.status !== 0) {
+    throw new Error(`seal --run failed (status=${String(result.status)}): ${result.stderr}`);
+  }
+  console.log(`[seed] sealed: ${result.stdout.trim()}`);
 };
 
 // ---------------------------------------------------------------------------
@@ -311,8 +415,8 @@ interface Phase {
 }
 
 const usage = `Usage:
-  bun run scripts/read-amplification-harness.ts seed --source <vault-COPY> --out <dir> [--backlog 4000]
-  bun run scripts/read-amplification-harness.ts run --seed-base <dir> --manifest <out.json> --label <str> [--resolve-count 40] [--settle-ms 45000] [--keep-copy]
+  bun run scripts/read-amplification-harness.ts seed --source <vault-COPY> --out <dir> [--backlog 4000] [--days-back 0] [--seal]
+  bun run scripts/read-amplification-harness.ts run --seed-base <dir> --manifest <out.json> --label <str> [--resolve-count 40] [--health-poll-count 5] [--settle-ms 45000] [--keep-copy]
 `;
 
 const argVal = (argv: readonly string[], flag: string): string | undefined => {
@@ -324,6 +428,8 @@ const runSeed = async (argv: readonly string[]): Promise<void> => {
   const source = argVal(argv, '--source');
   const out = argVal(argv, '--out');
   const backlog = Number(argVal(argv, '--backlog') ?? '4000');
+  const daysBack = Number(argVal(argv, '--days-back') ?? '0');
+  const seal = argv.includes('--seal');
   if (source === undefined || out === undefined) {
     process.stderr.write(usage);
     throw new Error('--source and --out are required.');
@@ -335,8 +441,19 @@ const runSeed = async (argv: readonly string[]): Promise<void> => {
   await rm(resolvedOut, { recursive: true, force: true });
   console.log(`[seed] copying ${resolvedSource} -> ${resolvedOut}`);
   await copyVaultTree(resolvedSource, resolvedOut);
-  console.log(`[seed] writing ${String(backlog)} synthetic backlog events`);
-  seedBacklog(resolvedOut, backlog);
+  console.log(
+    `[seed] writing ${String(backlog)} synthetic backlog events` +
+      (daysBack > 0 ? ` spread across ${String(daysBack)} closed days` : ' (today)'),
+  );
+  seedBacklog(resolvedOut, backlog, { daysBack });
+  if (seal) {
+    if (daysBack <= 0) {
+      console.warn('[seed] --seal with --days-back=0 seals nothing (today is never sealed) — ignoring.');
+    } else {
+      console.log('[seed] sealing closed days via `seal --run`');
+      sealSeedBase(resolvedOut);
+    }
+  }
   console.log(`[seed] done: ${resolvedOut}`);
 };
 
@@ -345,6 +462,7 @@ const runMeasurement = async (argv: readonly string[]): Promise<void> => {
   const manifestOut = argVal(argv, '--manifest');
   const label = argVal(argv, '--label') ?? 'run';
   const resolveCount = Number(argVal(argv, '--resolve-count') ?? '40');
+  const healthPollCount = Number(argVal(argv, '--health-poll-count') ?? '5');
   const settleMs = Number(argVal(argv, '--settle-ms') ?? '45000');
   const keepCopy = argv.includes('--keep-copy');
   if (seedBase === undefined || manifestOut === undefined) {
@@ -432,6 +550,32 @@ const runMeasurement = async (argv: readonly string[]): Promise<void> => {
     const bridgeKey = await readBridgeKeyWithRetry(vaultCopy, 5_000);
     handle = { proc, pid: proc.pid, port, baseUrl, vaultRoot: vaultCopy, logPath, bridgeKey };
 
+    // --- Phase 1b: health poll (columnar scan routing, 2026-08-18) ---
+    // GET /v1/system/health BEFORE settle, while no connections drain has
+    // produced a fresh workGraphHealth artifact yet (systemRoutes.ts's
+    // readWorkGraphHealthArtifact freshness check) — this forces each call
+    // to go through a LIVE collectWorkGraphHealth compute, i.e. through
+    // workGraphHealth.ts's readEventsForHealth, the routed consumer this
+    // phase exists to isolate. Polling AFTER settle would mostly hit the
+    // drain-time artifact cache instead and measure nothing.
+    const before1b = readingAt();
+    const healthPollStart = performance.now();
+    const healthStatusCounts: Record<string, number> = {};
+    for (let i = 0; i < healthPollCount; i += 1) {
+      const res = await fetch(`${baseUrl}/v1/system/health`, {
+        headers: { 'x-bac-bridge-key': bridgeKey },
+      });
+      const key = String(res.status);
+      healthStatusCounts[key] = (healthStatusCounts[key] ?? 0) + 1;
+    }
+    const after1b = readingAt();
+    phases.push({
+      name: 'healthPoll',
+      durationMs: performance.now() - healthPollStart,
+      bytesRead: after1b.diskioBytesRead - before1b.diskioBytesRead,
+      bytesWritten: after1b.diskioBytesWritten - before1b.diskioBytesWritten,
+    });
+
     // --- Phase 2: settle (background catch-up / topic / embed lane) ---
     const before2 = readingAt();
     const settleStart = performance.now();
@@ -472,9 +616,13 @@ const runMeasurement = async (argv: readonly string[]): Promise<void> => {
       env: {
         SIDETRACK_SQLITE_CACHE_MB: process.env['SIDETRACK_SQLITE_CACHE_MB'] ?? '(default)',
         SIDETRACK_SQLITE_MMAP_MB: process.env['SIDETRACK_SQLITE_MMAP_MB'] ?? '(default)',
+        SIDETRACK_EVENT_SEAL: process.env['SIDETRACK_EVENT_SEAL'] ?? '(default/off)',
+        SIDETRACK_COLUMNAR_SCANS: process.env['SIDETRACK_COLUMNAR_SCANS'] ?? '(default/on)',
       },
       seedBase: resolvedSeedBase,
       resolveCount: targets.length,
+      healthPollCount,
+      healthStatusCounts,
       settleMs,
       phases,
       totals: {

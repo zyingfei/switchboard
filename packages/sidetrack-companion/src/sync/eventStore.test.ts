@@ -220,6 +220,30 @@ describe('EventStore sqlite', () => {
     expect(store.readSince({})).toEqual(referenceReadSince(events, {}));
     store.close();
   });
+
+  sqliteIt(
+    'readEventsForDay returns full-fidelity events (deps/target/hlc intact) day-bounded',
+    async () => {
+      const dayA = event({ replicaId: 'replica-a', seq: 1, acceptedAtMs: Date.parse('2026-05-01T10:00:00.000Z') });
+      const dayAlate = event({ replicaId: 'replica-a', seq: 2, acceptedAtMs: Date.parse('2026-05-01T23:59:59.000Z') });
+      const dayB = event({ replicaId: 'replica-a', seq: 3, acceptedAtMs: Date.parse('2026-05-02T00:00:01.000Z') });
+      const otherReplica = event({ replicaId: 'replica-b', seq: 1, acceptedAtMs: Date.parse('2026-05-01T12:00:00.000Z') });
+      const vault = await tempVault();
+      const store = await createEventStore(vault);
+      store.ingestMany([dayA, dayAlate, dayB, otherReplica]);
+
+      const rows = store.readEventsForDay('replica-a', '2026-05-01');
+      expect(rows).toEqual([dayA, dayAlate]);
+      // Full AcceptedEvent fidelity — unlike readSealRows/the sealed-scan
+      // router's output, this preserves deps/target/hlc exactly.
+      expect(rows[0]?.deps).toEqual(dayA.deps);
+      expect(rows[0]?.target).toEqual(dayA.target);
+      expect(rows[0]?.hlc).toEqual(dayA.hlc);
+      expect(store.readEventsForDay('replica-a', '2026-05-02')).toEqual([dayB]);
+      expect(store.readEventsForDay('replica-a', '2026-05-03')).toEqual([]);
+      store.close();
+    },
+  );
 });
 
 describe('EventStore data-loss counters', () => {
