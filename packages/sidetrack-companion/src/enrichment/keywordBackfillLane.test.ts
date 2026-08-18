@@ -431,6 +431,64 @@ describe('scheduleKeywordBackfillLoop — production wiring', () => {
     15_000,
   );
 
+  sqliteIt(
+    'self-heals a degenerate concept distribution found at scheduler startup, before the lane runs its first cycle (2026-08-17 incident)',
+    async () => {
+      await setUp();
+
+      // Seed the EXACT live-incident shape directly on disk: 25 distinct
+      // keywords already indexed, all collapsed into ONE concept via a
+      // constant-vector embedder — mirroring the real vault's 360-
+      // keyword/1-concept finding, then close the handles so the
+      // scheduler opens its own (matching real boot: this vault's stores
+      // already exist with degenerate data from a PRIOR run).
+      const seedIndex = await createKeywordIndexStore(vaultRoot);
+      const seedConcepts = await createKeywordConceptStore(vaultRoot);
+      const keywords = Array.from({ length: 25 }, (_, i) => `seedword${String(i)}`);
+      seedIndex.upsertPageKeywords('url:https://seed.example/', keywords, 'llm', 1);
+      const constant = new Float32Array(384);
+      constant[0] = 1;
+      for (const keyword of keywords) seedConcepts.assignKeyword(keyword, constant, 1);
+      expect(seedConcepts.stats()).toEqual({ distinctKeywords: 25, distinctConcepts: 1 });
+      seedIndex.close();
+      seedConcepts.close();
+
+      const lines: string[] = [];
+      dispose = scheduleKeywordBackfillLoop(eventLog, vaultRoot, {
+        startupDelayMs: 0,
+        config: { batchCap: 20, cycleIntervalMs: 50, idleIntervalMs: 50, maxAttemptsPerPage: 3 },
+        log: (message) => lines.push(message),
+      });
+
+      const deadline = Date.now() + 10_000;
+      while (
+        !lines.some((line) => line.startsWith('[keyword-concepts] repair complete')) &&
+        Date.now() < deadline
+      ) {
+        await new Promise((resolve) => setTimeout(resolve, 25));
+      }
+      expect(lines.some((line) => line.startsWith('[keyword-concepts] repair complete'))).toBe(
+        true,
+      );
+      expect(
+        lines.some((line) => line.includes('degenerate concept distribution detected')),
+      ).toBe(true);
+
+      const concepts = await createKeywordConceptStore(vaultRoot);
+      try {
+        const after = concepts.stats();
+        expect(after.distinctKeywords).toBe(25);
+        // The content-hash embedder (setUp) is discriminative — repair
+        // must produce MORE than the one degenerate concept it started
+        // with.
+        expect(after.distinctConcepts).toBeGreaterThan(1);
+      } finally {
+        concepts.close();
+      }
+    },
+    15_000,
+  );
+
   sqliteIt('disabled via SIDETRACK_KEYWORD_BACKFILL=0 — no store handle opens, one boot line, no-op disposer', async () => {
     await setUp();
     const prevFlag = process.env[KEYWORD_BACKFILL_ENV];

@@ -54,6 +54,17 @@ export interface KeywordConceptStore {
    *  (keywords never assigned yet) skipped. */
   readonly conceptIdsForKeywords: (keywords: readonly string[]) => readonly string[];
   readonly stats: () => { readonly distinctKeywords: number; readonly distinctConcepts: number };
+  /**
+   * Wipe every concept assignment + centroid (keyword_concept,
+   * concept_centroid, and the concept-id sequence) — used ONLY by the
+   * degenerate-distribution self-heal repair (keywordIngest.ts's
+   * repairDegenerateKeywordConcepts). Concept tables are DERIVED state
+   * (keyword-index.db's keyword_posting/keyword_page remain the source of
+   * truth for which keywords exist), so this is always safe to call
+   * immediately before a full reassignment pass — never partial, never
+   * called mid-way through normal operation.
+   */
+  readonly reset: () => void;
   readonly close: () => void;
 }
 
@@ -244,6 +255,19 @@ export const createKeywordConceptStore = async (
     };
   };
 
+  const reset = (): void => {
+    db.exec('BEGIN');
+    try {
+      db.exec('DELETE FROM keyword_concept');
+      db.exec('DELETE FROM concept_centroid');
+      db.exec('UPDATE concept_seq SET next_value = 1 WHERE id = 1');
+      db.exec('COMMIT');
+    } catch (error) {
+      db.exec('ROLLBACK');
+      throw error;
+    }
+  };
+
   return {
     conceptForKeyword,
     hasKeyword,
@@ -251,6 +275,7 @@ export const createKeywordConceptStore = async (
     assignKeyword,
     conceptIdsForKeywords,
     stats,
+    reset,
     close: () => {
       db.close?.();
     },

@@ -39,7 +39,11 @@ import { createRevision } from '../domain/ids.js';
 import type { EventLog } from '../sync/eventLog.js';
 import type { EntityTitleEnrichedKind } from './events.js';
 import { loadGistLookup, parseGistLookupKey, type GistLookup } from './contentEnrichment.js';
-import { ingestGistKeywords, keywordIngestEnabled } from './keywordIngest.js';
+import {
+  ingestGistKeywords,
+  keywordIngestEnabled,
+  repairDegenerateKeywordConcepts,
+} from './keywordIngest.js';
 import { createKeywordConceptStore, type KeywordConceptStore } from './keywordConceptStore.js';
 import { createKeywordIndexStore, type KeywordIndexStore } from '../search-index/keywordIndexStore.js';
 
@@ -452,7 +456,14 @@ const buildKeywordBackfillDeps = (
   },
   hasIndexed: async (pageKey) => handles.keywordIndex.hasPage(pageKey),
   indexCandidate: async (candidate) => {
-    const result = await ingestGistKeywords(vaultRoot, candidate.kind, candidate.id, candidate.gist);
+    const result = await ingestGistKeywords(
+      vaultRoot,
+      candidate.kind,
+      candidate.id,
+      candidate.gist,
+      Date.now(),
+      log,
+    );
     if (!result.ingested) {
       throw new Error(`keyword backfill: ingestGistKeywords did not ingest ${candidate.pageKey}`);
     }
@@ -534,6 +545,21 @@ export const scheduleKeywordBackfillLoop = (
           return;
         }
         handles = { keywordIndex, concepts };
+        // ONE-TIME SELF-HEAL, before the lane starts (see
+        // keywordIngest.ts's repairDegenerateKeywordConcepts header for why
+        // "on lane start" and not "every cycle"). A no-op (returns
+        // `repaired: false`) on every normal boot — this only does work
+        // when the concept distribution is ALREADY degenerate, which a
+        // healthy embedder + threshold should never produce. Best-effort:
+        // a repair failure must never prevent the lane itself from
+        // starting, since the lane's own ingest path already tolerates a
+        // degenerate concept store (keywordIngest.ts's audible guards).
+        try {
+          await repairDegenerateKeywordConcepts(vaultRoot, keywordIndex, concepts, log);
+        } catch (error) {
+          log(`[keyword-backfill] concept repair failed: ${String(error)}`);
+        }
+        if (disposed) return;
         const deps = buildKeywordBackfillDeps(vaultRoot, eventLog, handles, log);
         lane = createKeywordBackfillLane(deps, options?.config);
         lane.start();

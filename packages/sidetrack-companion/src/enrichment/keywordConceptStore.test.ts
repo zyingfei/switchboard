@@ -111,6 +111,30 @@ describe('keywordConceptStore', () => {
     }
   });
 
+  sqliteIt('reset() wipes concept assignments/centroids and restarts the id sequence, without touching keyword identity', async () => {
+    const vaultRoot = await makeVault();
+    const store = await createKeywordConceptStore(vaultRoot);
+    try {
+      store.assignKeyword('kubernetes', vec(1, 0, 0), 100, 0.9);
+      store.assignKeyword('sourdough', vec(0, 1, 0), 200, 0.9);
+      expect(store.stats().distinctKeywords).toBe(2);
+      expect(store.stats().distinctConcepts).toBe(2);
+
+      store.reset();
+      expect(store.stats().distinctKeywords).toBe(0);
+      expect(store.stats().distinctConcepts).toBe(0);
+      expect(store.conceptForKeyword('kubernetes')).toBeUndefined();
+      expect(store.allCentroids()).toEqual([]);
+
+      // The id sequence restarts too — a fresh assignment after reset mints
+      // "concept-1" again rather than continuing from where it left off.
+      const outcome = store.assignKeyword('kubernetes', vec(1, 0, 0), 300);
+      expect(outcome.conceptId).toBe('concept-1');
+    } finally {
+      store.close();
+    }
+  });
+
   sqliteIt('reports stats reflecting distinct keywords vs distinct concepts', async () => {
     const vaultRoot = await makeVault();
     const store = await createKeywordConceptStore(vaultRoot);
