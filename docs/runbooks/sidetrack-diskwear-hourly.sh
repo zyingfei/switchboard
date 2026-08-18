@@ -62,6 +62,29 @@ entry = {
     "conn": du_bytes(f"{home}/.sidetrack-vault/_BAC/connections"),
     "conn_test": du_bytes(f"{home}/.sidetrack-vault-test/_BAC/connections"),
 }
+# Per-process kernel disk-IO counters (proc_pid_rusage, no root needed) —
+# the ONLY honest per-process write measure: du deltas miss in-place WAL
+# churn entirely (2026-08-17 user-methodology correction). Counters are
+# per-pid lifetime; a pid change means restart — record pid so readers
+# treat the first post-restart delta as a reset, not a negative.
+for name, port in (("proc_test", 17374), ("proc_daily", 17373)):
+    try:
+        pid = int(subprocess.run(["lsof", f"-iTCP:{port}", "-sTCP:LISTEN", "-t"],
+                                 capture_output=True, text=True, timeout=20).stdout.split()[0])
+        r = subprocess.run(["bun", "-e", (
+            "import{dlopen,FFIType,ptr}from'bun:ffi';"
+            "const l=dlopen('/usr/lib/libproc.dylib',{proc_pid_rusage:{args:[FFIType.i32,FFIType.i32,FFIType.ptr],returns:FFIType.i32}});"
+            "const b=new BigUint64Array(64);"
+            f"if(l.symbols.proc_pid_rusage({pid},4,ptr(b))===0)process.stdout.write(String(Number(b[18]))+' '+String(Number(b[19])));"
+        )], capture_output=True, text=True, timeout=30,
+            env={**os.environ, "PATH": os.path.expanduser("~/.bun/bin") + ":" + os.environ.get("PATH", "")})
+        parts = r.stdout.split()
+        if len(parts) == 2:
+            entry[f"{name}_pid"] = pid
+            entry[f"{name}_read"] = int(parts[0])
+            entry[f"{name}_written"] = int(parts[1])
+    except Exception:
+        pass
 
 lines = []
 if os.path.exists(log_path):
@@ -84,8 +107,23 @@ os.replace(log_path + ".tmp", log_path)
 
 breach = ""
 d1 = entry.get("written_delta_1h")
-if isinstance(d1, int) and d1 > hourly_alert:
-    breach = f"hourly {d1/1e9:.1f}GB > {hourly_alert/1e9:.0f}GB"
+elapsed_s = None
+if prev:
+    try:
+        from datetime import datetime
+        fmt = "%Y-%m-%dT%H:%M:%SZ"
+        elapsed_s = (datetime.strptime(entry["ts"], fmt)
+                     - datetime.strptime(prev["ts"], fmt)).total_seconds()
+    except Exception:
+        elapsed_s = None
+# Rate-normalized: compare bytes/hour, and only after >=30min elapsed so a
+# RunAtLoad capture minutes after the previous one cannot fake an hourly
+# number (root cause of the first confusing alarm). NOTE: no apostrophes or
+# double quotes in comments here — macOS bash 3.2 mis-lexes quote chars
+# inside a heredoc nested in command substitution.
+if (isinstance(d1, int) and elapsed_s and elapsed_s >= 1800
+        and d1 * 3600 / elapsed_s > hourly_alert):
+    breach = f"{d1/1e9:.1f}GB in {elapsed_s/60:.0f}min (rate > {hourly_alert/1e9:.0f}GB/h)"
 window = [json.loads(l) for l in lines[-7:]]
 if not breach and len(window) >= 2:
     span = window[-1]["written"] - window[0]["written"]
@@ -93,6 +131,8 @@ if not breach and len(window) >= 2:
         breach = f"trailing-6h {span/1e9:.1f}GB > {sixhour_alert/1e9:.0f}GB"
 
 if breach:
+    st_delta = sum(entry.get(f"{k}_delta_1h") or 0 for k in ("vault", "vault_test"))
+    breach = f"machine {breach}; sidetrack dirs {st_delta/1e6:+.0f}MB"
     attribution = ", ".join(
         f"{k}={entry[f'{k}_delta_1h']/1e6:+.0f}MB"
         for k in ("vault", "vault_test", "conn", "conn_test")
