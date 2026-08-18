@@ -99,6 +99,15 @@ export interface KeywordIndexStore {
     keyword: string,
     limit?: number,
   ) => readonly KeywordPostingRow[];
+  /** Every distinct keyword ever posted, alphabetical (stable order for
+   *  reproducible reassignment). Used by the degenerate-concept-
+   *  distribution self-heal repair (keywordIngest.ts's
+   *  repairDegenerateKeywordConcepts) to enumerate the full vocabulary to
+   *  re-embed — bounded by the same "dozens to low thousands of distinct
+   *  terms" vocabulary size this store's own header describes, so an
+   *  unbounded SELECT here is the same cheap shape as `stats()`, not an
+   *  O(corpus) scan. */
+  readonly distinctKeywords: () => readonly string[];
   readonly stats: () => KeywordIndexStats;
   readonly close: () => void;
 }
@@ -201,6 +210,9 @@ export const createKeywordIndexStore = async (vaultRoot: string): Promise<Keywor
   );
   const countDistinctKeywords = db.query('SELECT COUNT(DISTINCT keyword) AS c FROM keyword_posting');
   const countDistinctPages = db.query('SELECT COUNT(*) AS c FROM keyword_page');
+  const selectDistinctKeywords = db.query(
+    'SELECT DISTINCT keyword FROM keyword_posting ORDER BY keyword',
+  );
 
   const capPostingsFor = (keyword: string): void => {
     const row = countPostingsForKeyword.get(keyword) as { readonly c: number } | undefined;
@@ -277,12 +289,18 @@ export const createKeywordIndexStore = async (vaultRoot: string): Promise<Keywor
     };
   };
 
+  const distinctKeywords = (): readonly string[] => {
+    const rows = selectDistinctKeywords.all() as readonly { readonly keyword: string }[];
+    return rows.map((row) => row.keyword);
+  };
+
   return {
     upsertPageKeywords,
     removePage,
     keywordsForPage,
     hasPage,
     pagesForKeyword,
+    distinctKeywords,
     stats,
     close: () => {
       db.close?.();

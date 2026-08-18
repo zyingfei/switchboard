@@ -2228,3 +2228,172 @@ two new required fields), `runtime/companion.ts` (wires
 `scheduleSentenceVectorBackfillLoop`, same non-blocking + explicit-stop
 shape as the keyword backfill immediately above it). NOT touched, as
 scoped: `sync/contract/connectionsMaterializer.ts`.
+
+## §12 addendum — keyword-concept collapse: root cause + degenerate guard + self-heal (2026-08-17)
+
+**Live bug.** On the test vault, `_BAC/connections/keyword-index.db` had 446
+`keyword_posting` rows across 64 pages / 360 distinct keywords, but
+`keyword-concepts.db` showed `concept_centroid` count = 1 (`keyword_concept`
+had 360 rows, all pointing at the same `concept-1`). The keyword-backfill
+lane's own audible per-cycle mark (`concepts=1`) had been reporting this
+correctly the whole time — nothing was silent about the SYMPTOM, only about
+the underlying cause. This neutered every downstream consumer of concept
+ids: `splitSuggestionEngine.ts`'s concept-Jaccard hybrid-distance term
+(everything overlaps with everything), the per-domain keyword-entropy
+aggregator signal, and `newLabelHint.ts`'s keyword grouping.
+
+**Diagnosis method.** Copied `keyword-index.db` + `keyword-concepts.db` (+
+WALs) to a scratch dir, pulled real distinct keywords straight out of
+`keyword_posting`, and ran them through the ACTUAL production embed() path
+(`multilingual-e5-small`, not the test embedder) in a scratch script,
+printing pairwise cosines — the directive's own prescribed first step, and
+it discriminated immediately.
+
+**Root cause.** None of the three named hypotheses in the narrow sense
+(constant/zero embedder output; a centroid running-mean bug; a `>=` vs `<`
+threshold-comparison bug) — closest to hypothesis (a) in effect, but more
+precise: the embedder works correctly and returns real, finite, distinct
+vectors, but **for BARE, isolated single-word keyword inputs** (no sentence
+context) wrapped in the E5 "query: " prefix, the baseline pairwise cosine
+between totally UNRELATED words is ~0.78-0.87 — fully overlapping, and
+sometimes exceeding, genuinely related pairs. Measured on the real
+embedder:
+
+```
+cos(kubernetes, docker)   = 0.8391   (related — containers)
+cos(kubernetes, k8s)      = 0.8638   (near-synonym)
+cos(visa, passport)       = 0.8819   (related — travel)
+cos(kubernetes, sqlite)   = 0.8098   (unrelated)
+cos(kubernetes, visa)     = 0.8110   (unrelated)
+cos(security, travel)     = 0.8744   (unrelated — HIGHER than several related pairs above)
+```
+
+Because concept assignment is greedy ONLINE-LEADER clustering (join the
+first centroid scoring `>= threshold`, then fold into its running-mean
+centroid), any threshold at/below that noise floor (the old default, 0.82)
+creates a SELF-REINFORCING RUNAWAY: replaying the real algorithm against 20
+sequential real keywords, similarity to the first concept climbed
+0.83 → 0.93 as more members folded in, because the running-mean centroid
+drifts toward the model's shared "generic single word" direction, which
+makes the NEXT arbitrary keyword's cosine to it climb even higher. Sweeping
+the full real 360-keyword vocabulary through the unmodified algorithm at
+several thresholds confirmed this is not threshold-adjacent noise but a
+structural cliff:
+
+```
+threshold=0.82  concepts=1    largest concept holds 100.0% of vocabulary
+threshold=0.86  concepts=5    largest concept holds  98.9%
+threshold=0.88  concepts=31   largest concept holds  90.3%
+threshold=0.90  concepts=137  largest concept holds  58.9%   (still a dominant hub)
+threshold=0.92  concepts=298  largest concept holds   5.0%   (hub effect breaks)
+threshold=0.94  concepts=334  largest concept holds   0.8%
+```
+
+**Fix.**
+1. `enrichment/keywordConcepts.ts` — raised `DEFAULT_CONCEPT_COSINE_THRESHOLD`
+   from the guessed 0.82 to the empirically-calibrated **0.92** (doc comment
+   carries the measured evidence above so a future reader isn't looking at
+   a bare number). This is a real, accepted trade-off: 0.92 legitimately
+   misses some synonym pairs a human would merge (e.g. "kubernetes"/"k8s"
+   at 0.864 now falls short) in exchange for eliminating the unbounded
+   runaway-collapse failure mode. Still flagged for golden-set tuning, now
+   anchored to measured data instead of a guess.
+2. Added pure guards: `isDegenerateEmbedding` (all-zero/non-finite/empty
+   vector), `isIdenticalVectorBatch` (2+ keywords getting the exact SAME
+   vector back — the literal signature hypothesis (a) named, e.g. a
+   degraded/fallback embedder), and `isConceptDistributionDegenerate`
+   (distinct keywords past a floor of 20 but concepts `<= 1`) — the SAME
+   predicate drives both the ongoing audible check and the self-heal
+   trigger below, so "warn" and "repair" can never drift apart.
+3. `enrichment/keywordIngest.ts`'s `ingestGistKeywords` now checks
+   degenerate/identical embeddings BEFORE folding anything into a centroid
+   and skips (never invents) with a throttled (60s/vault) audible log line,
+   plus an ongoing post-assignment check for a collapsing distribution —
+   catches a fresh collapse starting DURING live ingest, not just one
+   discovered at the next restart.
+4. ONE-TIME SELF-HEAL: `repairDegenerateKeywordConcepts` (new,
+   `keywordIngest.ts`) — if the concept distribution is degenerate, resets
+   `concept_centroid`/`keyword_concept`/`concept_seq`
+   (`keywordConceptStore.ts`'s new `reset()`) and reassigns from
+   `keyword-index.db`'s existing vocabulary (`keywordIndexStore.ts`'s new
+   `distinctKeywords()`) through the real embedder at the corrected
+   threshold. Aborts (leaves tables reset, not re-collapsed) if the
+   embedder is STILL degenerate at repair time. Wired into
+   `keywordBackfillLane.ts`'s `scheduleKeywordBackfillLoop`, called once
+   right after the scheduler opens its store handles and before the lane's
+   first cycle — deploy-and-forget, no CLI needed. A no-op on every healthy
+   boot.
+
+**End-to-end verification, on a COPY of the real test-vault DBs** (never
+the live vault; copied to a scratch `_BAC/connections/` dir). Ran the
+actual `repairDegenerateKeywordConcepts` through the real production
+embedder:
+
+```
+BEFORE: distinctKeywords=360, distinctConcepts=1
+[keyword-concepts] degenerate concept distribution detected (distinctKeywords=360 distinctConcepts=1) — resetting and reassigning
+[keyword-concepts] repair complete: 360/360 keywords reassigned into 298 concepts
+AFTER:  distinctKeywords=360, distinctConcepts=298
+```
+
+38 concepts have 2+ members, 260 are singletons. Sample groupings look
+semantically sane for genuine morphological/near-synonym variants —
+`data/database`, `code/coding`, `document/documentation`,
+`developer/development`, `function/functions`, `anthropic/anthropogenic`,
+`agency/agents`, `correct/correction/correctness` — with one honest caveat:
+the largest residual concept still holds 18 members (~5% of the
+vocabulary, matching the calibration sweep's own 5.0% figure at this
+threshold) — a small, bounded hub, not the 100% collapse this incident
+started from. Also honest: `docker`/`duckdb`/`sqlite`/`database` did NOT
+merge into one "database tooling" concept at 0.92 (their pairwise cosines,
+0.81-0.86, sit below the new threshold) — the accepted precision-over-
+recall trade-off described above, not a bug.
+
+**Tests.** `keywordConcepts.test.ts` — unit tests for the three new guard
+predicates, plus a synthetic-embedding regression (shaped to the measured
+0.85 baseline-noise cosine, not orthogonal test vectors) that pins BOTH the
+old threshold's catastrophic collapse and the new threshold's non-collapse,
+so a future revert of the constant is caught without depending on the real
+model. `keywordConceptStore.test.ts` — `reset()`. `keywordIndexStore.test.ts`
+— `distinctKeywords()`. `keywordIngest.test.ts` — degenerate-embedding
+guard fires (skipped, not assigned); identical-vector-batch guard fires;
+concept-distribution guard fires across separate live-ingest calls;
+distinct real-ish keywords resolve to multiple concepts via the real
+deterministic embedder (`SIDETRACK_TEST_EMBEDDER=1`, same precedent as
+`http/prototypeLaneWiring.test.ts`, no ONNX download needed in CI);
+`repairDegenerateKeywordConcepts` no-ops when healthy, repairs a seeded
+degenerate distribution into multiple concepts, and aborts cleanly when the
+embedder is still degenerate at repair time. `keywordBackfillLane.test.ts`
+— end-to-end: a degenerate distribution seeded on disk before
+`scheduleKeywordBackfillLoop` starts is self-healed before the lane's first
+cycle.
+
+**Files changed.** MODIFIED —
+`enrichment/keywordConcepts.ts` (threshold 0.82→0.92 +
+`isDegenerateEmbedding`/`isIdenticalVectorBatch`/
+`isConceptDistributionDegenerate`), `enrichment/keywordConcepts.test.ts`,
+`enrichment/keywordConceptStore.ts` (`reset()`),
+`enrichment/keywordConceptStore.test.ts`,
+`search-index/keywordIndexStore.ts` (`distinctKeywords()`),
+`search-index/keywordIndexStore.test.ts`,
+`enrichment/keywordIngest.ts` (degenerate-input guards in
+`ingestGistKeywords`, throttled audible logging, new
+`repairDegenerateKeywordConcepts` + `resetDegenerateLogThrottleForTest`),
+`enrichment/keywordIngest.test.ts`,
+`enrichment/keywordBackfillLane.ts` (wires the repair into
+`scheduleKeywordBackfillLoop`'s startup, threads `log` into
+`ingestGistKeywords`), `enrichment/keywordBackfillLane.test.ts`. NOT
+touched, as scoped: `sync/contract/connectionsMaterializer.ts`.
+
+**Deviations from the directive.** The directive's three named hypotheses
+were investigated in the prescribed order, but the actual finding didn't
+fit any of them cleanly — reported as measured instead of forced into one
+box (see Root cause above). The directive's degenerate-guard example
+("all-zero, or identical vector repeated N times") is implemented exactly
+as literal cases (`isDegenerateEmbedding`, `isIdenticalVectorBatch`), but
+those alone would NOT have caught the actual live incident, since the real
+embeddings were finite and non-identical — the threshold recalibration is
+the change that actually fixes the observed collapse; the guards are the
+"impossible to miss" layer for the LITERAL failure shapes named, which is
+still a real and separate risk class (e.g. an embedder that degrades to a
+fallback constant in the future).

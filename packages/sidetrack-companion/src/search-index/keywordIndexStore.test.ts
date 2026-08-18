@@ -139,6 +139,18 @@ describe('keywordIndexStore', () => {
     }
   });
 
+  sqliteIt('distinctKeywords lists every distinct keyword alphabetically, deduped across pages', async () => {
+    const vaultRoot = await makeVault();
+    const store = await createKeywordIndexStore(vaultRoot);
+    try {
+      store.upsertPageKeywords('url:https://a.example/', ['kubernetes', 'docker'], 'llm', 100);
+      store.upsertPageKeywords('url:https://b.example/', ['docker', 'sourdough'], 'llm', 200);
+      expect(store.distinctKeywords()).toEqual(['docker', 'kubernetes', 'sourdough']);
+    } finally {
+      store.close();
+    }
+  });
+
   sqliteIt('survives a reopen against the same vault (durable, not in-memory only)', async () => {
     const vaultRoot = await makeVault();
     const first = await createKeywordIndexStore(vaultRoot);
