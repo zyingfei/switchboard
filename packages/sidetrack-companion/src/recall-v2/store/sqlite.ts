@@ -19,6 +19,7 @@ import { getSqliteDriver, type SqliteHandle, type SqliteStatement } from './driv
 // Dependency-free leaf (no ONNX, no runtime weight) — safe to import from the
 // store, which is on the server's static import graph.
 import { RECALL_MODEL } from '../../recall/modelManifest.js';
+import { hotCachePragmaSql } from '../../storage/sqliteCachePragmas.js';
 
 import type {
   RecallStore,
@@ -240,6 +241,11 @@ class SqliteRecallStore implements RecallStore {
     const driver = getSqliteDriver();
     this.db = driver.open(dbPath);
     this.db.exec(SCHEMA);
+    // Hot, held-for-process-lifetime handle — see
+    // storage/sqliteCachePragmas.ts (read-amplification). No-op-safe on
+    // ':memory:' test handles (mmap_size only affects the main db file;
+    // cache_size still applies uniformly).
+    this.db.exec(hotCachePragmaSql('recallV2Index'));
     // Migration for `prototypes` rows created before prototype-lane v2
     // (docs/plans/2026-08-16-category-flexibility-hyde.md §11): the raw
     // SCHEMA's `CREATE TABLE IF NOT EXISTS` is a no-op against an

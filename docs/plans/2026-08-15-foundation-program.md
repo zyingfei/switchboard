@@ -637,6 +637,195 @@ PR body for the actual numbers).
 
 ## Landing notes (current state, dated)
 
+**2026-08-18 — read-amplification: SQLite cache/mmap tuning on the three
+hot stores (perf/read-amplification).** Not an F1–F7 item; filed here per
+the "binding plan tracks reality" rule. Responds to kernel-counter LIVE
+EVIDENCE (proc_pid_rusage, the same ops/proc-rusage-telemetry methodology
+already landed in docs/runbooks/sidetrack-diskwear-hourly.sh): the daily
+test companion read 46.2 GB in ~45 min of boot catch-up + topic pass +
+embed backlog (writes were already fixed at 1.5 GB).
+
+**Audit (before this change) — grepped `cache_size`/`mmap_size` across every
+`PRAGMA journal_mode = WAL` block in src/: zero hits anywhere.** Every store
+module (sync/eventStore.ts, connections/snapshot.ts ×3 DDL blocks,
+recall-v2/store/sqlite.ts, page-content/store.ts, page-evidence/store.ts,
+search-index/*, engagement/engagementFactsStore.ts,
+threads/threadRegisterStore.ts, workstreams/*, timeline/timelineFactsStore.ts,
+connections/repairQueueStore.ts, enrichment/keywordConceptStore.ts) sets only
+`journal_mode = WAL` (+ `busy_timeout = 2500` on most) — bun:sqlite's
+built-in default `cache_size = -2000` (2 MiB) and `mmap_size = 0` (mmap off)
+apply everywhere. Real test-vault sizes (2026-08-17): event-store.db 956MB,
+connections generation db 436MB, recall-v2 index.sqlite 153MB (+21MB WAL),
+capture-text-fts.db 131MB, page-content.db 57MB, page-evidence.db 38MB.
+
+**Fix — `src/storage/sqliteCachePragmas.ts`** (new module; pure, unit-tested
+env→PRAGMA-SQL resolution, no I/O): a shared `SIDETRACK_SQLITE_CACHE_MB`
+total heap budget (default 192MB, hard-clamped ≤256MB) split by on-disk-size
+weight — eventStore 50%, connectionsGeneration 32%, recallV2Index 18%,
+floored at 8MB/store — plus an independent `SIDETRACK_SQLITE_MMAP_MB` lever
+(per-store defaults eventStore 1536MB, connectionsGeneration 768MB,
+recallV2Index 256MB; env scales all three proportionally; 0 disables).
+mmap is NOT drawn from the cache_size budget — mmap pages are OS-page-
+cache-backed, not process heap, so they don't count against the ratchet
+ceiling the same way and are reclaimable under memory pressure. MEASURED
+(not assumed) during test-writing: this machine's linked libsqlite3
+(Homebrew's, via setup-sqlite.ts's `setCustomSQLite`) enforces a hard
+`SQLITE_MAX_MMAP_SIZE` ceiling of exactly 1073741824 bytes (1 GiB)
+regardless of what's requested — so the 1536MB eventStore default is
+honored as ~1GiB in practice here, still full coverage of the 956MB file.
+Applied at 7 long-lived open sites in connections/snapshot.ts's
+`#openHandleForRole`/`#reopenIfPointerChanged` (legacy current.db,
+parent-reader, single-buffer — deliberately NOT the child-writer shadow or
+any of the file's short-lived one-shot handles: in-place publish,
+checkpoint, shadow-publish overlay, resolver-cache.db, which stay default
+per the module's own scoping rule), 1 site in sync/eventStore.ts, 1 site
+in recall-v2/store/sqlite.ts. page-content.db / page-evidence.db /
+capture-text-fts.db were audited (see sizes above) but left untuned —
+out of the task's explicit 3-store scope; capture-text-fts.db (131MB) is a
+follow-up candidate given it's close in size to the connections generation
+db.
+
+**Harness — `scripts/read-amplification-harness.ts`** (new; `seed` then
+`run` subcommands): seeds a real, valid AcceptedEvent JSONL backlog
+directly into a synthetic replica's log shard (no companion involved),
+then boots a REAL companion process (`child_process.spawn`, not an
+in-process import) against a fresh APFS clone (`cp -Rc`) of that seeded
+vault, attributing kernel disk-IO bytes (bun:ffi `proc_pid_rusage`,
+RUSAGE_INFO_V4, offsets verified against the local macOS SDK's
+`sys/resource.h`, not guessed) to three phases: **boot** (spawn → first
+`/v1/version` 200), **settle** (fixed wall-clock window, background
+catch-up/topic/embed-lane), **resolves** (N stratified `/v1/visits/:url/
+resolve` calls). A process-TREE tracker (`scripts/lib/procRusage.ts`)
+sums the companion's pid AND all live descendants, folding an exited
+child's last-known counters into a running total — required because the
+connections reconcile materializer runs in a FORKED CHILD by default
+(cli.ts: `SIDETRACK_CONNECTIONS_CHILD` defaults to `'1'`); a parent-pid-only
+measurement would silently drop most of the connections-generation-db read
+volume every drain cycle.
+
+**Methodology trap found and fixed mid-measurement:** the harness initially
+pointed at `src/cli.ts` (raw TS source, matching scripts/resolver-
+acceptance.ts's own convention). This silently broke the reconcile child
+— its fork target (`connectionsReconcileChildClient.ts`'s
+`defaultEntryPath()`) resolves a `.js` sibling next to the COMPILED file,
+which only exists under `dist/`, not next to the `.ts` source — producing
+an audible-but-easy-to-miss `[connections] catchUp failed: reconcile child
+entry not found at .../connectionsReconcileChild.entry.js` on every
+catch-up. The FIRST baseline run under this bug measured only 1747.8MB
+read (livePids=1, no descendant ever observed) — a ~5× undercount of the
+real number below. Fixed by pointing the harness at the built
+`dist/cli.js`, matching this repo's OWN existing CI contract
+(`.github/workflows/ci.yml`, companion job: "Typecheck + build dist
+(child-process tests need it)" runs before `bun test`) — not a new
+convention, just one this new script had missed. All numbers below are
+post-fix (confirmed via a tight 50ms-interval `ps` probe showing the real
+reconcile child's pid, plus its `[reconcile.child]` progress log lines,
+once dist/ was used).
+
+**Measured (workload: 4000-event seeded backlog + boot + 45s settle + 40
+stratified resolves, on a fresh clone of the real ~2.8GB test vault; both
+trials cloned from the SAME seed-base so the backlog is byte-identical):**
+
+| config | replicate bytes read | mean | vs. baseline |
+|---|---|---|---|
+| baseline (no tuning) | 8764.3MB, 4135.9MB | 6450.1MB | — |
+| tuned (cache+mmap, defaults) | 2618.0MB, 2792.3MB | 2705.2MB | **2.4×** (range 1.48×–3.35× across pairings) |
+| cache_size only (`SIDETRACK_SQLITE_MMAP_MB=0`) | 4282.6MB | — | ~2.05× (1 rep) |
+
+Tuned replicates were also visibly MORE stable (6.6% spread) than baseline's
+(>2× spread between two otherwise-identical runs) — real value beyond the
+top-line ratio on a shared, loaded dev machine (the live daily + live test
+companions ran throughout this measurement session on the same host, per
+this task's own "loaded machine" framing). The cache-only isolation trial
+confirms mmap_size does real, additional work beyond cache_size alone
+(architecturally expected: once mmap_size covers a file, SQLite serves
+those pages directly from the mapping, bypassing its own pcache and the
+read() syscall path entirely).
+
+**Did not reliably clear the >5× target — reporting the real number, not
+the aspiration.** Root cause understood, not hand-waved: the `boot` phase
+reads ~830–930MB of genuinely NEW data (the seeded backlog materializing
+for the first time) in EVERY trial regardless of tuning — cache/mmap only
+pay off on repeated reads of a working set already touched, and first-touch
+cost is a large, fixed fraction of this harness's 45s-settle workload. A
+150s-settle spot-check (1 run each, not replicated) compressed the ratio
+further rather than improving it (baseline 6742.6MB vs tuned 5466.7MB,
+~1.23×) — most plausibly explained by non-determinism in exactly when the
+reconcile child's cyclic work lands inside the settle-vs-resolve phase
+boundary (baseline's own `resolves` phase varied 1532MB/18.9s to
+5668.6MB/62.4s between two otherwise-identical 45s-settle runs) rather than
+tuning failing — but it wasn't replicated enough to separate signal from
+machine noise with confidence, so it is reported as inconclusive rather
+than folded into a headline number.
+
+**RSS cost:** cache_size's heap contribution stays within the declared
+≤256MB-total budget (verified by pragma read-back tests — see below).
+Combined-config peakPhysFootprint rose to ~5.9–6.7GB vs baseline's
+~4.4–6.9GB; the delta is dominated by RESIDENT MMAP PAGES for the full
+event-store + connections-generation files while actively read — OS-page-
+cache-backed and reclaimable under memory pressure (not permanent heap
+growth the way an equivalent cache_size increase would be, which is why
+mmap carries most of the tuning weight for the "memory ratchet" concern),
+but real resident memory while the process works through a big backlog —
+stated plainly rather than only citing the reclaimable/heap distinction.
+
+**Redundant-scan check:** log-line attribution from a kept working copy of
+a tuned run identified the settle phase's two dominant costs, neither a
+miss requiring a fix: (1) page-evidence/store.ts's per-record `ensure`
+loop (~line 611) processing ~4000 records — proportional to the seed's
+genuinely-new page-evidence rows (its own 2026-07-29-incident comment
+documents when this loop pathologically widens to a full-store scan; this
+run's count, ~4005, matches the seed count, not a full-store size,
+confirming the normal path); (2) connections/snapshot.ts's
+`deleteOrphanEdges` (~line 7462, `[sql.slow] ms=1060`) — a scope-bounded,
+temp-table-driven DELETE already hardened by the 2026-08-16 #378 incident
+response (SQL-budget-wrapped, indexed, alarm-monitored). Neither lives in
+connectionsMaterializer.ts (both are in files this PR was free to edit);
+neither showed evidence of re-reading the same data more than once per
+drain. No fix applied — documented per the task's "if it's already
+correct, say so" framing rather than manufacturing a change.
+
+**Tests:** `src/storage/sqliteCachePragmas.test.ts` (16 tests) — pure
+env-resolution coverage (defaults, clamping, malformed-env fallback, 0 as a
+valid "disable" value, per-store split/floor) PLUS pragma-actually-applied
+coverage on REAL handles: a raw bun:sqlite `Database` (same API sync/
+eventStore.ts and connections/snapshot.ts use) and the recall-v2
+`SqliteDriver` (same API recall-v2/store/sqlite.ts uses), reading `PRAGMA
+cache_size`/`PRAGMA mmap_size` back on the SAME live connection — the only
+way a connection-scoped setting can be observed at all (a second connection
+to the same file shows its OWN default, proving nothing about the first).
+Neither `EventStore` nor `ConnectionsStore` nor `RecallStore` expose their
+raw db handle (deliberate encapsulation), so these tests exercise the exact
+underlying primitive each store calls `hotCachePragmaSql`'s output against,
+not the class itself — the full existing suites for all three stores
+(3817 pass / 8 skip / 0 fail package-wide) are the "does it work inside the
+real store" check. `scripts/read-amplification-harness.test.ts` (6 tests):
+pure `seedBacklog`/`stratifiedSample` coverage (JSONL validity checked
+against the REAL `isAcceptedEvent` production validator) + one end-to-end
+smoke test (real `seed` then `run` subprocesses, tiny empty-vault fixture,
+300ms settle) asserting a well-formed 3-phase JSON report.
+
+Verification: companion `bun test` 3817 pass / 8 skip / 0 fail (414 files,
+`dist/` rebuilt first); full connections suite 549/549; `bun run build`
+clean across all three packages (companion/extension/mcp); companion
+`tsc --noEmit` unchanged at 150 pre-existing errors (confirmed identical
+via `git stash` before/after — bun:test module-resolution + strict-mode
+fixture gaps in files this task never touched, none in the 4 touched/new
+files).
+
+**Deviations from the brief:** (1) reduction target (>5×) not reliably
+met — reported honestly above (2.4× mean, up to 3.35× best-case observed)
+with the mechanism understood; mmap's clamp to a 1GiB ceiling on this
+build's linked libsqlite3 is documented but not fixable from this codebase
+(a libsqlite3 compile-time constant). (2) page-content.db / page-evidence.db
+/ capture-text-fts.db audited but left untuned — out of the task's explicit
+3-store scope, flagged as follow-up. (3) redundant-scan check found nothing
+needing a fix in reachable code (see above) rather than the one-fix-found
+outcome the brief anticipated as a live possibility.
+
+PR: perf(store): kill read amplification — measured SQLite cache/mmap
+tuning (branch `perf/read-amplification`).
+
 **2026-08-17 — single lane registry: derived unions/allowlists/labels + all-
 lanes render contract test (feat/lane-contract-registry, task #29).** Not an
 F1–F7 item; filed here per the "binding plan tracks reality" rule. Closes a
