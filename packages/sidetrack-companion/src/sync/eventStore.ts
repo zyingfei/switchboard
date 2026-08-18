@@ -27,6 +27,7 @@ import {
 } from './eventLaneHealth.js';
 import { USER_ORGANIZED_ITEM, isUserOrganizedItemPayload } from '../feedback/events.js';
 import { BROWSER_TIMELINE_OBSERVED, isBrowserTimelineObservedPayload } from '../timeline/events.js';
+import { hotCachePragmaSql } from '../storage/sqliteCachePragmas.js';
 
 // Duplicated, one-line-on-purpose: `http/routes/visitsRoutes.ts` has its own
 // `resolverCanonicalUrlKey` and `connections/snapshot.ts` its own
@@ -376,6 +377,10 @@ export const createEventStore = async (vaultRoot: string): Promise<EventStore> =
   await mkdir(join(vaultRoot, '_BAC', 'connections'), { recursive: true });
   const db = new Database(dbPath, { create: true, readwrite: true });
   db.exec(SCHEMA);
+  // Hot, held-for-process-lifetime handle over a store that regularly
+  // reaches ~1GB on a real vault — see storage/sqliteCachePragmas.ts for
+  // why (read-amplification: default 2MB cache_size against a ~1GB db).
+  db.exec(hotCachePragmaSql('eventStore'));
 
   // Migration for stores created before `resolver_url` existed: the raw
   // SCHEMA's `CREATE TABLE IF NOT EXISTS` is a no-op against an already-

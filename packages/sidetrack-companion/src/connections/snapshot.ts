@@ -161,6 +161,7 @@ import {
   type VisitSimilarityRevision,
 } from './types.js';
 import { extractUrlsFromText } from './urlExtractor.js';
+import { hotCachePragmaSql } from '../storage/sqliteCachePragmas.js';
 
 export type { ConnectionsSnapshot } from './types.js';
 
@@ -4865,6 +4866,7 @@ export class SqliteConnectionsStore implements ConnectionsStore {
         reconcileLegacyToPublished(this.#root, (path) => this.#openReadwriteLike(sqlite, path));
       }
       this.#db = new sqlite.Database(this.#databasePath, { create: true, readwrite: true });
+      this.#applyHotCachePragmas(this.#db);
       this.#openGenId = null;
       this.#openHandleWritable = true;
       return;
@@ -4950,6 +4952,7 @@ export class SqliteConnectionsStore implements ConnectionsStore {
       }
       try {
         this.#db = new sqlite.Database(generationDbPath(this.#root, gen), { readonly: true });
+        this.#applyHotCachePragmas(this.#db);
         this.#openGenId = gen;
         this.#openHandleWritable = false;
         return;
@@ -4960,6 +4963,7 @@ export class SqliteConnectionsStore implements ConnectionsStore {
         const fresh = readPointer(this.#root);
         if (fresh !== null && fresh !== gen && generationExists(this.#root, fresh)) {
           this.#db = new sqlite.Database(generationDbPath(this.#root, fresh), { readonly: true });
+          this.#applyHotCachePragmas(this.#db);
           this.#openGenId = fresh;
           this.#openHandleWritable = false;
           return;
@@ -4977,6 +4981,7 @@ export class SqliteConnectionsStore implements ConnectionsStore {
         create: true,
         readwrite: true,
       });
+      this.#applyHotCachePragmas(this.#db);
       this.#openGenId = gen0;
       // Fresh gen0: NO pointer is published yet, so the CAS seed is null (the
       // first publish flips a null pointer → gen0). After that publish the seed
@@ -4987,6 +4992,7 @@ export class SqliteConnectionsStore implements ConnectionsStore {
       return;
     }
     this.#db = new sqlite.Database(resolved.path, { create: true, readwrite: true });
+    this.#applyHotCachePragmas(this.#db);
     this.#openGenId = resolved.genId;
     // The resolved gen IS the current pointer, so the CAS seed matches it.
     this.#seedGenId = resolved.genId;
@@ -4998,6 +5004,19 @@ export class SqliteConnectionsStore implements ConnectionsStore {
     path: string,
   ): SqliteLikeDb {
     return new sqlite.Database(path, { create: true, readwrite: true }) as unknown as SqliteLikeDb;
+  }
+
+  /** Apply the read-amplification cache/mmap pragmas (storage/
+   *  sqliteCachePragmas.ts) to the connections generation db's HOT,
+   *  held-for-process-lifetime handle. Call this ONLY at the long-lived
+   *  open sites in #openHandleForRole / #reopenIfPointerChanged (legacy
+   *  current.db, parent-reader, single-buffer) — never for a child-writer
+   *  shadow, the in-memory placeholder, or any of the short-lived
+   *  one-shot handles elsewhere in this file (in-place publish,
+   *  checkpoint, shadow-publish overlay), which stay on SQLite's
+   *  defaults per the module's own scoping rule. */
+  #applyHotCachePragmas(db: SqliteDatabase): void {
+    db.exec(hotCachePragmaSql('connectionsGeneration'));
   }
 
   /** Reopen check: if the POINTER now names a different generation than the
@@ -5030,12 +5049,14 @@ export class SqliteConnectionsStore implements ConnectionsStore {
     const sqlite = await loadSqlite();
     if (this.#role === 'parent-reader') {
       this.#db = new sqlite.Database(generationDbPath(this.#root, gen), { readonly: true });
+      this.#applyHotCachePragmas(this.#db);
       this.#openHandleWritable = false;
     } else {
       this.#db = new sqlite.Database(generationDbPath(this.#root, gen), {
         create: true,
         readwrite: true,
       });
+      this.#applyHotCachePragmas(this.#db);
       this.#openHandleWritable = true;
     }
     this.#openGenId = gen;
