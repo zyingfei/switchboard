@@ -887,6 +887,139 @@ describe('runCli', () => {
     }
   });
 
+  // F2 follow-up — event-store-repair-days. Mirrors event-store-vacuum's own
+  // arm/lock discipline tests, plus a happy-path + idempotent-re-run test
+  // against a real store-drift-with-zero-rows fixture (a day whose mirror
+  // rows were deleted out-of-band while its canonical JSONL is untouched —
+  // the exact condition gc/eventStoreMirrorRepair.ts exists to fix).
+  it('event-store-repair-days refuses without --vault', async () => {
+    const streams = createStreams();
+    const exitCode = await runCli(['event-store-repair-days'], streams);
+    expect(exitCode).toBe(2);
+    expect(streams.stderr.text()).toContain('--vault');
+  });
+
+  it('event-store-repair-days refuses without SIDETRACK_EVENT_STORE_REPAIR=1', async () => {
+    const vaultRoot = await mkdtemp(join(tmpdir(), 'event-store-repair-unarmed-'));
+    try {
+      const streams = createStreams();
+      const exitCode = await runCli(['event-store-repair-days', '--vault', vaultRoot], streams);
+      expect(exitCode).toBe(1);
+      expect(streams.stderr.text()).toContain('SIDETRACK_EVENT_STORE_REPAIR');
+    } finally {
+      await rm(vaultRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('event-store-repair-days refuses when the recall process-lock is held by a live foreign PID', async () => {
+    const parentPid = process.ppid;
+    if (!Number.isFinite(parentPid) || parentPid <= 0) return;
+    const vaultRoot = await mkdtemp(join(tmpdir(), 'event-store-repair-locked-'));
+    process.env['SIDETRACK_EVENT_STORE_REPAIR'] = '1';
+    try {
+      await mkdir(join(vaultRoot, '_BAC', 'recall'), { recursive: true });
+      await writeFile(join(vaultRoot, '_BAC', 'recall', '.lock'), `${String(parentPid)}\n`, 'utf8');
+      const streams = createStreams();
+      const exitCode = await runCli(['event-store-repair-days', '--vault', vaultRoot], streams);
+      expect(exitCode).toBe(1);
+      expect(streams.stderr.text()).toContain('refuses');
+      expect(streams.stderr.text()).toContain(String(parentPid));
+    } finally {
+      delete process.env['SIDETRACK_EVENT_STORE_REPAIR'];
+      await rm(vaultRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('event-store-repair-days is a clean no-op on a vault with no canonical shards, once armed', async () => {
+    const vaultRoot = await mkdtemp(join(tmpdir(), 'event-store-repair-noop-'));
+    process.env['SIDETRACK_EVENT_STORE_REPAIR'] = '1';
+    try {
+      const streams = createStreams();
+      const exitCode = await runCli(['event-store-repair-days', '--vault', vaultRoot], streams);
+      expect(exitCode).toBe(0);
+      expect(streams.stdout.text()).toContain('candidatesConsidered=0');
+    } finally {
+      delete process.env['SIDETRACK_EVENT_STORE_REPAIR'];
+      await rm(vaultRoot, { recursive: true, force: true });
+    }
+  });
+
+  it(
+    'event-store-repair-days repairs a zero-row day once armed, and is idempotent on re-run ' +
+      '(explicit --replica/--day)',
+    async () => {
+      const vaultRoot = await mkdtemp(join(tmpdir(), 'event-store-repair-apply-'));
+      process.env['SIDETRACK_EVENT_STORE_REPAIR'] = '1';
+      try {
+        const { createEventLog } = await import('./sync/eventLog.js');
+        const { loadOrCreateReplica } = await import('./sync/replicaId.js');
+        const { createEventStore } = await import('./sync/eventStore.js');
+        const replica = await loadOrCreateReplica(vaultRoot);
+        const eventLog = createEventLog(vaultRoot, replica);
+        const day = '2026-06-15';
+        for (let seq = 1; seq <= 4; seq += 1) {
+          await eventLog.importPeerEvent({
+            clientEventId: `peer.${String(seq)}.thread.upserted`,
+            dot: { replicaId: 'peer-cli-repair', seq },
+            deps: {},
+            aggregateId: `T${String(seq)}`,
+            type: 'thread.upserted',
+            payload: { bac_id: `T${String(seq)}`, title: `Thread ${String(seq)}` },
+            acceptedAtMs: Date.parse(`${day}T10:00:00.000Z`) + seq,
+          });
+        }
+        const store = await createEventStore(vaultRoot);
+        await store.catchUpFromJsonl(join(vaultRoot, '_BAC', 'log'));
+        store.close();
+
+        // Simulate store-drift-with-zero-rows: delete this day's mirror
+        // rows out-of-band, leaving the canonical JSONL untouched.
+        const { Database } = (await import('bun:sqlite')) as {
+          readonly Database: new (path: string) => {
+            readonly query: (sql: string) => { readonly run: (...params: readonly unknown[]) => unknown };
+            readonly close: () => void;
+          };
+        };
+        const dbPath = join(vaultRoot, '_BAC', 'connections', 'event-store.db');
+        const lo = Date.parse(`${day}T00:00:00.000Z`);
+        const hi = lo + 86_400_000 - 1;
+        const db = new Database(dbPath);
+        db.query('DELETE FROM events WHERE replica_id = ? AND accepted_at_ms BETWEEN ? AND ?').run(
+          'peer-cli-repair',
+          lo,
+          hi,
+        );
+        db.close();
+
+        const apply = createStreams();
+        const applyExit = await runCli(
+          ['event-store-repair-days', '--vault', vaultRoot, '--replica', 'peer-cli-repair', '--day', day],
+          apply,
+        );
+        expect(applyExit).toBe(0);
+        expect(apply.stdout.text()).toContain('daysRepaired=1');
+        expect(apply.stdout.text()).toContain('rowsInsertedTotal=4');
+        expect(apply.stdout.text()).toContain('rowsBefore=0');
+        expect(apply.stdout.text()).toContain('rowsAfter=4');
+
+        // Re-run: idempotent no-op, not an error and not a duplicate insert.
+        const reapply = createStreams();
+        const reapplyExit = await runCli(
+          ['event-store-repair-days', '--vault', vaultRoot, '--replica', 'peer-cli-repair', '--day', day],
+          reapply,
+        );
+        expect(reapplyExit).toBe(0);
+        expect(reapply.stdout.text()).toContain('daysRepaired=0');
+        expect(reapply.stdout.text()).toContain('rowsInsertedTotal=0');
+        expect(reapply.stdout.text()).toContain('rowsBefore=4');
+        expect(reapply.stdout.text()).toContain('rowsAfter=4');
+      } finally {
+        delete process.env['SIDETRACK_EVENT_STORE_REPAIR'];
+        await rm(vaultRoot, { recursive: true, force: true });
+      }
+    },
+  );
+
   // F8 IVM plan W3 — Recovery consent rule (docs/plans/2026-08-16-f8-ivm-
   // designs.md). `connections-rebuild` is the sole consented full-replay
   // entry point; these tests mirror the compact-engagement CLI tests'
