@@ -39,20 +39,37 @@
 //
 // The FEED-VS-ITEM sub-classification (which only matters when the
 // separately-gated, default-OFF SIDETRACK_AGGREGATOR_ITEM_SIGNALS narrowing
-// is on) stays REGISTRY-ONLY — the 2026-08-21 measurement
-// (scripts/measure-learned-aggregator-stats.ts) found a real, if
-// safe-directioned (over-suppression, not under-suppression — see the
-// COLD-START RULE below), per-URL false-negative pattern on this specific
-// sub-decision: platforms that inject volatile metadata into a page's
-// <title> across captures (reddit vote/comment counts, ChatGPT/Claude.ai
-// auto-renaming a new conversation after its first exchange) trip the
-// pre-existing per-URL title-churn-as-feed heuristic even though the
-// underlying content object is stable. Not yet replacement-grade; still
-// wired into system/workGraphHealth.ts as an observe-only diagnostic for
-// this sub-decision specifically. See docs/plans/2026-08-15-foundation-
+// is on) stays REGISTRY-ONLY — STILL NOT REPLACEMENT-GRADE, per the
+// 2026-08-21 title-churn metadata-robustness follow-up's own re-measurement
+// (see isSubstantiveTitleChurn / TITLE_SETTLE_WINDOW_OBSERVATIONS above).
+// That follow-up fixed the originally-diagnosed cause (volatile in-<title>
+// metadata — reddit vote/comment counts, unread/notification counters, chat
+// auto-renaming, live tickers — tripping the per-URL title-churn-as-feed
+// heuristic on stable content) and measurably shrank the SAFE-direction
+// (over-suppression) disagreement on the four named domains (registry-
+// covered item->feed counts: github.com 68->12, chatgpt.com 204->155,
+// reddit.com 28->15, claude.ai 4->3). But re-measurement also surfaced that
+// removing that false churn signal was, on some registry-covered domains,
+// ALSO removing a coincidental safety net for a SEPARATE, pre-existing
+// signal — the opener-independent DEEP-path item inference added by PR #406
+// (below) — misclassifying non-item deep paths (login/session flows,
+// checkout/marketing pages, x.com's policy-driven "every page is a feed"
+// stance, reddit's two-segment `/r/<subreddit>` listing shape) as 'item'.
+// That is the DANGEROUS direction (under-suppression) the binding
+// COLD-START RULE forbids, and it grew on re-measurement: chatgpt.com
+// dangerous-direction disagreements 4->10, reddit.com 1->4, x.com 22->65
+// (github.com and claude.ai unchanged). Net: learned-wrong is NOT ≈0, so
+// per this task's own decision bar the serving flip is NOT extended to
+// feed-vs-item — the title-churn fix ships on its own merits, feed-vs-item
+// stays registry-only, and the deep-path item-inference heuristic's
+// non-item-shaped-URL blind spot is left as a named follow-up (it needs its
+// own fix, not a title-churn workaround). Still wired into
+// system/workGraphHealth.ts as an observe-only diagnostic for this
+// sub-decision specifically. See docs/plans/2026-08-15-foundation-
 // program.md's "Learned per-node aggregator stats — design note
-// (2026-08-16)" for the full design rationale, the false-friend history
-// this must not weaken, and the thresholds' reasoning.
+// (2026-08-16)" and the 2026-08-21 title-churn-robustness landing note for
+// the full design rationale, the false-friend history this must not
+// weaken, and the thresholds' reasoning.
 //
 // COLD-START RULE (binding). Any URL or domain this module has not seen
 // enough evidence for defaults to the CONSERVATIVE / quarantining answer —
@@ -100,6 +117,54 @@ export const ITEM_MAX_OUTLINK_FANOUT = 3;
 // Title changed on at least roughly 1 of every 3 adjacent capture pairs —
 // the listing signature (content rotates under a stable URL).
 export const MIN_TITLE_CHURN_RATE_FOR_FEED = 0.34;
+
+// ---------------------------------------------------------------------------
+// Metadata-robust title churn (2026-08-21 follow-up, task #22 remainder —
+// closing the gap PR #406's disagreement sampling found). The churn signal
+// above and its per-domain shallow-path aggregate (signal (c) below) both
+// used to fire on ANY adjacent-capture title INEQUALITY — which trips on
+// volatile IN-TITLE METADATA a platform injects across captures (reddit
+// vote/comment counts, unread/notification counters, chat auto-renaming a
+// new conversation once after its first exchange, live tickers) even though
+// the underlying content object never changed. PR #406's disagreement
+// sampling attributed 96-100% of every item->feed misfire on
+// github.com/reddit.com/chatgpt.com/claude.ai to exactly this cause. Two
+// structural fixes (no domain list, no per-site pattern — both operate on
+// generic TOKEN SHAPE):
+//
+// (1) STABLE-CONTENT NORMALIZATION (isSubstantiveTitleChurn /
+// stableContentTokens). Before comparing two titles, strip the SHAPES
+// volatile metadata takes — a short bracketed/parenthesized segment
+// carrying a digit ("(123 points)", "(3) Inbox" — reads as a counter/badge,
+// not parenthetical content; "(Director's Cut)" has no digit and survives),
+// a leading bare-or-bracketed numeric counter, and any remaining standalone
+// numeric token (live-ticker values, timestamps) — then tokenize what's left
+// and compare via Jaccard similarity, not string equality. A CJK run has no
+// ASCII word boundaries to split on, so it tokenizes per character instead
+// of collapsing into one opaque token, and is never touched by the numeric
+// filter (`\d` matches ASCII 0-9 only, never Han/Hiragana/Katakana) — CJK
+// content survives normalization untouched, and its OWN churn still
+// registers via token-set drift (verified by dedicated tests, not assumed).
+//
+// (2) SETTLE WINDOW. A title that changes ONCE, early, then holds steady
+// (the chat-rename case: a new conversation auto-renamed from a generic
+// placeholder after its first exchange) is title SETTLING, not churn — the
+// first TITLE_SETTLE_WINDOW_OBSERVATIONS title-bearing captures' transition
+// is excluded from churn accounting entirely (neither counted as churn nor
+// as evidence of "same content"), for both the per-URL and per-domain
+// shallow-churn aggregate. Applies uniformly per URL, never gated on domain
+// identity.
+export const TITLE_SETTLE_WINDOW_OBSERVATIONS = 2;
+
+// Below this normalized-token Jaccard similarity, two titles' STABLE-CONTENT
+// portions are substantively different (churn). At or above it, they're the
+// same content wearing different volatile metadata.
+export const STABLE_CONTENT_CHURN_JACCARD_THRESHOLD = 0.5;
+
+// A bracketed/parenthesized segment this short, carrying at least one digit,
+// reads as a counter/badge rather than parenthetical content — see (1)
+// above.
+const SHORT_DIGIT_BRACKET_MAX_INNER_CHARS = 24;
 
 // ---------------------------------------------------------------------------
 // Opener-independent hub signals (2026-08-21, task #22 — closing PR #373's
@@ -392,6 +457,75 @@ const pathSegmentCountOf = (canonicalUrl: string): number => {
 
 const normalizeTitle = (title: string): string => title.trim().toLowerCase();
 
+// Matches a short bracketed/parenthesized segment carrying a digit —
+// "(123 points)", "(3) Inbox", "[45 comments]". Global so ALL such segments
+// in one title are stripped in a single pass (a title can carry more than
+// one, e.g. "(3) Inbox — Updates (12 unread)"). See
+// SHORT_DIGIT_BRACKET_MAX_INNER_CHARS's own comment for why "short" and
+// "carries a digit" are both required.
+const SHORT_DIGIT_BRACKET_PATTERN = new RegExp(
+  `[([{][^()[\\]{}]{0,${String(SHORT_DIGIT_BRACKET_MAX_INNER_CHARS)}}?\\d[^()[\\]{}]{0,${String(SHORT_DIGIT_BRACKET_MAX_INNER_CHARS)}}?[)\\]}]`,
+  'gu',
+);
+
+// A leading bare-or-bracketed numeral, optionally followed by punctuation —
+// "3: Inbox", "(3) Inbox" (redundant with SHORT_DIGIT_BRACKET_PATTERN when
+// bracketed, but cheap to also match here so the two patterns don't have to
+// agree on ordering). Bounded to <=3 digits (the notification-badge range)
+// so genuine content that happens to start with a longer number (a year, a
+// model number) is left alone — a deliberately scoped heuristic, not a
+// claim of perfect precision.
+const LEADING_COUNTER_PATTERN = /^\(?\[?\d{1,3}\]?\)?[\s:.\-–—]+/u;
+
+// Word/CJK-character tokenizer for churn comparison: a maximal run of
+// Unicode letters/digits is one token (ordinary words, numbers); each
+// Han/Hiragana/Katakana character is its OWN token, since CJK text has no
+// whitespace between words to split on otherwise — collapsing a whole CJK
+// sentence into one opaque token would defeat Jaccard comparison entirely.
+// Punctuation/symbols are separators, never part of a token.
+const CHURN_TOKEN_PATTERN = /\p{Script=Han}|\p{Script=Hiragana}|\p{Script=Katakana}|[\p{L}\p{N}]+/gu;
+
+const isPureNumericToken = (token: string): boolean => /^\d+$/u.test(token);
+
+/** Strip volatile-metadata shapes and tokenize what remains, for churn
+ *  comparison only — never mutates or replaces the stored
+ *  `lastTitleNormalized` (that stays the full trimmed/lowercased title, used
+ *  for the exact-match fast path and for diagnostics). See the module
+ *  header's METADATA-ROBUST TITLE CHURN note for the full rationale. */
+const stableContentTokens = (normalizedTitle: string): ReadonlySet<string> => {
+  const withoutDigitBrackets = normalizedTitle.replace(SHORT_DIGIT_BRACKET_PATTERN, ' ');
+  const withoutLeadingCounter = withoutDigitBrackets.replace(LEADING_COUNTER_PATTERN, '');
+  const tokens = withoutLeadingCounter.match(CHURN_TOKEN_PATTERN) ?? [];
+  return new Set(tokens.filter((token) => !isPureNumericToken(token)));
+};
+
+const jaccardSimilarity = (left: ReadonlySet<string>, right: ReadonlySet<string>): number => {
+  if (left.size === 0 && right.size === 0) return 1;
+  let intersectionCount = 0;
+  for (const token of left) {
+    if (right.has(token)) intersectionCount += 1;
+  }
+  const unionSize = left.size + right.size - intersectionCount;
+  return unionSize === 0 ? 1 : intersectionCount / unionSize;
+};
+
+/** Substantive-drift churn decision between two already-`normalizeTitle`'d
+ *  (trimmed/lowercased) titles. Exact match short-circuits before any
+ *  tokenization — the overwhelmingly common case (title genuinely
+ *  unchanged). When BOTH titles' stable-content token sets are empty (the
+ *  whole title normalized away as metadata-shaped on both sides, e.g. a
+ *  title that is nothing but a live-ticker value), there is no positive
+ *  evidence the underlying content is the same — conservative fallback:
+ *  treat as churn, per this module's binding cold-start rule ("wrong by
+ *  over-suppressing... never wrong by under-suppressing"). */
+export const isSubstantiveTitleChurn = (previousNormalized: string, currentNormalized: string): boolean => {
+  if (previousNormalized === currentNormalized) return false;
+  const previousTokens = stableContentTokens(previousNormalized);
+  const currentTokens = stableContentTokens(currentNormalized);
+  if (previousTokens.size === 0 && currentTokens.size === 0) return true;
+  return jaccardSimilarity(previousTokens, currentTokens) < STABLE_CONTENT_CHURN_JACCARD_THRESHOLD;
+};
+
 /** Incrementally maintained per-URL and per-domain behavioral counters. Feed
  * new observations with applyAggregatorObservation(s); read with
  * classifyLearnedAggregatorPage / isLearnedAggregatorHost, or the raw
@@ -574,10 +708,20 @@ export class AggregatorStatsState {
 
     if (observation.title !== undefined && observation.title.length > 0) {
       const normalized = normalizeTitle(observation.title);
-      const hadPriorTitle = url.lastTitleNormalized !== null;
-      const titleChanged = hadPriorTitle && url.lastTitleNormalized !== normalized;
+      const previousNormalized = url.lastTitleNormalized;
+      const hadPriorTitle = previousNormalized !== null;
       url.captureCount += 1;
-      if (titleChanged) {
+      // Settle window (see module header's METADATA-ROBUST TITLE CHURN
+      // note) — the transition INTO this capture is still "settling" if
+      // this capture falls inside the first TITLE_SETTLE_WINDOW_OBSERVATIONS
+      // title-bearing captures for this URL. Such a transition is excluded
+      // from churn accounting entirely: not counted as churn, and not
+      // counted as evidence of "same content" either (it simply isn't a
+      // trusted sample yet).
+      const withinSettleWindow = url.captureCount <= TITLE_SETTLE_WINDOW_OBSERVATIONS;
+      const isChurnTransition =
+        hadPriorTitle && !withinSettleWindow && isSubstantiveTitleChurn(previousNormalized, normalized);
+      if (isChurnTransition) {
         url.titleChangeCount += 1;
       }
       url.lastTitleNormalized = normalized;
@@ -588,14 +732,15 @@ export class AggregatorStatsState {
       // DomainAggregatorCounters.shallowTitleChurnRate). Deep item pages are
       // deliberately excluded — they are expected to be title-stable, so
       // including them would dilute the listing-churn signal this exists to
-      // detect.
-      if (url.pathDepth <= SHALLOW_PATH_MAX_SEGMENTS && hadPriorTitle) {
+      // detect. A settling transition is excluded from the sample entirely,
+      // same as the per-URL accounting above.
+      if (url.pathDepth <= SHALLOW_PATH_MAX_SEGMENTS && hadPriorTitle && !withinSettleWindow) {
         const hostname = hostnameOf(observation.canonicalUrl);
         if (hostname !== null) {
           const domainCounters = this.domainCounters.get(registrableDomainOf(hostname));
           if (domainCounters !== undefined) {
             domainCounters.shallowChurnDenominator += 1;
-            if (titleChanged) domainCounters.shallowChurnNumerator += 1;
+            if (isChurnTransition) domainCounters.shallowChurnNumerator += 1;
           }
         }
       }
