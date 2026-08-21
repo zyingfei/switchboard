@@ -9,10 +9,11 @@
 
 import { createHash } from 'node:crypto';
 import { existsSync } from 'node:fs';
-import { copyFile, mkdtemp, readFile, readdir, rm, stat, unlink } from 'node:fs/promises';
+import { copyFile, mkdtemp, readFile, rm, stat, unlink } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { isAbsolute, join, relative, resolve, sep } from 'node:path';
 
+import { listCanonicalEventShards } from '../analytics/hotTailRetirement.js';
 import {
   discardShadowGeneration,
   generationDbPath,
@@ -300,18 +301,14 @@ const buildLegacyCurrentCandidate = async (
   };
 };
 
-const listCanonicalShards = async (vaultRoot: string): Promise<readonly string[]> => {
-  const root = join(vaultRoot, '_BAC', 'log');
-  const replicas = await readdir(root).catch(() => []);
-  const paths: string[] = [];
-  for (const replica of replicas.sort()) {
-    const names = await readdir(join(root, replica)).catch(() => []);
-    for (const name of names.sort()) {
-      if (name.endsWith('.jsonl')) paths.push(join(root, replica, name));
-    }
-  }
-  return paths;
-};
+// F2 (2026-08-21): reads BOTH `_BAC/log` and the retired mirror
+// `_BAC/retired/log` (`hotTailRetirement.ts`'s `listCanonicalEventShards`)
+// so this proof still sees the COMPLETE canonical event set once any day
+// has been hot-tail-retired — a `_BAC/log`-only read would see fewer
+// events than exist and (fail-closed, but wrongly) refuse an
+// event-store-mirror candidate this proof used to verify.
+const listCanonicalShards = async (vaultRoot: string): Promise<readonly string[]> =>
+  await listCanonicalEventShards(vaultRoot);
 
 interface CanonicalEventReadback {
   readonly status: RetirementProofStatus;

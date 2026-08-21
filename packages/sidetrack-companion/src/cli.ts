@@ -225,19 +225,36 @@ export const renderHelp = (): string =>
     "    vault's recall process-lock. Rewrites run through EventLog's",
     '    runExclusiveMaintenance; there is no force path.',
     '',
-    'Retire-hot-tail subcommand (F2 — hot-tail retirement report, report-only):',
+    'Retire-hot-tail subcommand (F2 — hot-tail retirement):',
     '  sidetrack-companion retire-hot-tail --report --vault <path> [--json]',
-    '    Per (replica, day) hot-tail JSONL shard: events sealed vs unsealed,',
-    '    hot-tail bytes retirable once APPLY ships, and the seal-coverage',
-    '    verdict (sealed-verified / store-drift / segment-corrupt /',
-    "    segment-missing / never-sealed / open) reusing the columnar tier's",
-    '    DuckDB-over-Parquet integrity check (src/analytics/eventScan.ts).',
-    '    ZERO writes: the event-store mirror is opened `{ readonly: true }`',
-    '    (never created, never caught up); sealed segments are only read via',
-    "    DuckDB; hot-tail shard files are only stat()'d, never read. Safe to",
-    '    run against a vault a live companion is serving. APPLY (retiring the',
-    '    hot tail) is a separate, consent-gated follow-up behind a soak',
-    '    period — this command only ever reports.',
+    '  sidetrack-companion retire-hot-tail --apply --vault <path> [--json]',
+    '    --report: per (replica, day) hot-tail JSONL shard — events sealed vs',
+    '    unsealed, hot-tail bytes retirable, and the seal-coverage verdict',
+    '    (sealed-verified / store-drift / segment-corrupt / segment-missing /',
+    "    never-sealed / open) reusing the columnar tier's DuckDB-over-Parquet",
+    '    integrity check (src/analytics/eventScan.ts). ZERO writes: the',
+    '    event-store mirror is opened `{ readonly: true }`, sealed segments',
+    "    are only read via DuckDB, hot-tail shard files are only stat()'d.",
+    '    Safe to run against a vault a live companion is serving.',
+    '    --apply: MOVES (never deletes) every shard the FRESH eligibility',
+    '    computation confirms sealed-verified from _BAC/log/<replica>/<day>.jsonl',
+    '    to the sibling mirror _BAC/retired/log/<replica>/<day>.jsonl — history',
+    '    stays served by the typed event-store mirror and the sealed Parquet',
+    '    tier. Requires SIDETRACK_HOT_TAIL_RETIRE=1 in the environment (this',
+    "    module's own arm switch) and refuses if a live companion holds the",
+    '    vault\'s recall process-lock. Re-validates every proof in this run —',
+    '    fail-closed per shard, so one drifted day never blocks the rest.',
+    '    Crash-safe: each move is one same-filesystem rename; re-running',
+    '    resumes cleanly (already-retired shards are a no-op). Writes a',
+    '    bounded receipt log to _BAC/system/retirement-receipts.jsonl.',
+    '',
+    'Event-store-vacuum subcommand (F2 apply — reclaim SQLite mirror bytes):',
+    '  sidetrack-companion event-store-vacuum --vault <path> [--json]',
+    '    Runs VACUUM on _BAC/connections/event-store.db in place and reports',
+    '    bytes before/after. Requires SIDETRACK_EVENT_STORE_VACUUM=1 in the',
+    '    environment and refuses if a live companion holds the recall',
+    '    process-lock (VACUUM rewrites the whole file). A clean no-op when',
+    '    the file does not exist.',
     '',
     'Connections-rebuild subcommand (user-consented full replay):',
     '  sidetrack-companion connections-rebuild --vault <path> [--json]',
@@ -1504,25 +1521,33 @@ const runCompactEngagementSubcommand = async (
   }
 };
 
-// F2 — hot-tail retirement report (docs/plans/2026-08-15-foundation-program.md,
-// F2 row). REPORT-ONLY: `buildHotTailRetirementReport` never writes — the
+// F2 — hot-tail retirement (docs/plans/2026-08-15-foundation-program.md, F2
+// row). REPORT: `buildHotTailRetirementReport` never writes — the
 // event-store mirror is opened `{ readonly: true }` (never created, never
 // caught up), sealed segments are read via DuckDB (read-only by
 // construction), and hot-tail JSONL shard files are only `stat()`'d. No
 // process lock is needed or taken: unlike compact-engagement/gc --apply,
 // there is nothing here that could desync a live companion's in-memory
-// state, so this refuses nothing and is safe to run alongside one. APPLY
-// (actually retiring the hot tail) does not exist yet — it is a separate,
-// consent-gated follow-up behind the seal soak period; this command only
-// ever reports, hence requiring `--report` explicitly rather than defaulting
-// to it (an operator who types `--apply` today gets a clear refusal, not a
-// silent no-op).
+// state, so this refuses nothing and is safe to run alongside one.
+//
+// APPLY (`runRetireHotTailApply` below): MOVES (never deletes) each
+// eligible day's hot-tail shard to the sibling retired mirror — see
+// `analytics/hotTailRetirement.ts`'s `applyHotTailRetirement` header for
+// the full move-not-delete / re-validation / crash-safety contract. Same
+// two-confirmation safety bar as compact-engagement --apply: (1)
+// SIDETRACK_HOT_TAIL_RETIRE=1 — the module's own arm switch, not a
+// CLI-only gate; (2) the vault's recall process-lock, refused outright if
+// a live companion owns it (a second process moving shard files while a
+// live companion holds warm append indexes / a merged-log memo over the
+// same files would desync those caches from disk, identically to why
+// compact-engagement --apply takes the same lock).
 const runRetireHotTailSubcommand = async (
   argv: readonly string[],
   streams: CliStreams,
 ): Promise<number> => {
   if (argv.includes('--help') || argv.includes('help')) {
     writeLine(streams.stdout, 'Usage: sidetrack-companion retire-hot-tail --report --vault <path> [--json]');
+    writeLine(streams.stdout, '       sidetrack-companion retire-hot-tail --apply --vault <path> [--json]');
     return 0;
   }
   const vaultPath = findArgValue(argv, '--vault');
@@ -1532,19 +1557,20 @@ const runRetireHotTailSubcommand = async (
   }
   const report = argv.includes('--report');
   const apply = argv.includes('--apply');
-  if (apply) {
-    writeLine(
-      streams.stderr,
-      'retire-hot-tail --apply does not exist yet: F2 apply is gated on the seal soak period and',
-    );
-    writeLine(streams.stderr, 'ships as a separate, consent-gated command. Only --report is implemented.');
+  if (report && apply) {
+    writeLine(streams.stderr, 'retire-hot-tail: pass at most one of --report or --apply.');
     return 2;
   }
-  if (!report) {
-    writeLine(streams.stderr, 'retire-hot-tail requires --report (the only implemented mode).');
+  if (!report && !apply) {
+    writeLine(streams.stderr, 'retire-hot-tail requires --report or --apply.');
     return 2;
   }
   const json = argv.includes('--json');
+
+  if (apply) {
+    return await runRetireHotTailApply(vaultPath, json, streams);
+  }
+
   const { buildHotTailRetirementReport } = await import('./analytics/hotTailRetirement.js');
   const result = await buildHotTailRetirementReport(vaultPath);
   if (json) {
@@ -1591,6 +1617,157 @@ const runRetireHotTailSubcommand = async (
     }
   }
   return result.totals.segmentAlarms === 0 ? 0 : 1;
+};
+
+const runRetireHotTailApply = async (
+  vaultPath: string,
+  json: boolean,
+  streams: CliStreams,
+): Promise<number> => {
+  const { hotTailRetireArmed } = await import('./analytics/hotTailRetirement.js');
+  if (!hotTailRetireArmed()) {
+    writeLine(
+      streams.stderr,
+      'retire-hot-tail --apply refuses: SIDETRACK_HOT_TAIL_RETIRE is not set to 1/true.',
+    );
+    writeLine(
+      streams.stderr,
+      "This is analytics/hotTailRetirement.ts's own arm switch — set it explicitly in the",
+    );
+    writeLine(streams.stderr, 'environment to confirm the hot-tail move; --apply alone is not enough.');
+    return 1;
+  }
+
+  const { acquireRecallProcessLock, RecallLockHeldError } = await import('./recall/recovery.js');
+  let lock;
+  try {
+    lock = await acquireRecallProcessLock(vaultPath);
+  } catch (error) {
+    if (error instanceof RecallLockHeldError) {
+      writeLine(
+        streams.stderr,
+        `retire-hot-tail --apply refuses: a live companion (pid ${String(error.pid)}) owns ${vaultPath}.`,
+      );
+      writeLine(
+        streams.stderr,
+        "Stop it first — this process cannot invalidate that companion's in-memory append",
+      );
+      writeLine(streams.stderr, 'indexes / merged-log memo, only its own.');
+      return 1;
+    }
+    throw error;
+  }
+  try {
+    const { applyHotTailRetirement } = await import('./analytics/hotTailRetirement.js');
+    const result = await applyHotTailRetirement(vaultPath);
+    if (json) {
+      writeLine(streams.stdout, JSON.stringify({ mode: 'apply', result }, null, 2));
+      return result.errors.length === 0 ? 0 : 1;
+    }
+    writeLine(
+      streams.stdout,
+      `retire-hot-tail apply: vault=${vaultPath} shardsRetired=${String(
+        result.shardsRetired,
+      )} alreadyRetired=${String(result.shardsAlreadyRetired)} skipped=${String(
+        result.shardsSkipped,
+      )} bytesMoved=${String(result.bytesMoved)}`,
+    );
+    writeLine(streams.stdout, `  receipt=${result.receiptPath}`);
+    const skips = result.outcomes.filter((outcome) => outcome.outcome === 'skipped');
+    if (skips.length > 0) {
+      writeLine(streams.stdout, '  skipped shards:');
+      for (const outcome of skips.slice(0, 20)) {
+        writeLine(
+          streams.stdout,
+          `    ${outcome.replica}\t${outcome.day}\t${outcome.verdict}\t${outcome.reason ?? 'unknown'}`,
+        );
+      }
+      if (skips.length > 20) {
+        writeLine(streams.stdout, `    ... ${String(skips.length - 20)} more not shown (capped at 20)`);
+      }
+    }
+    for (const error of result.errors) writeLine(streams.stderr, error);
+    return result.errors.length === 0 ? 0 : 1;
+  } finally {
+    await lock.release();
+  }
+};
+
+// F2 apply — event-store maintenance. Same safety bar as the other
+// maintenance --apply paths: SIDETRACK_EVENT_STORE_VACUUM=1 arm switch +
+// the vault's recall process-lock, refused outright if a live companion
+// owns it (VACUUM rewrites the whole file in place; a live companion's
+// open handle on the same file would see it change out from under it).
+// See gc/eventStoreVacuum.ts for why this is a separate maintenance
+// entrypoint from connections/snapshot.ts's own (graph-generation-only,
+// currently-no-op-under-in-place-publish) VACUUM path.
+const runEventStoreVacuumSubcommand = async (
+  argv: readonly string[],
+  streams: CliStreams,
+): Promise<number> => {
+  if (argv.includes('--help') || argv.includes('help')) {
+    writeLine(streams.stdout, 'Usage: sidetrack-companion event-store-vacuum --vault <path> [--json]');
+    return 0;
+  }
+  const vaultPath = findArgValue(argv, '--vault');
+  if (vaultPath === undefined || vaultPath.length === 0) {
+    writeLine(streams.stderr, '--vault <path> is required for event-store-vacuum.');
+    return 2;
+  }
+  const json = argv.includes('--json');
+
+  const { eventStoreVacuumArmed } = await import('./gc/eventStoreVacuum.js');
+  if (!eventStoreVacuumArmed()) {
+    writeLine(
+      streams.stderr,
+      'event-store-vacuum refuses: SIDETRACK_EVENT_STORE_VACUUM is not set to 1/true.',
+    );
+    writeLine(
+      streams.stderr,
+      'Set it explicitly in the environment to confirm the rewrite; the command alone is not enough.',
+    );
+    return 1;
+  }
+
+  const { acquireRecallProcessLock, RecallLockHeldError } = await import('./recall/recovery.js');
+  let lock;
+  try {
+    lock = await acquireRecallProcessLock(vaultPath);
+  } catch (error) {
+    if (error instanceof RecallLockHeldError) {
+      writeLine(
+        streams.stderr,
+        `event-store-vacuum refuses: a live companion (pid ${String(error.pid)}) owns ${vaultPath}.`,
+      );
+      writeLine(streams.stderr, 'Stop it first — VACUUM rewrites the whole file in place.');
+      return 1;
+    }
+    throw error;
+  }
+  try {
+    const { runEventStoreVacuum } = await import('./gc/eventStoreVacuum.js');
+    const result = await runEventStoreVacuum(vaultPath);
+    if (json) {
+      writeLine(streams.stdout, JSON.stringify({ mode: 'apply', result }, null, 2));
+      return 0;
+    }
+    if (!result.present) {
+      writeLine(
+        streams.stdout,
+        `event-store-vacuum: no event-store.db at ${result.dbPath} — nothing to do.`,
+      );
+      return 0;
+    }
+    writeLine(
+      streams.stdout,
+      `event-store-vacuum: vault=${vaultPath} bytesBefore=${String(
+        result.bytesBefore,
+      )} bytesAfter=${String(result.bytesAfter)} bytesReclaimed=${String(result.bytesReclaimed)}`,
+    );
+    return 0;
+  } finally {
+    await lock.release();
+  }
 };
 
 // F8 IVM plan, W3 — Recovery consent rule (docs/plans/2026-08-16-f8-ivm-
@@ -1822,6 +1999,9 @@ export const runCli = async (argv: readonly string[], streams: CliStreams): Prom
   }
   if (argv[0] === 'retire-hot-tail') {
     return await runRetireHotTailSubcommand(argv, streams);
+  }
+  if (argv[0] === 'event-store-vacuum') {
+    return await runEventStoreVacuumSubcommand(argv, streams);
   }
   if (argv[0] === 'recall') {
     return await runRecallSubcommand(argv, streams);

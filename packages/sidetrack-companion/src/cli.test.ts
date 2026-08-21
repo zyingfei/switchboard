@@ -659,21 +659,21 @@ describe('runCli', () => {
     expect(streams.stderr.text()).toContain('--vault');
   });
 
-  it('retire-hot-tail requires --report; --apply is refused with a clear message (not implemented yet)', async () => {
+  it('retire-hot-tail requires --report or --apply, and refuses both together', async () => {
     const vaultRoot = await mkdtemp(join(tmpdir(), 'retire-hot-tail-flags-'));
     try {
       const missingMode = createStreams();
       const missingExit = await runCli(['retire-hot-tail', '--vault', vaultRoot], missingMode);
       expect(missingExit).toBe(2);
-      expect(missingMode.stderr.text()).toContain('--report');
+      expect(missingMode.stderr.text()).toContain('--report or --apply');
 
-      const applyAttempt = createStreams();
-      const applyExit = await runCli(
-        ['retire-hot-tail', '--apply', '--vault', vaultRoot],
-        applyAttempt,
+      const both = createStreams();
+      const bothExit = await runCli(
+        ['retire-hot-tail', '--report', '--apply', '--vault', vaultRoot],
+        both,
       );
-      expect(applyExit).toBe(2);
-      expect(applyAttempt.stderr.text()).toContain('does not exist yet');
+      expect(bothExit).toBe(2);
+      expect(both.stderr.text()).toContain('at most one of');
     } finally {
       await rm(vaultRoot, { recursive: true, force: true });
     }
@@ -736,6 +736,153 @@ describe('runCli', () => {
     } finally {
       if (previousStoreFlag === undefined) delete process.env['SIDETRACK_EVENT_STORE'];
       else process.env['SIDETRACK_EVENT_STORE'] = previousStoreFlag;
+      await rm(vaultRoot, { recursive: true, force: true });
+    }
+  });
+
+  // F2 apply — mirrors compact-engagement --apply's own CLI test structure
+  // (arm-refusal, lock-refusal, happy path + idempotent re-run).
+  const seedSealedHotTailVault = async (vaultRoot: string): Promise<void> => {
+    const { createEventLog } = await import('./sync/eventLog.js');
+    const { loadOrCreateReplica } = await import('./sync/replicaId.js');
+    const { runEventSealPass } = await import('./analytics/eventSeal.js');
+    const replica = await loadOrCreateReplica(vaultRoot);
+    const now = new Date('2026-03-04T12:00:00.000Z');
+    const log = createEventLog(vaultRoot, replica, { now: () => new Date('2026-03-01T10:00:00.000Z') });
+    for (let seq = 0; seq < 3; seq += 1) {
+      await log.appendClientObserved({
+        clientEventId: `t-${String(seq)}`,
+        aggregateId: `thread.upserted:T${String(seq)}`,
+        type: 'thread.upserted',
+        baseVector: {},
+        payload: { bac_id: `T${String(seq)}`, title: `Thread ${String(seq)}` },
+      });
+    }
+    const sealPass = await runEventSealPass(vaultRoot, { now: () => now });
+    expect(sealPass.errors).toEqual([]);
+    expect(sealPass.sealed.length).toBeGreaterThan(0);
+  };
+
+  it('retire-hot-tail --apply refuses without SIDETRACK_HOT_TAIL_RETIRE=1, even with --apply', async () => {
+    const vaultRoot = await mkdtemp(join(tmpdir(), 'retire-hot-tail-unarmed-'));
+    const previousStoreFlag = process.env['SIDETRACK_EVENT_STORE'];
+    process.env['SIDETRACK_EVENT_STORE'] = '1';
+    try {
+      await seedSealedHotTailVault(vaultRoot);
+      const streams = createStreams();
+      const exitCode = await runCli(['retire-hot-tail', '--apply', '--vault', vaultRoot], streams);
+      expect(exitCode).toBe(1);
+      expect(streams.stderr.text()).toContain('SIDETRACK_HOT_TAIL_RETIRE');
+    } finally {
+      if (previousStoreFlag === undefined) delete process.env['SIDETRACK_EVENT_STORE'];
+      else process.env['SIDETRACK_EVENT_STORE'] = previousStoreFlag;
+      await rm(vaultRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('retire-hot-tail --apply refuses when the recall process-lock is held by a live foreign PID, even when armed', async () => {
+    const parentPid = process.ppid;
+    if (!Number.isFinite(parentPid) || parentPid <= 0) return;
+    const vaultRoot = await mkdtemp(join(tmpdir(), 'retire-hot-tail-locked-'));
+    process.env['SIDETRACK_HOT_TAIL_RETIRE'] = '1';
+    try {
+      await mkdir(join(vaultRoot, '_BAC', 'recall'), { recursive: true });
+      await writeFile(join(vaultRoot, '_BAC', 'recall', '.lock'), `${String(parentPid)}\n`, 'utf8');
+      const streams = createStreams();
+      const exitCode = await runCli(['retire-hot-tail', '--apply', '--vault', vaultRoot], streams);
+      expect(exitCode).toBe(1);
+      expect(streams.stderr.text()).toContain('refuses');
+      expect(streams.stderr.text()).toContain(String(parentPid));
+    } finally {
+      delete process.env['SIDETRACK_HOT_TAIL_RETIRE'];
+      await rm(vaultRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('retire-hot-tail --apply moves eligible shards once armed, and is idempotent on re-run', async () => {
+    const vaultRoot = await mkdtemp(join(tmpdir(), 'retire-hot-tail-apply-'));
+    const previousStoreFlag = process.env['SIDETRACK_EVENT_STORE'];
+    process.env['SIDETRACK_EVENT_STORE'] = '1';
+    process.env['SIDETRACK_HOT_TAIL_RETIRE'] = '1';
+    try {
+      await seedSealedHotTailVault(vaultRoot);
+      const { readSealManifest } = await import('./analytics/eventSeal.js');
+      const manifest = await readSealManifest(vaultRoot);
+      const [key] = [...manifest.latest.keys()];
+      if (key === undefined) throw new Error('fixture produced no sealed day');
+      const spaceIndex = key.indexOf(' ');
+      const replica = key.slice(0, spaceIndex);
+      const day = key.slice(spaceIndex + 1);
+      const hotPath = join(vaultRoot, '_BAC', 'log', replica, `${day}.jsonl`);
+      const retiredPath = join(vaultRoot, '_BAC', 'retired', 'log', replica, `${day}.jsonl`);
+
+      const apply = createStreams();
+      const applyExit = await runCli(['retire-hot-tail', '--apply', '--vault', vaultRoot], apply);
+      expect(applyExit).toBe(0);
+      expect(apply.stdout.text()).toContain('shardsRetired=1');
+      expect(apply.stdout.text()).toContain('receipt=');
+
+      const { stat } = await import('node:fs/promises');
+      await expect(stat(hotPath)).rejects.toThrow();
+      expect((await stat(retiredPath)).isFile()).toBe(true);
+
+      // Re-run: already retired, so a clean no-op, not an error.
+      const reapply = createStreams();
+      const reapplyExit = await runCli(['retire-hot-tail', '--apply', '--vault', vaultRoot], reapply);
+      expect(reapplyExit).toBe(0);
+      expect(reapply.stdout.text()).toContain('shardsRetired=0');
+      expect(reapply.stdout.text()).toContain('alreadyRetired=1');
+    } finally {
+      if (previousStoreFlag === undefined) delete process.env['SIDETRACK_EVENT_STORE'];
+      else process.env['SIDETRACK_EVENT_STORE'] = previousStoreFlag;
+      delete process.env['SIDETRACK_HOT_TAIL_RETIRE'];
+      await rm(vaultRoot, { recursive: true, force: true });
+    }
+  });
+
+  // F2 apply — event-store-vacuum. Mirrors retire-hot-tail --apply's own
+  // arm/lock discipline tests.
+  it('event-store-vacuum refuses without SIDETRACK_EVENT_STORE_VACUUM=1', async () => {
+    const vaultRoot = await mkdtemp(join(tmpdir(), 'event-store-vacuum-unarmed-'));
+    try {
+      const streams = createStreams();
+      const exitCode = await runCli(['event-store-vacuum', '--vault', vaultRoot], streams);
+      expect(exitCode).toBe(1);
+      expect(streams.stderr.text()).toContain('SIDETRACK_EVENT_STORE_VACUUM');
+    } finally {
+      await rm(vaultRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('event-store-vacuum refuses when the recall process-lock is held by a live foreign PID', async () => {
+    const parentPid = process.ppid;
+    if (!Number.isFinite(parentPid) || parentPid <= 0) return;
+    const vaultRoot = await mkdtemp(join(tmpdir(), 'event-store-vacuum-locked-'));
+    process.env['SIDETRACK_EVENT_STORE_VACUUM'] = '1';
+    try {
+      await mkdir(join(vaultRoot, '_BAC', 'recall'), { recursive: true });
+      await writeFile(join(vaultRoot, '_BAC', 'recall', '.lock'), `${String(parentPid)}\n`, 'utf8');
+      const streams = createStreams();
+      const exitCode = await runCli(['event-store-vacuum', '--vault', vaultRoot], streams);
+      expect(exitCode).toBe(1);
+      expect(streams.stderr.text()).toContain('refuses');
+      expect(streams.stderr.text()).toContain(String(parentPid));
+    } finally {
+      delete process.env['SIDETRACK_EVENT_STORE_VACUUM'];
+      await rm(vaultRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('event-store-vacuum is a clean no-op on a vault with no event-store.db, once armed', async () => {
+    const vaultRoot = await mkdtemp(join(tmpdir(), 'event-store-vacuum-noop-'));
+    process.env['SIDETRACK_EVENT_STORE_VACUUM'] = '1';
+    try {
+      const streams = createStreams();
+      const exitCode = await runCli(['event-store-vacuum', '--vault', vaultRoot], streams);
+      expect(exitCode).toBe(0);
+      expect(streams.stdout.text()).toContain('nothing to do');
+    } finally {
+      delete process.env['SIDETRACK_EVENT_STORE_VACUUM'];
       await rm(vaultRoot, { recursive: true, force: true });
     }
   });
