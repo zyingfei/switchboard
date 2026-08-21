@@ -831,12 +831,16 @@ const runSealSubcommand = async (argv: readonly string[], streams: CliStreams): 
       result.sealed.length,
     )} open-skipped=${String(result.skippedOpenDays)} already-sealed=${String(
       result.skippedAlreadySealed,
-    )} errors=${String(result.errors.length)}`,
+    )} unexplained-zero-row=${String(result.unexplainedZeroRowDays)} errors=${String(
+      result.errors.length,
+    )}`,
   );
   for (const entry of dryRun ? result.planned : result.sealed) {
     writeLine(
       streams.stdout,
-      `${entry.replica}\t${entry.day}\trows=${String(entry.rows)}\tseq=[${String(entry.seqLo)},${String(entry.seqHi)}]`,
+      `${entry.replica}\t${entry.day}\trows=${String(entry.rows)}\tseq=[${String(entry.seqLo)},${String(entry.seqHi)}]${
+        entry.rows === 0 ? '\tempty-day-seal' : ''
+      }`,
     );
   }
   for (const error of result.errors) writeLine(streams.stderr, error);

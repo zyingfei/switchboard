@@ -33,6 +33,19 @@
 // need arose for a line-level compaction-aware proof, it belongs in the CLI
 // (cold path allowed per F3's own carve-out), never a hot serving path; this
 // report has no such need today.
+//
+// Compaction can go further than shrinking a day — it can legitimately drop
+// EVERY retained row of a day (e.g. a day whose events are all
+// engagement.interval, all covered by an aggregate elsewhere). eventSeal.ts
+// heals a stale (rows > 0) seal for such a day into an EMPTY-day seal
+// (`rows: 0`, ledger-provenance verified there, not here) rather than
+// leaving it store-drift forever. This report trusts that provenance and
+// treats a `rows === 0` manifest entry as its own case, ahead of the
+// parquet lookup (an empty-day seal carries no segment file — see
+// eventScan.ts's header for why a zero-row parquet file can't be used):
+// live store also zero → `sealed-verified`, retirement-eligible, same as
+// any other proven-clean day; live store non-zero → `store-drift`, benign,
+// same self-heal-on-next-pass story as every other drift case.
 
 import { appendFile, mkdir, readdir, readFile, rename, stat } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
@@ -402,6 +415,47 @@ export const buildHotTailRetirementReport = async (
         jsonlBytes,
         retirementEligible: false,
       });
+      continue;
+    }
+
+    if (manifestEntry.rows === 0) {
+      // Empty-day seal (eventSeal.ts's sealEmptyDay): every retained row for
+      // this day was legitimately compacted, verified against the
+      // compaction ledger BEFORE the seal was written — the provenance this
+      // report trusts rather than re-deriving. No parquet segment exists for
+      // it by design (see eventScan.ts's header), so the parquet cross-check
+      // below is skipped entirely for this key; the only remaining question
+      // is whether the live store still agrees the day has zero rows. The
+      // hot-tail JSONL shard itself is typically a genuine 0-byte file
+      // (compaction rewrites it empty rather than deleting it) — still
+      // eligible to move to retired/ so the hot tail stays fully clean.
+      if (storeStat === undefined) {
+        shards.push({
+          replica,
+          day,
+          verdict: 'sealed-verified',
+          detail:
+            'empty-day seal: every retained row for this day was legitimately compacted ' +
+            `(ledger-verified ${String(manifestEntry.emptyDayCompactedRows ?? 0)} rows at seal time) — zero rows expected and zero rows live`,
+          eventsSealed,
+          eventsLive,
+          eventsUncovered: 0,
+          jsonlBytes,
+          retirementEligible: true,
+        });
+      } else {
+        shards.push({
+          replica,
+          day,
+          verdict: 'store-drift',
+          detail: `store rows=${String(storeStat.rows)} vs empty-day seal (0) — new arrivals since the empty-day seal; benign, next sealer pass re-seals`,
+          eventsSealed,
+          eventsLive,
+          eventsUncovered: storeStat.rows,
+          jsonlBytes,
+          retirementEligible: false,
+        });
+      }
       continue;
     }
 

@@ -21,6 +21,15 @@
 //                     the write path lied. Surfaced as an alarm count.
 // - segment-missing — manifest names a segment whose file is gone.
 //
+// EMPTY-DAY SEALS (`entry.rows === 0`, eventSeal.ts's sealEmptyDay) are a
+// distinct case handled up front, before the parquet lookup: they carry no
+// segment file by design (a zero-row parquet file would be invisible to the
+// GROUP BY above, which reports no row at all for an empty group — not a
+// zero-count one), so routing them through the parquet cross-check would
+// misfire `segment-missing`. Verified against the live store instead: zero
+// rows there too is `match`, any rows is `store-drift` (benign — the day
+// reopened after the empty seal and the next sealer pass re-seals it).
+//
 // The facade never reads the canonical JSONL log and never blocks serving:
 // DuckDB runs queries off the JS thread, the instance is closed after every
 // call, and the whole check is one aggregate over all segments (~30ms
@@ -180,6 +189,25 @@ export const runSealIntegrityCheck = async (
   const segmentAlarms: SealIntegrityDayVerdict[] = [];
   for (const entry of manifest.latest.values()) {
     const key = `${entry.replica} ${entry.day}`;
+    if (entry.rows === 0) {
+      // Empty-day seal (eventSeal.ts's sealEmptyDay): every retained row for
+      // this day was legitimately compacted, verified against the
+      // compaction ledger BEFORE the seal was written. There is no parquet
+      // segment for it by design (a physically empty file would be invisible
+      // to the GROUP-BY-over-glob query above — no rows means no group at
+      // all — so empty-day entries are never routed through the parquet
+      // cross-check). The only live check that still applies: does the
+      // store still agree the day has zero rows?
+      const storeStat = storeDayStats(entry.replica, entry.day);
+      if (storeStat === undefined) {
+        matches += 1;
+      } else {
+        // A new peer dot re-opened this day after the empty-day seal —
+        // benign, same as any other drift; the sealer re-seals it normally.
+        storeDrift += 1;
+      }
+      continue;
+    }
     if (unreadable.has(key)) {
       segmentAlarms.push({
         replica: entry.replica,
