@@ -12,6 +12,14 @@ import {
   classifyAggregatorPageForUrl,
   isAggregatorHost,
 } from './aggregatorProfiles.js';
+import {
+  applyAggregatorObservations,
+  createEmptyAggregatorStatsState,
+  isLearnedAggregatorHost,
+  learnedAggregatorServeEnabled,
+  type AggregatorStatsState,
+} from './learnedAggregatorStats.js';
+import { aggregatorObservationsFromEvents } from './learnedAggregatorStatsEvents.js';
 import type { Candidate, CandidateSource, GenerateCandidates } from './types.js';
 
 type CandidateContext = Parameters<GenerateCandidates>[1];
@@ -500,6 +508,11 @@ const chainGenerator = (
 //       CORPUS: narrowing lets item CONTENT edges through, and the clean corpus
 //       is what makes those edges trustworthy (host/path skeleton no longer
 //       inflates same-site cosine). Enable both together for the intended state.
+//   SIDETRACK_LEARNED_AGGREGATOR_SERVE   (absent = ON) — consult
+//       learnedAggregatorStats.ts's is-aggregator (hub) classifier
+//       alongside the registry (see isAggregatorHostFor's own comment for
+//       the OR-combine contract). =0 is the kill switch back to
+//       registry-only, byte-identical to pre-task-#22 behavior.
 
 // Call-time + case-insensitive so both flags are togglable in tests and
 // consistent with the repo's other boolean flags (lexicalFallbackEnabled).
@@ -521,26 +534,61 @@ export const aggregatorItemSignalsEnabled = (): boolean => {
  * True when `hostname` belongs to a large multi-topic platform — i.e. two pages
  * sharing only this domain (or its site-chrome tokens) are not topically
  * related. Matched by registrable domain, so any subdomain qualifies. Exported
- * for tests and for the resolver guard (tabsession/similarity.ts).
+ * for tests. REGISTRY-ONLY (unlike the internal per-context predicate below) —
+ * this convenience alias has no CandidateContext to build a learned state
+ * from; the resolver guard (tabsession/similarity.ts) has its own combined
+ * predicate, built from its own event batch (see similarity.ts).
  */
 export const isCoarseMultiTopicDomain = (hostname: string): boolean => isAggregatorHost(hostname);
+
+// Per-context (WeakMap-memoized, same idiom as indexesFor) OR-combine of the
+// registry's isAggregatorHost with learnedAggregatorStats.ts's
+// isLearnedAggregatorHost — task #22's serving flip. ADDITIVE ONLY: a
+// hostname is an aggregator if EITHER classifier says so, so this can only
+// gain quarantine protection the registry didn't have (the blind spot),
+// never lose protection the registry already provides. Built once per
+// context from context.merged — the SAME event batch collectVisitRecords
+// already scans for this context (indexesFor), so this is not a new order
+// of magnitude of work, just one more O(events) fold alongside it. Skipped
+// entirely (zero added cost) when the kill switch is off.
+const learnedAggregatorStateByContext = new WeakMap<object, AggregatorStatsState>();
+
+const isAggregatorHostFor = (context: CandidateContext, hostname: string): boolean => {
+  if (isAggregatorHost(hostname)) return true;
+  if (!learnedAggregatorServeEnabled()) return false;
+  let learnedState = learnedAggregatorStateByContext.get(context);
+  if (learnedState === undefined) {
+    learnedState = applyAggregatorObservations(
+      createEmptyAggregatorStatsState(),
+      aggregatorObservationsFromEvents(context.merged),
+    );
+    learnedAggregatorStateByContext.set(context, learnedState);
+  }
+  return isLearnedAggregatorHost(learnedState, hostname);
+};
 
 // Whether the grouping guard should quarantine a given aggregator URL. Feed
 // pages are ALWAYS quarantined when the guard is on. Item pages are quarantined
 // only when the item-signals narrowing is disabled — otherwise they are content
 // objects and flow through to content-level similarity. A non-aggregator URL is
-// never quarantined.
+// never quarantined (registry AND learned, per isAggregatorHostFor).
 // Takes an already-parsed URL to avoid a redundant `new URL()` on the
 // per-candidate hot path (repoOrDomainKeys parses once, then passes it here).
-const suppressCoarseGrouping = (parsed: URL): boolean => {
+const suppressCoarseGrouping = (parsed: URL, context: CandidateContext): boolean => {
   if (!aggregatorGroupingGuardEnabled()) return false;
   const pageType = classifyAggregatorPageForUrl(parsed);
-  if (pageType === 'not-aggregator') return false;
+  if (pageType === 'not-aggregator') {
+    // Registry has no opinion on this hostname — the ONLY branch where the
+    // learned classifier's is-aggregator signal can add protection the
+    // registry didn't already have (feed-vs-item narrowing below is
+    // registry-only, unaffected by this).
+    return isAggregatorHostFor(context, parsed.hostname);
+  }
   if (pageType === 'item' && aggregatorItemSignalsEnabled()) return false;
   return true;
 };
 
-const repoOrDomainKeys = (record: VisitRecord): readonly string[] => {
+const repoOrDomainKeys = (record: VisitRecord, context: CandidateContext): readonly string[] => {
   try {
     const parsed = new URL(record.canonicalUrl);
     const hostname = parsed.hostname.toLowerCase().replace(/^www\./u, '');
@@ -557,7 +605,7 @@ const repoOrDomainKeys = (record: VisitRecord): readonly string[] => {
       return [`repo:${hostname}/${owner}/${repo}`];
     }
     if (hostname.length === 0) return [];
-    if (suppressCoarseGrouping(parsed)) {
+    if (suppressCoarseGrouping(parsed, context)) {
       // Coarse platform (feed page, or an item page while item-narrowing is
       // off): prefer a community-level key when the URL encodes one; otherwise
       // emit nothing (the bare domain is topic-blind). Note `domain:` is
@@ -566,7 +614,7 @@ const repoOrDomainKeys = (record: VisitRecord): readonly string[] => {
       const community = aggregatorCommunityKey(hostname, segments);
       return community === null ? [] : [community];
     }
-    if (aggregatorGroupingGuardEnabled() && isAggregatorHost(hostname)) {
+    if (aggregatorGroupingGuardEnabled() && isAggregatorHostFor(context, hostname)) {
       // Item page that passed the narrowing (guard on): still no bare `domain:`
       // key (the domain is topic-blind), but a community key applies when
       // encoded. When the guard kill-switch is OFF this branch is skipped and
@@ -629,7 +677,7 @@ const tokenizeTitlePathText = (value: string): readonly string[] =>
       (token) => token.length >= 3 && !/^\d+$/u.test(token) && !TITLE_PATH_STOP_TOKENS.has(token),
     );
 
-const titlePathTokenKeys = (record: VisitRecord): readonly string[] => {
+const titlePathTokenKeys = (record: VisitRecord, context: CandidateContext): readonly string[] => {
   const pieces: string[] = [];
   if (record.title !== undefined) pieces.push(record.title);
   try {
@@ -638,10 +686,11 @@ const titlePathTokenKeys = (record: VisitRecord): readonly string[] => {
     // Hacker News") and the path is a generic stub ("item"), so title/path
     // tokens link unrelated items — this is true for FEED and ITEM pages alike
     // (an item's path token is literally "item"). Suppressed unconditionally for
-    // any aggregator host when the guard is on; item pages recover their signal
-    // from the CONTENT-level similarity lane (a clean, host/path-free corpus),
-    // not from these lexical tokens. Rely on content signals for these pages.
-    if (aggregatorGroupingGuardEnabled() && isAggregatorHost(parsed.hostname)) return [];
+    // any aggregator host (registry OR learned, see isAggregatorHostFor) when
+    // the guard is on; item pages recover their signal from the CONTENT-level
+    // similarity lane (a clean, host/path-free corpus), not from these lexical
+    // tokens. Rely on content signals for these pages.
+    if (aggregatorGroupingGuardEnabled() && isAggregatorHostFor(context, parsed.hostname)) return [];
     for (const part of parsed.pathname.split('/')) {
       pieces.push(safeDecode(part));
     }
@@ -940,7 +989,7 @@ const sameRepoOrDomainGenerator: SourceGenerator = (fromVisitId, context, genera
     context,
     'same_repo_or_domain',
     generatedAt,
-    repoOrDomainKeys,
+    (record) => repoOrDomainKeys(record, context),
   );
 
 const sameSearchQueryGenerator: SourceGenerator = (fromVisitId, context, generatedAt) =>
@@ -952,7 +1001,7 @@ const sameTitlePathTokensGenerator: SourceGenerator = (fromVisitId, context, gen
     context,
     'same_title_path_tokens',
     generatedAt,
-    titlePathTokenKeys,
+    (record) => titlePathTokenKeys(record, context),
   );
 
 export const generateUserConfirmedCandidates: GenerateCandidates = sourceWrapper(

@@ -627,6 +627,110 @@ decisions; the registry keeps deciding both guards. Registry-replacement is
 a follow-up PR gated on shadow-agreement evidence from the real vault (see
 PR body for the actual numbers).
 
+### Follow-up: opener-independent hub signals — task #22 (2026-08-21)
+
+Closes the "Second limitation" above, using the SAME evidence-first
+discipline: measured before writing a line of new logic
+(`scripts/measure-learned-aggregator-stats.ts`, extended to a per-domain
+breakdown + a keyword-index/keyword-concepts join for entropy), THEN
+implemented, THEN re-measured on the same vault snapshot. See the PR body
+for the full before/after table and the disagreement-sample classification;
+summary below.
+
+**Root cause, confirmed by measurement (not assumption).** The blind-spot
+domains (github.com, reddit.com, chatgpt.com, claude.ai) had
+`hubCandidateCount: 0, maxQualifyingOutlinkFanout: 0` on the real vault —
+not "low", literally zero qualifying same-domain opener evidence, no matter
+how many times the domain was visited. Confirms the prior note's hypothesis
+exactly.
+
+**Three new signals, all opener-independent, all structural** (no domain
+list — see `learnedAggregatorStats.ts`'s own header for the exact gates and
+thresholds):
+- **(a) URL-population shape** — `deepSingleVisitUrlCount` (distinct
+  `DEEP_PATH_MIN_SEGMENTS`-or-deeper paths seen exactly once) +
+  `shallowHighRevisitUrlCount` (distinct `SHALLOW_PATH_MAX_SEGMENTS`-or-shallower
+  paths revisited). Both required — this is what tells a hub-shaped
+  population apart from a single-source blog with deep dated permalinks
+  (many single-visit deep URLs, but nothing shallow ever gets revisited).
+  The dominant fix for github.com/reddit.com/claude.ai's is-aggregator
+  recognition.
+- **(b) Keyword-concept entropy** — PR #385's counter, previously
+  diagnostic-only, now consulted as a VETO (can turn a structurally
+  hub-shaped domain into `not-aggregator` given low entropy + enough
+  samples; can never manufacture a hub call on its own — see
+  `MIN_KEYWORD_CONCEPT_SAMPLES_FOR_VETO`). Measured coverage on the real
+  vault is thin (65 pages tagged; 5 on github.com, 0 on
+  reddit.com/chatgpt.com/claude.ai) — this signal did NOT move the
+  blind-spot domains' numbers directly, but is wired in correctly for when
+  keyword coverage grows, and is unit-tested on synthetic fixtures either
+  way.
+- **(c) Shallow-path title churn** — the existing per-URL churn signal,
+  aggregated across a domain's shallow paths specifically. Closed
+  chatgpt.com's is-aggregator recognition (chatgpt.com already had
+  `hub: true` from the original fan-out signal in some vault snapshots, but
+  this signal is what qualifies domains — x.com in this vault's case —
+  that have neither fan-out nor population-shape evidence).
+
+**Opener-independent per-URL item inference, added alongside the domain gate.**
+Once a domain is hub-qualified by ANY gate (fan-out OR population-shape OR
+shallow-churn), a URL with a DEEP path and low self-fan-out is presumptively
+an `item` even with zero opener/inbound evidence — the same reasoning signal
+(a) uses at the domain level, applied per-URL. This is what actually
+resolves individual github/reddit/chatgpt/claude.ai items that arrived via
+external link or bookmark.
+
+**Measured result (per-domain, registry-covered, real vault, 2026-08-21).**
+Collapsed is-aggregator (feed|item vs. not-aggregator) agreement on
+registry-covered domains: **73.3% → 98.7%**. `registryOnlyAggregatorCount`
+(registry protects, learned doesn't — the dangerous under-protection
+direction): **628 → 30** (95% reduction); the residual 30 are domains below
+`MIN_DOMAIN_URLS_FOR_HUB` (medium.com: 3 URLs; gitlab.com/stackexchange.com/
+stackoverflow.com: 1 URL each) or below the population/churn bars
+(substack.com, t.co) — correctly conservative, and still fully protected via
+the registry-fallback OR-combine (see below), never a regression.
+
+**Disagreement-sample classification (the task's explicit bar: learned-wrong
+≈ 0, not blind 100% agreement).** Sampled and attributed every remaining
+`item→feed` disagreement on the four named blind-spot domains
+(github.com 71, reddit.com 29, chatgpt.com 208, claude.ai 4): 96-100% of
+each domain's disagreements trace to ONE cause — the PRE-EXISTING per-URL
+title-churn-as-feed heuristic (not a new signal from this PR) misfiring on
+platforms that inject volatile metadata into a page's `<title>` across
+captures (reddit vote/comment counts, GitHub notification-count title
+prefixes, ChatGPT/Claude.ai auto-renaming a new conversation after its first
+exchange). This IS a genuine "learned-wrong" pattern, but it fails in the
+SAFE direction the module's own binding cold-start rule explicitly allows
+("wrong by over-suppressing... never wrong by under-suppressing") — it
+quarantines a real item like a feed page, costing it some content-similarity
+signal, never resurrecting the 2026-07-10 false-friend. A handful of other
+disagreements (google.com's `/search` pages, ycombinator.com's `/item?id=`
+pages, youtube.com's `/watch?v=` pages — all query-string-identity URLs, not
+introduced or worsened by this PR) share a known, documented limitation:
+`DEEP_PATH_MIN_SEGMENTS` is a PATH-segment count and is blind to
+query-string identity. Left as a follow-up, not fixed here (fixing it
+generically without a per-domain query-param allowlist is a harder problem
+than this PR's scope).
+
+**Serving flip — SCOPED, not a full replacement.** Per the measurement:
+the IS-AGGREGATOR (hub) boolean is now consulted at serving time
+(`ranker/candidates.ts`, `tabsession/similarity.ts`), OR-COMBINED with the
+registry behind `SIDETRACK_LEARNED_AGGREGATOR_SERVE` (default ON, `=0` kill
+switch reverts to byte-identical pre-task-#22 behavior). OR-combine means
+this is STRICTLY ADDITIVE — quarantine protection can only be GAINED
+(closing the blind spot: 677 hostnames on the live vault the registry has no
+profile for at all), never lost (the registry's own 'feed'/'item' call
+alone still fully quarantines, unconditionally). The FEED-VS-ITEM
+sub-classification — which only matters when the separately-gated,
+default-OFF `SIDETRACK_AGGREGATOR_ITEM_SIGNALS` narrowing is on — stays
+REGISTRY-ONLY: the title-churn false-negative above means it is not yet
+replacement-grade, and flipping it would have zero effect on default-flag
+serving anyway (both call sites treat feed and item identically until that
+separate flag is turned on). `aggregatorProfiles.ts` is NOT deleted or
+deprecated — it is the fallback for every OR-combine and the sole decider
+for feed-vs-item; a follow-up soak-and-measure PR is the earliest point to
+revisit that.
+
 ## Columnar scan routing — design note (2026-08-18)
 
 Binding user rule: design before code. Task #35, follow-up to
@@ -964,6 +1068,34 @@ none qualified in this task's `deps`/`target`/`hlc` audit).
 4. Kick a fresh acceptance-sampler window; record numbers here.
 
 ## Landing notes (current state, dated)
+
+**2026-08-21 — task #22: opener-independent hub signals, learned aggregator
+to replacement grade on the IS-AGGREGATOR boundary
+(feat/aggregator-shadow-close).** Closes PR #373's named blind spot: three
+new opener-independent signals in `learnedAggregatorStats.ts` (URL-population
+shape, keyword-concept-entropy veto, shallow-path title churn — see the
+design note above for the exact gates) plus an opener-independent per-URL
+item inference. Measured before AND after on the same real-vault snapshot
+(`scripts/measure-learned-aggregator-stats.ts`, extended with a per-domain
+breakdown + keyword-index/keyword-concepts join): collapsed is-aggregator
+agreement on registry-covered domains **73.3% → 98.7%**;
+`registryOnlyAggregatorCount` (the dangerous under-protection direction)
+**628 → 30**. Sampled every remaining disagreement on the four named
+blind-spot domains (github/reddit/chatgpt/claude.ai, 312 total
+`item→feed` disagreements) and attributed 96-100% of each domain's count to
+ONE pre-existing (not introduced by this PR) cause: the per-URL
+title-churn-as-feed heuristic misfiring on platforms with volatile
+in-`<title>` metadata — a safe-direction ("wrong by over-suppressing")
+failure per the module's own binding cold-start rule, never a false-friend.
+Serving flip is SCOPED: the is-aggregator boolean is now consulted at
+serving time (`candidates.ts`, `tabsession/similarity.ts`), OR-combined with
+the registry (`SIDETRACK_LEARNED_AGGREGATOR_SERVE`, default ON, `=0` kill
+switch is byte-identical to before) — additive-only by construction, so it
+cannot regress the registry's existing protection. The feed-vs-item
+sub-classification stays registry-only (not yet replacement-grade, and
+inert under today's default `SIDETRACK_AGGREGATOR_ITEM_SIGNALS=off` anyway).
+`aggregatorProfiles.ts` is NOT deleted — it is the OR-combine fallback and
+the sole feed/item decider. See PR body for the full per-domain table.
 
 **2026-08-21 — F2 apply: hot-tail retirement (move-not-delete) + event-store
 vacuum, CLOSES F2 (feat/f2-retire-apply).** The soak window named in the F2
