@@ -182,6 +182,24 @@ describe('aggregatorObservationsFromEvents', () => {
     expect(aggregatorObservationsFromEvents(events)).toEqual([]);
   });
 
+  it('passes a title through UNMODIFIED, metadata and all — normalization is learnedAggregatorStats.ts\'s job, not this adapter\'s (2026-08-21 metadata-robustness follow-up)', () => {
+    const events: AcceptedEvent[] = [
+      event({
+        seq: 1,
+        type: BROWSER_TIMELINE_OBSERVED,
+        payload: timelinePayload({ url: 'https://hub.test/deep/post-1', title: 'a great post about otters (123 points)' }),
+      }),
+      event({
+        seq: 2,
+        type: BROWSER_TIMELINE_OBSERVED,
+        payload: timelinePayload({ url: 'https://hub.test/deep/repo-1', title: '(3) my-project' }),
+      }),
+    ];
+    const observations = aggregatorObservationsFromEvents(events);
+    expect(observations[0]?.title).toBe('a great post about otters (123 points)');
+    expect(observations[1]?.title).toBe('(3) my-project');
+  });
+
   it('skips a BROWSER_TIMELINE_OBSERVED with no title (edge-only NAVIGATION_COMMITTED observations still carry no title field)', () => {
     const events: AcceptedEvent[] = [
       event({
