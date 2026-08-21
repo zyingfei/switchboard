@@ -56,20 +56,128 @@
 // checkout/marketing pages, x.com's policy-driven "every page is a feed"
 // stance, reddit's two-segment `/r/<subreddit>` listing shape) as 'item'.
 // That is the DANGEROUS direction (under-suppression) the binding
-// COLD-START RULE forbids, and it grew on re-measurement: chatgpt.com
+// COLD-START RULE forbids, and it grew on that re-measurement: chatgpt.com
 // dangerous-direction disagreements 4->10, reddit.com 1->4, x.com 22->65
-// (github.com and claude.ai unchanged). Net: learned-wrong is NOT ≈0, so
-// per this task's own decision bar the serving flip is NOT extended to
-// feed-vs-item — the title-churn fix ships on its own merits, feed-vs-item
-// stays registry-only, and the deep-path item-inference heuristic's
-// non-item-shaped-URL blind spot is left as a named follow-up (it needs its
-// own fix, not a title-churn workaround). Still wired into
-// system/workGraphHealth.ts as an observe-only diagnostic for this
-// sub-decision specifically. See docs/plans/2026-08-15-foundation-
-// program.md's "Learned per-node aggregator stats — design note
-// (2026-08-16)" and the 2026-08-21 title-churn-robustness landing note for
-// the full design rationale, the false-friend history this must not
-// weaken, and the thresholds' reasoning.
+// (github.com and claude.ai unchanged). That named follow-up (oscillating
+// placeholder titles + deep-path item-inference overreach) was closed by
+// task #23 below — STILL not enough to extend the serving flip to
+// feed-vs-item (the dangerous direction improved on some domains but grew
+// net overall, see task #23's own re-measurement) — feed-vs-item remains
+// registry-only. Still wired into system/workGraphHealth.ts as an
+// observe-only diagnostic for this sub-decision specifically. See
+// docs/plans/2026-08-15-foundation-program.md's "Learned per-node
+// aggregator stats — design note (2026-08-16)", the 2026-08-21 title-churn-
+// robustness landing note, and the 2026-08-21 "FEED-VS-ITEM v2 (task #23)"
+// landing note for the full design rationale, the false-friend history this
+// must not weaken, and the thresholds' reasoning.
+//
+// FEED-VS-ITEM v2 (2026-08-21, task #23 — closing the two residual patterns
+// the title-churn-robustness follow-up's own re-measurement named). Two more
+// structural fixes, still no domain list, still no per-site pattern:
+//
+// (1) OSCILLATING PLACEHOLDER TITLES. The title-churn-robustness follow-up
+// fixed volatile IN-TITLE METADATA (vote counts, unread counters) but left a
+// different shape unaddressed: a generic loading-placeholder title
+// ("ChatGPT", "Reddit - The heart of the internet") that ALTERNATES with the
+// real title across captures (tab background/foreground re-renders) — not a
+// one-time settle, and not metadata-shaped (the placeholder and the real
+// title share no tokens at all, so Jaccard correctly calls each transition
+// "substantively different" in isolation). Two structural signals close this,
+// both keyed on data this module already tracks incrementally:
+//   (a) OSCILLATION-SET TRACKING (distinctNormalizedTitles, bounded at
+//       MAX_TRACKED_DISTINCT_TITLES_PER_URL). A transition to a title this
+//       URL has shown BEFORE is a RETURN to a known value, not novel content
+//       — churn requires a title NEVER SEEN before for this URL. A small
+//       alternating set (2-3 recurring values) never accumulates novel
+//       titles past its first lap; a genuinely rotating feed does, every
+//       capture.
+//   (b) DOMAIN-BOILERPLATE TITLE EXCLUSION (titleDistinctUrlCounts, bounded
+//       at MAX_TRACKED_DOMAIN_TITLES top-N tracked keys). A title recurring
+//       across >= MIN_DISTINCT_URLS_FOR_BOILERPLATE_TITLE DISTINCT URLs on
+//       the same domain is the platform's generic chrome, not this page's
+//       content — learned per-domain from data already folded into the
+//       existing per-domain aggregates. A transition where EITHER side is
+//       domain-boilerplate carries no content evidence and is excluded from
+//       churn accounting entirely (same posture as the settle window).
+// Both (a) and (b) are SCOPED to the per-URL churn count (titleChangeCount)
+// only — deliberately NOT applied to signal (c)'s domain-level SHALLOW-path
+// churn aggregate (shallowChurnNumerator, below), which keeps using the
+// pre-existing metadata-robust-only churn test. Measured on the real test
+// vault: applying (a)/(b) to signal (c) too starved several registry-covered
+// domains (reddit.com, claude.ai, openai.com, youtube.com, …) of enough
+// shallow-path samples to ever clear MIN_SHALLOW_CHURN_SAMPLES_FOR_SIGNAL —
+// their ONLY learned hub-qualifying evidence — silently disabling the
+// learned classifier for them (SAFE, since all are registry-covered and the
+// OR-combine falls back to the registry, but a real, avoidable loss of
+// classifier value this task does not need to pay for).
+//
+// (2) DEEP-PATH ITEM-INFERENCE OVERREACH. Path depth alone (the opener-
+// independent per-URL item signal added for PR #373's blind spot) proved too
+// blunt: it fired on x.com permalinks (registry policy: always feed), reddit
+// `/r/<sub>` roots (2 path segments — "deep" by segment count, but a listing
+// page), and chatgpt.com checkout/marketing paths. Deep path is now
+// NECESSARY, never SUFFICIENT — it must be corroborated by at least one more
+// structural vote, and can be VETOED outright:
+//   VETO — sibling fan-out (pathPrefixChildCounts, bounded at
+//     MAX_TRACKED_PATH_PREFIXES, registered up to MAX_PREFIX_TRACK_DEPTH
+//     ancestor levels per URL). A URL that is itself a prefix-parent of
+//     >= PREFIX_PARENT_MIN_CHILDREN distinct deeper URLs (reddit's `/r/sub`
+//     is the parent path of every `/r/sub/comments/…` thread) is a LISTING,
+//     not an item — vetoes item classification outright regardless of the
+//     votes below.
+//   VOTE — single-visit pattern: real items are visited once or twice then
+//     decay (urlCounters.visitCount <= SINGLE_VISIT_PATTERN_MAX_VISITS,
+//     keyed on session-gap-separated DISTINCT VISITS, never raw observation
+//     count — a single open-tab dwell routinely folds SEVERAL raw
+//     observations (its own navigation.committed plus periodic
+//     BROWSER_TIMELINE_OBSERVED re-captures; the live test vault measures
+//     ~2.5 timeline captures per navigation), which an early build of this
+//     signal wrongly read as "revisited" — see visitCount's own comment);
+//     a URL revisited more than that is feed-like regardless of depth.
+//   VOTE — title stability: at least 2 title-bearing captures with ZERO
+//     registered churn is positive evidence of a stable content object.
+// Item classification now requires deep-path AND NOT prefix-parent-veto AND
+// (single-visit-pattern OR title-stability) — never deep-path alone.
+//
+// RE-MEASUREMENT (task #23, same fresh vault snapshot, registry-covered
+// domains): overall agreement 72.0%->75.1% (4698 URLs); registry-covered
+// agreement 67.9%->74.1% (2348 URLs). The SAFE direction (item->feed,
+// over-suppression) improved sharply — overall 339->174 — driven mostly by
+// (1): github.com 95.2%->97.8% (item->feed 12->4), chatgpt.com
+// 40.0%->86.9% (155->24), reddit.com 50.0%->86.8% (15->1), claude.ai
+// 76.9%->84.6% (3->0). The DANGEROUS direction (feed->item,
+// under-suppression) did NOT shrink net — overall 355->376 — so per this
+// module's own binding COLD-START RULE and the task's decision bar, feed-
+// vs-item is NOT extended to serving; it stays registry-only. Disagreement
+// sample classification, "registry-wrong" meaning the registry's per-domain
+// isItemUrl is genuinely incomplete rather than the learned signal being
+// unsound:
+//   - x.com dangerous count GREW (65->83) rather than resolving as hoped —
+//     individual tweet permalinks (deep, overwhelmingly single-visit) are
+//     structurally indistinguishable from genuine items; x.com's registry
+//     "always feed" is a deliberate PLATFORM POLICY (short/ephemeral
+//     content, not a content-stability fact), which no structural signal
+//     can recover. Verified, not assumed — this is the honest negative
+//     result of that verification, not a bug.
+//   - google.com's large, ~unchanged dangerous count (213->208) is the
+//     PRE-EXISTING opener-chain `reachedFromHub` signal (PR #373/#406,
+//     untouched by this task) misfiring on search-result pages reached from
+//     a hub-shaped www.google.com session — confirmed these URLs are
+//     SHALLOW (never enter the deep-path gate this task changed) — a named,
+//     out-of-scope follow-up.
+//   - NEW finding: platform.openai.com settings/dashboard SPA pages
+//     (single-page-app chrome, e.g. /settings/organization/billing/…) are
+//     single-visit AND spuriously title-stable (client-side route changes
+//     that don't always update document.title lag the visible page one
+//     capture behind) — a structural blind spot distinct from x.com/
+//     google.com's, not fixed here.
+//   - chatgpt.com's small residual growth (10->12) is the SAME checkout/
+//     marketing/library/project-workspace pattern PR #408 already named,
+//     still present: a single-visit, title-stable non-conversation page is
+//     structurally identical to a real thread by every signal available
+//     here.
+// See docs/plans/2026-08-15-foundation-program.md's 2026-08-21 "FEED-VS-ITEM
+// v2 (task #23)" landing note for the full before/after table.
 //
 // COLD-START RULE (binding). Any URL or domain this module has not seen
 // enough evidence for defaults to the CONSERVATIVE / quarantining answer —
@@ -167,6 +275,67 @@ export const STABLE_CONTENT_CHURN_JACCARD_THRESHOLD = 0.5;
 const SHORT_DIGIT_BRACKET_MAX_INNER_CHARS = 24;
 
 // ---------------------------------------------------------------------------
+// Oscillating placeholder titles (2026-08-21, task #23 — see the module
+// header's FEED-VS-ITEM v2 note, part (1)).
+
+// Bound memory per URL. Oscillation between a genuinely small set (2-3
+// recurring values — a loading placeholder plus the real title, maybe a
+// third transient variant) never approaches this; a URL that DOES keeps
+// growing past it is exactly the "novel titles keep appearing" shape that
+// should be treated as churn, so capping loses no decision-relevant
+// information (same reasoning as MAX_TRACKED_OUTLINK_TARGETS).
+export const MAX_TRACKED_DISTINCT_TITLES_PER_URL = 8;
+
+// Bound memory per domain (top-N tracked title keys — see MAX_TRACKED_
+// OUTLINK_TARGETS for the same style of approximate, bounded tracking).
+const MAX_TRACKED_DOMAIN_TITLES = 128;
+
+// A title recurring across at least this many DISTINCT URLs on one domain
+// reads as the platform's generic chrome (a loading placeholder, a
+// composer's default title), not this specific page's content.
+export const MIN_DISTINCT_URLS_FOR_BOILERPLATE_TITLE = 5;
+
+// ---------------------------------------------------------------------------
+// Deep-path item-inference structural evidence (2026-08-21, task #23 — see
+// the module header's FEED-VS-ITEM v2 note, part (2)).
+
+// "Visited once or twice, then decays" — a real item's revisit shape. Keyed
+// on DISTINCT VISITS (see UrlAggregatorCounters.visitCount /
+// SESSION_GAP_MS), never on raw observationCount: a single open-tab dwell
+// routinely produces several BROWSER_TIMELINE_OBSERVED re-captures (the live
+// test vault measures ~2.5 timeline captures per navigation.committed) plus
+// its own navigation.committed — conflating that capture density with
+// "revisited" is exactly the bug an early build of this signal measured (a
+// single-visit github.com/owner/repo page with 3 raw observations, 1 real
+// visit, wrongly falling to feed). visitCount corrects for this
+// structurally, not by loosening the threshold.
+export const SINGLE_VISIT_PATTERN_MAX_VISITS = 2;
+
+// A gap this long between two observations of the SAME URL is treated as a
+// NEW visit, not more captures of the same open-tab dwell — the same 30-
+// minute session-boundary convention dispatch/correlation.ts's
+// MATCH_WINDOW_MS already uses elsewhere in this repo. Generic web-session
+// heuristic, not a per-domain tunable.
+export const SESSION_GAP_MS = 30 * 60 * 1000;
+
+// How many ancestor path-prefix levels to register per newly observed URL
+// (bounded — see MAX_TRACKED_PATH_PREFIXES). Covers every named overreach
+// shape (reddit `/r/<sub>` = 2 segments, x.com `/<user>` = 1 segment) with
+// headroom; a candidate URL deeper than this never gets prefix-parent
+// evidence (lookup degrades to 0, the conservative "no veto" direction).
+const MAX_PREFIX_TRACK_DEPTH = 3;
+
+// Bound memory per domain (top-N tracked path-prefix keys).
+const MAX_TRACKED_PATH_PREFIXES = 128;
+
+// A URL that is itself the shared path-prefix of at least this many distinct
+// deeper URLs is a listing page (reddit's `/r/sub` is the prefix-parent of
+// every `/r/sub/comments/…` thread) — mirrors MIN_HUB_FANOUT's "many" bar by
+// intent, same evidence shape (fan-out), different granularity (a specific
+// path prefix rather than an observed opener-chain launch).
+export const PREFIX_PARENT_MIN_CHILDREN = MIN_HUB_FANOUT;
+
+// ---------------------------------------------------------------------------
 // Opener-independent hub signals (2026-08-21, task #22 — closing PR #373's
 // named blind spot). The fan-out gate above requires OBSERVING a same-domain
 // launch -> item opener chain (NAVIGATION_COMMITTED.openerVisitId inside the
@@ -244,14 +413,35 @@ export interface UrlAggregatorCounters {
   readonly lastObservedAtMs: number;
   /** Total observations of ANY kind folded for this URL (title-bearing or
    *  not, opener/previous edge or not) — unlike captureCount, this counts
-   *  every visit, so it is the "how many times was this exact URL visited"
-   *  measure the population-shape signal (a) is built on. */
+   *  every fold, so it is the measure the population-shape signal (a) is
+   *  built on. NOT the same as "how many times was this exact URL visited"
+   *  (see visitCount for that) — a single open-tab dwell routinely folds
+   *  more than one observation (its own navigation.committed plus several
+   *  periodic BROWSER_TIMELINE_OBSERVED re-captures), so this measure is
+   *  session-blind by construction. Kept exactly as-is (signal (a) is
+   *  pre-existing, unrelated to this task) — see visitCount for the
+   *  session-aware count part (2)'s revisit-concentration signal needs. */
   readonly observationCount: number;
   /** Non-empty path segment count, computed once from the URL and cached
    *  (a stable structural property, never re-derived per read). Feeds the
    *  population-shape signal (a) — see SHALLOW_PATH_MAX_SEGMENTS /
    *  DEEP_PATH_MIN_SEGMENTS. */
   readonly pathDepth: number;
+  /** Count of distinct normalized titles this URL has ever shown (bounded,
+   *  see MAX_TRACKED_DISTINCT_TITLES_PER_URL) — the oscillation-set-tracking
+   *  signal (see the module header's FEED-VS-ITEM v2 note, part (1a)). A
+   *  small, stable count (2-3) alongside a healthy captureCount is exactly
+   *  the placeholder-oscillation shape; a count that keeps climbing with
+   *  captureCount is a genuinely rotating feed. */
+  readonly distinctTitleCount: number;
+  /** Count of DISTINCT VISITS to this URL — observations more than
+   *  SESSION_GAP_MS apart count as separate visits; closer ones are more
+   *  captures of the same open-tab dwell. The revisit-concentration signal
+   *  (see the module header's FEED-VS-ITEM v2 note, part (2), and
+   *  SINGLE_VISIT_PATTERN_MAX_VISITS). Deliberately distinct from
+   *  observationCount (every fold, session-blind) — see that field's own
+   *  comment for why the two must not be conflated. */
+  readonly visitCount: number;
 }
 
 export interface DomainAggregatorCounters {
@@ -325,6 +515,19 @@ export interface DomainAggregatorCounters {
    *  computed over — the sample-size gate for shallowTitleChurnRate (see
    *  MIN_SHALLOW_CHURN_SAMPLES_FOR_SIGNAL). */
   readonly shallowTitleChurnSampleCount: number;
+  /** Diagnostic only (not itself a classification gate — consulted per-title
+   *  via isDomainBoilerplateTitle, not read as an aggregate): count of
+   *  tracked title keys (bounded, see MAX_TRACKED_DOMAIN_TITLES) currently
+   *  at or above MIN_DISTINCT_URLS_FOR_BOILERPLATE_TITLE distinct URLs — how
+   *  many boilerplate placeholder titles this domain has learned. See the
+   *  module header's FEED-VS-ITEM v2 note, part (1b). */
+  readonly boilerplateTitleKeyCount: number;
+  /** Diagnostic only: count of tracked path-prefix keys (bounded, see
+   *  MAX_TRACKED_PATH_PREFIXES) currently at or above
+   *  PREFIX_PARENT_MIN_CHILDREN distinct children — how many listing-shaped
+   *  path prefixes this domain has learned. See the module header's
+   *  FEED-VS-ITEM v2 note, part (2) VETO. */
+  readonly prefixParentKeyCount: number;
 }
 
 interface MutableUrlCounters {
@@ -356,6 +559,15 @@ interface MutableUrlCounters {
    *  countedAsHubCandidate. */
   countedAsDeepSingleVisit: boolean;
   countedAsShallowHighRevisit: boolean;
+  /** See UrlAggregatorCounters.distinctTitleCount — the oscillation-set
+   *  signal (module header FEED-VS-ITEM v2, part (1a)). Bounded at
+   *  MAX_TRACKED_DISTINCT_TITLES_PER_URL. */
+  distinctNormalizedTitles: Set<string>;
+  /** See UrlAggregatorCounters.visitCount — module header FEED-VS-ITEM v2,
+   *  part (2) revisit-concentration. Incremented once per applyObservation
+   *  call where the gap since this URL's previous observation exceeds
+   *  SESSION_GAP_MS (or this is the URL's first-ever observation). */
+  visitCount: number;
 }
 
 interface MutableDomainCounters {
@@ -377,6 +589,16 @@ interface MutableDomainCounters {
    *  existing per-URL title-churn bookkeeping in applyObservation. */
   shallowChurnNumerator: number;
   shallowChurnDenominator: number;
+  /** See DomainAggregatorCounters.boilerplateTitleKeyCount — module header
+   *  FEED-VS-ITEM v2, part (1b). Key = normalized title; value = count of
+   *  DISTINCT URLs on this domain that have shown it (bounded, see
+   *  MAX_TRACKED_DOMAIN_TITLES). */
+  titleDistinctUrlCounts: Map<string, number>;
+  /** See DomainAggregatorCounters.prefixParentKeyCount — module header
+   *  FEED-VS-ITEM v2, part (2) VETO. Key = an ancestor path prefix (e.g.
+   *  `/r/pics`); value = count of DISTINCT deeper URLs observed sharing it
+   *  (bounded, see MAX_TRACKED_PATH_PREFIXES and MAX_PREFIX_TRACK_DEPTH). */
+  pathPrefixChildCounts: Map<string, number>;
 }
 
 const freezeUrlCounters = (mutable: MutableUrlCounters): UrlAggregatorCounters => ({
@@ -390,7 +612,34 @@ const freezeUrlCounters = (mutable: MutableUrlCounters): UrlAggregatorCounters =
   lastObservedAtMs: mutable.lastObservedAtMs,
   observationCount: mutable.observationCount,
   pathDepth: mutable.pathDepth,
+  distinctTitleCount: mutable.distinctNormalizedTitles.size,
+  visitCount: mutable.visitCount,
 });
+
+// A title recurring across enough DISTINCT URLs on one domain is the
+// platform's generic chrome — see MIN_DISTINCT_URLS_FOR_BOILERPLATE_TITLE.
+const isDomainBoilerplateTitle = (domainCounters: MutableDomainCounters, normalizedTitle: string): boolean =>
+  (domainCounters.titleDistinctUrlCounts.get(normalizedTitle) ?? 0) >= MIN_DISTINCT_URLS_FOR_BOILERPLATE_TITLE;
+
+// Count of tracked title keys currently at or above the boilerplate bar —
+// diagnostic only (DomainAggregatorCounters.boilerplateTitleKeyCount).
+const boilerplateTitleKeyCountOf = (domainCounters: MutableDomainCounters): number => {
+  let count = 0;
+  for (const distinctUrlCount of domainCounters.titleDistinctUrlCounts.values()) {
+    if (distinctUrlCount >= MIN_DISTINCT_URLS_FOR_BOILERPLATE_TITLE) count += 1;
+  }
+  return count;
+};
+
+// Count of tracked path-prefix keys currently at or above the prefix-parent
+// bar — diagnostic only (DomainAggregatorCounters.prefixParentKeyCount).
+const prefixParentKeyCountOf = (domainCounters: MutableDomainCounters): number => {
+  let count = 0;
+  for (const childCount of domainCounters.pathPrefixChildCounts.values()) {
+    if (childCount >= PREFIX_PARENT_MIN_CHILDREN) count += 1;
+  }
+  return count;
+};
 
 const entropyBitsOf = (counts: ReadonlyMap<string, number>): number => {
   const total = [...counts.values()].reduce((sum, count) => sum + count, 0);
@@ -441,18 +690,38 @@ const firstPathSegmentOf = (canonicalUrl: string): string => {
   }
 };
 
-// Non-empty path segment count — the generic structural primitive signal
-// (a)'s shallow/deep split is built on (SHALLOW_PATH_MAX_SEGMENTS /
-// DEEP_PATH_MIN_SEGMENTS). Same "URL-STRUCTURE, not domain-specific" spirit
-// as firstPathSegmentOf; a malformed URL depth-counts as 0 (shallow), the
-// conservative direction (never spuriously "deep").
-const pathSegmentCountOf = (canonicalUrl: string): number => {
+// Non-empty path segments, parsed once. The generic structural primitive
+// signal (a)'s shallow/deep split (SHALLOW_PATH_MAX_SEGMENTS /
+// DEEP_PATH_MIN_SEGMENTS) and the sibling-fan-out prefix tracking (part (2)
+// VETO) are both built on this — same "URL-STRUCTURE, not domain-specific"
+// spirit as firstPathSegmentOf. A malformed URL yields no segments (depth 0,
+// shallow), the conservative direction (never spuriously "deep").
+const pathSegmentsOf = (canonicalUrl: string): readonly string[] => {
   try {
     const parsed = new URL(canonicalUrl);
-    return parsed.pathname.split('/').filter((segment) => segment.length > 0).length;
+    return parsed.pathname.split('/').filter((segment) => segment.length > 0);
   } catch {
-    return 0;
+    return [];
   }
+};
+
+// This URL's own full path, in the same string shape pathPrefixChildCounts
+// keys are built in (`/seg1/seg2/…`) — used both to REGISTER a new URL's
+// ancestor prefixes and to LOOK UP whether a candidate URL is itself one of
+// those prefixes (see part (2) VETO).
+const fullPathKeyOf = (segments: readonly string[]): string => `/${segments.join('/')}`;
+
+// Ancestor path-prefix keys for `segments`, shallowest first, capped at
+// MAX_PREFIX_TRACK_DEPTH levels — see the module header's FEED-VS-ITEM v2
+// note, part (2) VETO. Excludes the URL's own full path (only proper
+// ancestors — a URL is never registered as its own child).
+const ancestorPathPrefixesOf = (segments: readonly string[]): readonly string[] => {
+  const trackDepth = Math.min(segments.length - 1, MAX_PREFIX_TRACK_DEPTH);
+  const prefixes: string[] = [];
+  for (let level = 1; level <= trackDepth; level += 1) {
+    prefixes.push(fullPathKeyOf(segments.slice(0, level)));
+  }
+  return prefixes;
 };
 
 const normalizeTitle = (title: string): string => title.trim().toLowerCase();
@@ -562,6 +831,8 @@ export class AggregatorStatsState {
           ? 0
           : mutable.shallowChurnNumerator / mutable.shallowChurnDenominator,
       shallowTitleChurnSampleCount: mutable.shallowChurnDenominator,
+      boilerplateTitleKeyCount: boilerplateTitleKeyCountOf(mutable),
+      prefixParentKeyCount: prefixParentKeyCountOf(mutable),
     };
   }
 
@@ -571,9 +842,25 @@ export class AggregatorStatsState {
     return [...this.urlCounters.keys()];
   }
 
+  /** Count of distinct deeper URLs observed sharing `canonicalUrl`'s own full
+   *  path as an ancestor prefix (bounded, see MAX_TRACKED_PATH_PREFIXES /
+   *  MAX_PREFIX_TRACK_DEPTH) — the sibling-fan-out VETO input (module header
+   *  FEED-VS-ITEM v2, part (2)). 0 for a domain/URL never observed, or for a
+   *  candidate deeper than MAX_PREFIX_TRACK_DEPTH (no data tracked at that
+   *  depth — degrades to "no veto", the conservative direction). */
+  pathPrefixChildCount(canonicalUrl: string): number {
+    const hostname = hostnameOf(canonicalUrl);
+    if (hostname === null) return 0;
+    const domainCounters = this.domainCounters.get(registrableDomainOf(hostname));
+    if (domainCounters === undefined) return 0;
+    const key = fullPathKeyOf(pathSegmentsOf(canonicalUrl));
+    return domainCounters.pathPrefixChildCounts.get(key) ?? 0;
+  }
+
   private mutableUrl(canonicalUrl: string, observedAtMs: number): MutableUrlCounters {
     const existing = this.urlCounters.get(canonicalUrl);
     if (existing !== undefined) return existing;
+    const segments = pathSegmentsOf(canonicalUrl);
     const created: MutableUrlCounters = {
       captureCount: 0,
       lastTitleNormalized: null,
@@ -585,9 +872,11 @@ export class AggregatorStatsState {
       lastObservedAtMs: observedAtMs,
       countedAsHubCandidate: false,
       observationCount: 0,
-      pathDepth: pathSegmentCountOf(canonicalUrl),
+      pathDepth: segments.length,
       countedAsDeepSingleVisit: false,
       countedAsShallowHighRevisit: false,
+      distinctNormalizedTitles: new Set<string>(),
+      visitCount: 0,
     };
     this.urlCounters.set(canonicalUrl, created);
     const hostname = hostnameOf(canonicalUrl);
@@ -604,6 +893,8 @@ export class AggregatorStatsState {
         shallowHighRevisitUrlCount: 0,
         shallowChurnNumerator: 0,
         shallowChurnDenominator: 0,
+        titleDistinctUrlCounts: new Map<string, number>(),
+        pathPrefixChildCounts: new Map<string, number>(),
       };
       domainCounters.distinctUrlCount += 1;
       const segment = firstPathSegmentOf(canonicalUrl);
@@ -611,6 +902,19 @@ export class AggregatorStatsState {
         segment,
         (domainCounters.firstPathSegmentCounts.get(segment) ?? 0) + 1,
       );
+      // Sibling-fan-out registration (module header FEED-VS-ITEM v2, part
+      // (2) VETO) — every ancestor prefix of this NEW URL gains one more
+      // distinct child. Bounded: existing keys always increment (accuracy
+      // for prefixes already being tracked never degrades); a brand-new key
+      // is only added while under MAX_TRACKED_PATH_PREFIXES.
+      for (const prefix of ancestorPathPrefixesOf(segments)) {
+        const existingCount = domainCounters.pathPrefixChildCounts.get(prefix);
+        if (existingCount !== undefined) {
+          domainCounters.pathPrefixChildCounts.set(prefix, existingCount + 1);
+        } else if (domainCounters.pathPrefixChildCounts.size < MAX_TRACKED_PATH_PREFIXES) {
+          domainCounters.pathPrefixChildCounts.set(prefix, 1);
+        }
+      }
       this.domainCounters.set(domain, domainCounters);
     }
     return created;
@@ -698,6 +1002,8 @@ export class AggregatorStatsState {
    * built around). Returns `this` for chaining convenience. */
   applyObservation(observation: AggregatorVisitObservation): this {
     const url = this.mutableUrl(observation.canonicalUrl, observation.observedAtMs);
+    const isFirstObservation = url.observationCount === 0;
+    const previousLastObservedAtMs = url.lastObservedAtMs;
     url.lastObservedAtMs = Math.max(url.lastObservedAtMs, observation.observedAtMs);
     url.firstObservedAtMs = Math.min(url.firstObservedAtMs, observation.observedAtMs);
 
@@ -705,6 +1011,16 @@ export class AggregatorStatsState {
     // shape needs the true revisit count, not just title-bearing captures.
     url.observationCount += 1;
     this.refreshPopulationShape(observation.canonicalUrl, url);
+
+    // Session-gap visit counting (module header FEED-VS-ITEM v2, part (2)
+    // revisit-concentration) — see UrlAggregatorCounters.visitCount / the
+    // SINGLE_VISIT_PATTERN_MAX_VISITS comment for why this must NOT be
+    // observationCount. Math.abs tolerates minor out-of-order arrival
+    // (adjacent captures a few ms apart, reordered in transit) without
+    // spuriously splitting one visit in two.
+    if (isFirstObservation || Math.abs(observation.observedAtMs - previousLastObservedAtMs) > SESSION_GAP_MS) {
+      url.visitCount += 1;
+    }
 
     if (observation.title !== undefined && observation.title.length > 0) {
       const normalized = normalizeTitle(observation.title);
@@ -719,8 +1035,72 @@ export class AggregatorStatsState {
       // counted as evidence of "same content" either (it simply isn't a
       // trusted sample yet).
       const withinSettleWindow = url.captureCount <= TITLE_SETTLE_WINDOW_OBSERVATIONS;
-      const isChurnTransition =
+
+      // Oscillation-set tracking (module header FEED-VS-ITEM v2, part (1a))
+      // — has THIS URL shown this exact normalized title before? Computed
+      // BEFORE adding `normalized` to the set below, so it reflects history
+      // strictly prior to this capture; recorded unconditionally (even
+      // inside the settle window) so a later return to an early "settling"
+      // title is still recognized as a repeat, not novel content.
+      const isNovelTitleForUrl = !url.distinctNormalizedTitles.has(normalized);
+      if (url.distinctNormalizedTitles.size < MAX_TRACKED_DISTINCT_TITLES_PER_URL) {
+        url.distinctNormalizedTitles.add(normalized);
+      }
+
+      const hostname = hostnameOf(observation.canonicalUrl);
+      const domainCounters =
+        hostname === null ? undefined : this.domainCounters.get(registrableDomainOf(hostname));
+
+      // Domain-boilerplate registration (module header FEED-VS-ITEM v2, part
+      // (1b)) — fold this (url, title) pair into the domain's
+      // title -> distinct-URL-count map, once per URL per title (guarded by
+      // isNovelTitleForUrl so a URL oscillating back to a title it already
+      // reported doesn't inflate the domain count a second time).
+      if (domainCounters !== undefined && isNovelTitleForUrl) {
+        const existingCount = domainCounters.titleDistinctUrlCounts.get(normalized);
+        if (existingCount !== undefined) {
+          domainCounters.titleDistinctUrlCounts.set(normalized, existingCount + 1);
+        } else if (domainCounters.titleDistinctUrlCounts.size < MAX_TRACKED_DOMAIN_TITLES) {
+          domainCounters.titleDistinctUrlCounts.set(normalized, 1);
+        }
+      }
+
+      // A transition where EITHER side is domain-boilerplate chrome carries
+      // no positive-or-negative content evidence — excluded from churn
+      // accounting entirely, same posture as the settle window.
+      const isBoilerplateTransition =
+        domainCounters !== undefined &&
+        hadPriorTitle &&
+        (isDomainBoilerplateTitle(domainCounters, normalized) ||
+          isDomainBoilerplateTitle(domainCounters, previousNormalized));
+
+      // Oscillation-set + domain-boilerplate awareness are deliberately
+      // SCOPED to the per-URL churn count only (this task's own named
+      // problem is specifically about DEEP ITEM PAGES — a conversation/
+      // thread title alternating with a loading placeholder). `isMetadata
+      // RobustChurn` is the PRE-EXISTING (2026-08-21 title-churn-
+      // robustness follow-up) churn test — metadata-shape-robust but NOT
+      // oscillation/boilerplate-aware — used below for signal (c), the
+      // DOMAIN-level SHALLOW-path aggregate, which exists to detect
+      // "this domain's root/listing pages show real content churn" and is
+      // orthogonal to the per-URL item-vs-feed decision. Measured on the
+      // real test vault: applying oscillation/boilerplate-awareness to
+      // signal (c) too starved several registry-covered domains (reddit.com,
+      // claude.ai, openai.com, youtube.com, …) of enough shallow-path
+      // samples to ever clear MIN_SHALLOW_CHURN_SAMPLES_FOR_SIGNAL — their
+      // ONLY learned hub-qualifying evidence — silently disabling the
+      // learned classifier for them entirely (SAFE, since they are all
+      // registry-covered, but a real loss of classifier value this task
+      // does not need to pay for).
+      const isMetadataRobustChurn =
         hadPriorTitle && !withinSettleWindow && isSubstantiveTitleChurn(previousNormalized, normalized);
+
+      const isChurnTransition =
+        hadPriorTitle &&
+        !withinSettleWindow &&
+        isNovelTitleForUrl &&
+        !isBoilerplateTransition &&
+        isSubstantiveTitleChurn(previousNormalized, normalized);
       if (isChurnTransition) {
         url.titleChangeCount += 1;
       }
@@ -732,17 +1112,18 @@ export class AggregatorStatsState {
       // DomainAggregatorCounters.shallowTitleChurnRate). Deep item pages are
       // deliberately excluded — they are expected to be title-stable, so
       // including them would dilute the listing-churn signal this exists to
-      // detect. A settling transition is excluded from the sample entirely,
-      // same as the per-URL accounting above.
-      if (url.pathDepth <= SHALLOW_PATH_MAX_SEGMENTS && hadPriorTitle && !withinSettleWindow) {
-        const hostname = hostnameOf(observation.canonicalUrl);
-        if (hostname !== null) {
-          const domainCounters = this.domainCounters.get(registrableDomainOf(hostname));
-          if (domainCounters !== undefined) {
-            domainCounters.shallowChurnDenominator += 1;
-            if (isChurnTransition) domainCounters.shallowChurnNumerator += 1;
-          }
-        }
+      // detect. A settling transition is excluded from the sample entirely
+      // (not a trusted sample yet, same as the per-URL accounting above).
+      // Uses isMetadataRobustChurn (NOT isChurnTransition) for the
+      // numerator — see that constant's own comment for why.
+      if (
+        url.pathDepth <= SHALLOW_PATH_MAX_SEGMENTS &&
+        hadPriorTitle &&
+        !withinSettleWindow &&
+        domainCounters !== undefined
+      ) {
+        domainCounters.shallowChurnDenominator += 1;
+        if (isMetadataRobustChurn) domainCounters.shallowChurnNumerator += 1;
       }
     }
 
@@ -936,23 +1317,38 @@ export const classifyLearnedAggregatorPage = (
   }
 
   // OPENER-INDEPENDENT positive item evidence (2026-08-21, task #22 — PR
-  // #373's named blind spot). A real visit to a github.com/reddit.com/
-  // chatgpt.com/claude.ai item overwhelmingly arrives via an external link
-  // or bookmark: the tab that lands there never had a same-domain opener,
-  // so `reachedFromHub` above is structurally never true for these domains
-  // no matter how much they're visited — the domain can clear
-  // isLearnedAggregatorHost (now that populationShaped/shallowChurnShaped
-  // don't need opener evidence either), but every one of its item pages
-  // still fell through to the conservative 'feed' default below. A DEEP
-  // path (see DEEP_PATH_MIN_SEGMENTS) on a domain we've already
-  // independently qualified as a hub, that isn't itself a qualifying
-  // listing page (checked above) and shows no title churn of its own
-  // (checked above), is presumptively an item — the same structural
-  // reasoning signal (a) uses at the domain level, applied per-URL. A
-  // SHALLOW ambiguous URL still falls through to 'feed' (the conservative
-  // default is unchanged for the case this can't speak to).
+  // #373's named blind spot; NARROWED 2026-08-21, task #23 — see the module
+  // header's FEED-VS-ITEM v2 note, part (2)). A real visit to a
+  // github.com/reddit.com/chatgpt.com/claude.ai item overwhelmingly arrives
+  // via an external link or bookmark: the tab that lands there never had a
+  // same-domain opener, so `reachedFromHub` above is structurally never true
+  // for these domains no matter how much they're visited — the domain can
+  // clear isLearnedAggregatorHost (populationShaped/shallowChurnShaped don't
+  // need opener evidence either), but every one of its item pages still fell
+  // through to the conservative 'feed' default below. DEEP path alone proved
+  // too blunt (x.com permalinks, reddit `/r/<sub>` roots, checkout/marketing
+  // paths all measured as deep-path false positives) — it is now NECESSARY,
+  // never SUFFICIENT: a DEEP path (see DEEP_PATH_MIN_SEGMENTS) on a domain
+  // we've already independently qualified as a hub, that isn't itself a
+  // qualifying listing page (checked above) and shows no title churn of its
+  // own (checked above), is presumptively an item only when (i) it is NOT
+  // itself the shared path-prefix of many distinct deeper URLs (the
+  // sibling-fan-out VETO — a listing root like `/r/sub` is the prefix-parent
+  // of every thread under it, however "deep" its own segment count reads),
+  // AND (ii) at least one corroborating vote fires: a single-visit-pattern
+  // revisit shape (real items are visited once or twice then decay; a
+  // recurring-revisit URL is feed-like regardless of depth) OR title
+  // stability (>= 2 title-bearing captures with zero registered churn). A
+  // SHALLOW ambiguous URL, or a deep URL that clears none of this, still
+  // falls through to 'feed' (the conservative default is unchanged for
+  // whatever this can't speak to).
   if (urlCounters.pathDepth >= DEEP_PATH_MIN_SEGMENTS && urlCounters.outlinkTargets.size <= ITEM_MAX_OUTLINK_FANOUT) {
-    return 'item';
+    const isPrefixParentOfManyChildren = state.pathPrefixChildCount(canonicalUrl) >= PREFIX_PARENT_MIN_CHILDREN;
+    if (!isPrefixParentOfManyChildren) {
+      const singleVisitPattern = urlCounters.visitCount <= SINGLE_VISIT_PATTERN_MAX_VISITS;
+      const titleStable = urlCounters.captureCount >= 2 && urlCounters.titleChangeCount === 0;
+      if (singleVisitPattern || titleStable) return 'item';
+    }
   }
 
   // Hub domain, ambiguous (shallow) URL, no positive item evidence:
