@@ -1,9 +1,10 @@
 import { existsSync, utimesSync } from 'node:fs';
-import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rename, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
+import { retiredShardPath } from '../analytics/hotTailRetirement.js';
 import {
   generationDbPath,
   reconcileLegacyToPublished,
@@ -165,6 +166,42 @@ describe('proof-gated storage retirement', () => {
       await rebuilt.rebuildFromJsonl(join(vaultRoot, '_BAC', 'log'));
       expect(rebuilt.readSince({})).toEqual([event]);
       rebuilt.close();
+    },
+  );
+
+  sqliteIt(
+    // F2 regression proof: hot-tail retirement (analytics/hotTailRetirement.ts)
+    // MOVES a sealed+verified day's canonical shard from _BAC/log to the
+    // sibling _BAC/retired/log mirror. Before this fix, listCanonicalShards
+    // read only _BAC/log, so a retired day's rows would look "uncovered"
+    // to this proof and (fail-closed, but wrongly) refuse retirement of a
+    // mirror it used to verify. Confirms the proof still verifies once the
+    // canonical shard lives under the retired mirror instead.
+    'still verifies the event-store mirror after its canonical shard has been F2-retired',
+    async () => {
+      const event = acceptedEvent();
+      const logPath = await writeCanonical(event);
+      const store = await createEventStore(vaultRoot);
+      store.ingest(event);
+      store.close();
+      await rm(join(vaultRoot, '_BAC', 'connections', 'event-store.db-shm'), { force: true });
+
+      // Simulate F2 apply's own move: same-filesystem rename to the
+      // retired mirror, never a delete.
+      const retiredPath = retiredShardPath(vaultRoot, event.dot.replicaId, '2026-01-01');
+      await mkdir(dirname(retiredPath), { recursive: true });
+      await rename(logPath, retiredPath);
+      expect(existsSync(logPath)).toBe(false);
+
+      const plan = await buildStorageRetirementPlan(vaultRoot);
+      const candidate = plan.candidates.find((row) => row.id === 'event-store-mirror');
+      expect(candidate?.proof.status).toBe('verified');
+      const result = await applyStorageRetirementPlan(plan, { confirmPlanId: plan.planId });
+      expect(result.errors).toEqual([]);
+      expect(existsSync(join(vaultRoot, '_BAC', 'connections', 'event-store.db'))).toBe(false);
+      // The retired mirror bytes are the recovery source now, untouched by
+      // the mirror's own retirement.
+      expect(JSON.parse((await readFile(retiredPath, 'utf8')).trim())).toEqual(event);
     },
   );
 

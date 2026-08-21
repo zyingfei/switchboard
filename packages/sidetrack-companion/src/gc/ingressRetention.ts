@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto';
 import { readdir, readFile, stat } from 'node:fs/promises';
 import { join } from 'node:path';
 
+import { listCanonicalEventShards } from '../analytics/hotTailRetirement.js';
 import { isAcceptedEvent } from '../sync/eventLog.js';
 
 // Proof-gated retention plan for the legacy capture ingress spool,
@@ -151,19 +152,14 @@ interface CanonicalCaptureIndex {
   readonly payloadHashes: ReadonlyMap<string, string>;
 }
 
-const listCanonicalShards = async (vaultRoot: string): Promise<readonly string[]> => {
-  const root = join(vaultRoot, '_BAC', 'log');
-  const replicas = await readdir(root).catch(() => []);
-  const paths: string[] = [];
-  for (const replica of replicas.sort()) {
-    const dir = join(root, replica);
-    const names = await readdir(dir).catch(() => []);
-    for (const name of names.sort()) {
-      if (name.endsWith('.jsonl')) paths.push(join(dir, name));
-    }
-  }
-  return paths;
-};
+// F2 (2026-08-21): reads BOTH `_BAC/log` and the retired mirror
+// `_BAC/retired/log` (`hotTailRetirement.ts`'s `listCanonicalEventShards`)
+// so this proof still sees the COMPLETE canonical `capture.recorded` set
+// once any day has been hot-tail-retired — a `_BAC/log`-only read would
+// see fewer canonical events than exist and (fail-closed, but wrongly)
+// refute an ingress-spool-day candidate this proof used to verify.
+const listCanonicalShards = async (vaultRoot: string): Promise<readonly string[]> =>
+  await listCanonicalEventShards(vaultRoot);
 
 /** Read the canonical bytes back from disk; no in-memory append result counts
  * as proof. Any malformed non-empty canonical line fails the proof closed. */

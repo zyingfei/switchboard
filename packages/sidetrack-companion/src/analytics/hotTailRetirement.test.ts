@@ -1,6 +1,6 @@
-import { mkdtemp, readFile, rm, stat, unlink, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rename, rm, stat, unlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
@@ -10,8 +10,14 @@ import type { AcceptedEvent } from '../sync/causal.js';
 import { createEventLog, type EventLog } from '../sync/eventLog.js';
 import { createEventStore } from '../sync/eventStore.js';
 import { loadOrCreateReplica } from '../sync/replicaId.js';
-import { runEventSealPass, sealSegmentPath } from './eventSeal.js';
-import { buildHotTailRetirementReport } from './hotTailRetirement.js';
+import { readSealedParquetDayStats } from './eventScan.js';
+import { readSealManifest, runEventSealPass, sealSegmentPath } from './eventSeal.js';
+import {
+  applyHotTailRetirement,
+  buildHotTailRetirementReport,
+  retiredShardPath,
+  retirementReceiptsPath,
+} from './hotTailRetirement.js';
 
 const PEER = 'peer-hot-tail';
 const DAY_A = '2026-03-01';
@@ -366,4 +372,230 @@ describe('hot-tail retirement report', () => {
       expect(healedShard?.jsonlBytes).toBeLessThan(bytesBeforeCompaction);
     });
   });
+});
+
+describe('hot-tail retirement apply', () => {
+  let vaultRoot = '';
+  let previousStoreFlag: string | undefined;
+  let previousSealFlag: string | undefined;
+
+  beforeEach(async () => {
+    vaultRoot = await mkdtemp(join(tmpdir(), 'sidetrack-hot-tail-apply-'));
+    previousStoreFlag = process.env['SIDETRACK_EVENT_STORE'];
+    previousSealFlag = process.env['SIDETRACK_EVENT_SEAL'];
+    process.env['SIDETRACK_EVENT_STORE'] = '1';
+    process.env['SIDETRACK_EVENT_SEAL'] = '1';
+  });
+
+  afterEach(async () => {
+    if (previousStoreFlag === undefined) delete process.env['SIDETRACK_EVENT_STORE'];
+    else process.env['SIDETRACK_EVENT_STORE'] = previousStoreFlag;
+    if (previousSealFlag === undefined) delete process.env['SIDETRACK_EVENT_SEAL'];
+    else process.env['SIDETRACK_EVENT_SEAL'] = previousSealFlag;
+    await rm(vaultRoot, { recursive: true, force: true });
+  });
+
+  const seedAndSeal = async (): Promise<void> => {
+    const replica = await loadOrCreateReplica(vaultRoot);
+    const eventLog = createEventLog(vaultRoot, replica);
+    for (let seq = 1; seq <= 5; seq += 1) await eventLog.importPeerEvent(peerEvent(seq, DAY_A));
+    for (let seq = 6; seq <= 9; seq += 1) await eventLog.importPeerEvent(peerEvent(seq, DAY_B));
+    const pass = await runEventSealPass(vaultRoot, { now: () => NOW });
+    expect(pass.errors).toEqual([]);
+    expect(pass.sealed).toHaveLength(2);
+  };
+
+  const hotPath = (day: string): string => join(vaultRoot, '_BAC', 'log', PEER, `${day}.jsonl`);
+  const retiredPath = (day: string): string => retiredShardPath(vaultRoot, PEER, day);
+
+  it(
+    'moves every sealed+eligible shard to the retired mirror byte-identically, leaves a ' +
+      'never-sealed day untouched, and is excluded from the next report\'s hot-tail discovery',
+    async () => {
+      await seedAndSeal();
+      // A third, never-sealed day — must be reported as a skip, never moved.
+      const replica = await loadOrCreateReplica(vaultRoot);
+      const eventLog = createEventLog(vaultRoot, replica);
+      const DAY_C = '2026-03-03';
+      await eventLog.importPeerEvent(peerEvent(10, DAY_C));
+
+      const bytesABefore = (await stat(hotPath(DAY_A))).size;
+      const bytesBBefore = (await stat(hotPath(DAY_B))).size;
+      const beforeContentA = await readFile(hotPath(DAY_A), 'utf8');
+      const beforeContentB = await readFile(hotPath(DAY_B), 'utf8');
+
+      const result = await applyHotTailRetirement(vaultRoot, { now: () => NOW });
+
+      expect(result.errors).toEqual([]);
+      expect(result.shardsRetired).toBe(2);
+      expect(result.shardsAlreadyRetired).toBe(0);
+      expect(result.bytesMoved).toBe(bytesABefore + bytesBBefore);
+
+      // Moved, byte-identical, hot path gone.
+      await expect(stat(hotPath(DAY_A))).rejects.toThrow();
+      await expect(stat(hotPath(DAY_B))).rejects.toThrow();
+      expect(await readFile(retiredPath(DAY_A), 'utf8')).toBe(beforeContentA);
+      expect(await readFile(retiredPath(DAY_B), 'utf8')).toBe(beforeContentB);
+
+      // Never-sealed day untouched.
+      expect((await stat(hotPath(DAY_C))).isFile()).toBe(true);
+      const cOutcome = result.outcomes.find((o) => o.day === DAY_C);
+      expect(cOutcome).toMatchObject({ outcome: 'skipped', reason: 'not-eligible', verdict: 'never-sealed' });
+
+      // Receipt: one line per moved shard, before/after hashes recorded,
+      // before === after (a same-filesystem rename cannot change content).
+      expect(result.receiptPath).toBe(retirementReceiptsPath(vaultRoot));
+      const receiptRaw = await readFile(result.receiptPath, 'utf8');
+      const receiptLines = receiptRaw.trim().split('\n').map((line) => JSON.parse(line) as Record<string, unknown>);
+      expect(receiptLines).toHaveLength(2);
+      for (const receipt of receiptLines) {
+        expect(receipt['beforeSha256']).toBe(receipt['afterSha256']);
+        expect(receipt['beforeBytes']).toBe(receipt['afterBytes']);
+      }
+
+      // Discovery: the retired tree is a SIBLING of _BAC/log, so the next
+      // report's hot-tail scan sees zero bytes at the (now-absent) hot
+      // path for the retired days — proves retired/ is excluded from
+      // day-file discovery, not merely "the file happens to be moved".
+      const afterReport = await buildHotTailRetirementReport(vaultRoot, { now: () => NOW });
+      const shardA = afterReport.shards.find((s) => s.day === DAY_A);
+      const shardB = afterReport.shards.find((s) => s.day === DAY_B);
+      expect(shardA).toMatchObject({ jsonlBytes: 0, verdict: 'sealed-verified', retirementEligible: true });
+      expect(shardB).toMatchObject({ jsonlBytes: 0, verdict: 'sealed-verified', retirementEligible: true });
+    },
+  );
+
+  it(
+    'readers still serve the full history after retirement: readMerged tolerates the absent ' +
+      'day file, and the typed store + sealed Parquet still cover it completely',
+    async () => {
+      await seedAndSeal();
+      const replica = await loadOrCreateReplica(vaultRoot);
+      const eventLog = createEventLog(vaultRoot, replica, { now: () => NOW });
+
+      const result = await applyHotTailRetirement(vaultRoot, { now: () => NOW });
+      expect(result.shardsRetired).toBe(2);
+
+      // eventLog.readMerged() never throws on the absent day files, and
+      // simply no longer surfaces the retired days' events — the designed
+      // F3 handoff, not a crash.
+      const merged = await eventLog.readMerged();
+      expect(merged.filter((e) => e.dot.replicaId === PEER)).toHaveLength(0);
+
+      // The typed store mirror still has every retired-day row.
+      const store = await createEventStore(vaultRoot);
+      try {
+        const dayStats = store.sealDayStats(PEER);
+        const statsByDay = new Map(dayStats.map((s) => [s.day, s]));
+        expect(statsByDay.get(DAY_A)?.rows).toBe(5);
+        expect(statsByDay.get(DAY_B)?.rows).toBe(4);
+      } finally {
+        store.close();
+      }
+
+      // The sealed Parquet segment still has every retired-day row.
+      const manifest = await readSealManifest(vaultRoot);
+      const { stats } = await readSealedParquetDayStats(vaultRoot, [...manifest.latest.values()]);
+      expect(stats.get(`${PEER} ${DAY_A}`)?.rows).toBe(5);
+      expect(stats.get(`${PEER} ${DAY_B}`)?.rows).toBe(4);
+    },
+  );
+
+  it('second run is a clean no-op: already-retired shards are recognised, not re-moved or errored', async () => {
+    await seedAndSeal();
+    const first = await applyHotTailRetirement(vaultRoot, { now: () => NOW });
+    expect(first.shardsRetired).toBe(2);
+
+    const beforeA = await readFile(retiredPath(DAY_A), 'utf8');
+    const beforeB = await readFile(retiredPath(DAY_B), 'utf8');
+
+    const second = await applyHotTailRetirement(vaultRoot, { now: () => NOW });
+    expect(second.errors).toEqual([]);
+    expect(second.shardsRetired).toBe(0);
+    expect(second.shardsAlreadyRetired).toBe(2);
+    expect(second.bytesMoved).toBe(0);
+    expect(second.outcomes.every((o) => o.outcome === 'already-retired')).toBe(true);
+
+    expect(await readFile(retiredPath(DAY_A), 'utf8')).toBe(beforeA);
+    expect(await readFile(retiredPath(DAY_B), 'utf8')).toBe(beforeB);
+  });
+
+  it(
+    'drift-fail-closed: a tampered seal skips only that shard in the SAME run — the other ' +
+      'still-eligible shard retires normally',
+    async () => {
+      await seedAndSeal();
+      await writeFile(sealSegmentPath(vaultRoot, PEER, DAY_A), 'not parquet');
+
+      const result = await applyHotTailRetirement(vaultRoot, { now: () => NOW });
+
+      expect(result.shardsRetired).toBe(1);
+      const outcomeA = result.outcomes.find((o) => o.day === DAY_A);
+      const outcomeB = result.outcomes.find((o) => o.day === DAY_B);
+      expect(outcomeA).toMatchObject({ outcome: 'skipped', reason: 'not-eligible', verdict: 'segment-corrupt' });
+      expect(outcomeB).toMatchObject({ outcome: 'moved' });
+
+      // The tampered day's hot shard is untouched — never partially moved.
+      expect((await stat(hotPath(DAY_A))).isFile()).toBe(true);
+      await expect(stat(retiredPath(DAY_A))).rejects.toThrow();
+      await expect(stat(hotPath(DAY_B))).rejects.toThrow();
+    },
+  );
+
+  it(
+    'crash-resume: a shard already moved by an earlier (interrupted) run is recognised on ' +
+      're-run and the remaining shard completes normally',
+    async () => {
+      await seedAndSeal();
+      // Simulate "the process crashed after moving DAY_A but before DAY_B"
+      // by performing exactly that half of the move out-of-band, then
+      // calling apply once — a faithful stand-in for what disk state a
+      // real crash between two shard renames would leave behind.
+      await mkdir(dirname(retiredPath(DAY_A)), { recursive: true });
+      await rename(hotPath(DAY_A), retiredPath(DAY_A));
+      await expect(stat(hotPath(DAY_A))).rejects.toThrow();
+      expect((await stat(hotPath(DAY_B))).isFile()).toBe(true);
+
+      const result = await applyHotTailRetirement(vaultRoot, { now: () => NOW });
+
+      expect(result.errors).toEqual([]);
+      expect(result.shardsRetired).toBe(1);
+      expect(result.shardsAlreadyRetired).toBe(1);
+      const outcomeA = result.outcomes.find((o) => o.day === DAY_A);
+      const outcomeB = result.outcomes.find((o) => o.day === DAY_B);
+      expect(outcomeA?.outcome).toBe('already-retired');
+      expect(outcomeB?.outcome).toBe('moved');
+      await expect(stat(hotPath(DAY_B))).rejects.toThrow();
+      expect((await stat(retiredPath(DAY_A))).isFile()).toBe(true);
+      expect((await stat(retiredPath(DAY_B))).isFile()).toBe(true);
+    },
+  );
+
+  it(
+    'never clobbers an existing retired file: a re-opened hot shard (late peer arrival after ' +
+      'an earlier retirement) is left exactly as found, both files intact',
+    async () => {
+      await seedAndSeal();
+      // Move DAY_A out-of-band first (as the previous test does), then
+      // simulate a late peer arrival re-opening the hot path for DAY_A —
+      // eventSeal.ts's own "late arrivals... re-sealed" comment documents
+      // exactly this store-level scenario; at the JSONL layer it means a
+      // NEW file appears at the hot path for an already-retired day.
+      await mkdir(dirname(retiredPath(DAY_A)), { recursive: true });
+      await rename(hotPath(DAY_A), retiredPath(DAY_A));
+      const retiredContent = await readFile(retiredPath(DAY_A), 'utf8');
+      await writeFile(hotPath(DAY_A), '{"reopened":"late-arrival-marker"}\n', 'utf8');
+
+      const result = await applyHotTailRetirement(vaultRoot, { now: () => NOW });
+
+      const outcomeA = result.outcomes.find((o) => o.day === DAY_A);
+      expect(outcomeA).toMatchObject({ outcome: 'skipped', reason: 'retired-destination-exists' });
+      expect(result.errors.length).toBeGreaterThan(0);
+
+      // BOTH files survive, byte-identical to how this test left them —
+      // the one invariant that must never break.
+      expect(await readFile(retiredPath(DAY_A), 'utf8')).toBe(retiredContent);
+      expect(await readFile(hotPath(DAY_A), 'utf8')).toBe('{"reopened":"late-arrival-marker"}\n');
+    },
+  );
 });

@@ -1,8 +1,9 @@
-import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, rename, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
+import { retiredShardPath } from '../analytics/hotTailRetirement.js';
 import type { AcceptedEvent } from '../sync/causal.js';
 import {
   INGRESS_RETAIN_DAYS_DEFAULT,
@@ -127,6 +128,30 @@ describe('planIngressRetention (canonical read-back proof)', () => {
     expect(plan.days[1]?.reclaimable).toBe(0);
     expect(plan.blockedBy).toBeNull();
   });
+
+  it(
+    // F2 regression proof: hot-tail retirement moves a sealed+verified
+    // day's canonical shard to _BAC/retired/log. Before the fix,
+    // listCanonicalShards read only _BAC/log, so a retired day's
+    // capture.recorded events would be invisible to this proof and (fail-
+    // closed, but wrongly) refute a spool day it used to verify.
+    'still verifies a spool day after its canonical shard has been F2-retired',
+    async () => {
+      const mirrored = await day('2026-05-01');
+      await mirror([mirrored]);
+      const canonicalPath = join(vaultRoot, '_BAC', 'log', 'replica-a', '2026-01-01.jsonl');
+      const retiredPath = retiredShardPath(vaultRoot, 'replica-a', '2026-01-01');
+      await mkdir(dirname(retiredPath), { recursive: true });
+      await rename(canonicalPath, retiredPath);
+
+      const plan = await planIngressRetention(vaultRoot, {
+        now: new Date('2026-07-29T12:00:00Z'),
+        retainDays: 14,
+      });
+      expect(plan.days[0]?.proof).toBe('verified');
+      expect(plan.days[0]?.reclaimable).toBeGreaterThan(0);
+    },
+  );
 
   it('counts lines, ignores non-spool filenames, and honours the env knob', async () => {
     await day('2026-05-01');

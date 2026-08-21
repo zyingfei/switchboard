@@ -35,7 +35,7 @@ from reality without being updated in the same PR that changes reality.
 | ID | Goal | Acceptance (coordinator-verified) | State (2026-08-15) |
 |----|------|------------------------------------|--------------------|
 | F1 | Engagement compaction runs | Report-only numbers reproduced (done: 439.7MB = 65.3% of 672.8MB reclaimable, 0 uncovered visits); gated `--apply` on test vault shrinks log with post-apply equivalence (event counts, serving probes); nightly report-only scheduled via runbook → live script | CLI + schedule merged-pending (PR #361); apply scheduled idle window |
-| F2 | JSONL hot-tail retirement | Report-only enumeration with per-day seal proofs; destructive apply behind flag + soak (~Aug 21); one-command flip documented | Report-only landed (PR perf/f2-hot-tail-report, 2026-08-16); real-vault run: 185 shards, 178 eligible, ~244MB retirable, 0 segment alarms; APPLY still pending soak (~Aug 21) |
+| F2 | JSONL hot-tail retirement | Report-only enumeration with per-day seal proofs; destructive apply behind flag + soak (~Aug 21); one-command flip documented | DONE — apply shipped (feat/f2-retire-apply, 2026-08-21): move-not-delete `retire-hot-tail --apply` + `event-store-vacuum`, same safety bar as compact-engagement (arm env + recall process-lock + per-shard fail-closed re-validation + crash-safe atomic rename + bounded receipt log); soak window executed by the coordinator |
 | F3 | No full-log walks on hot paths | Survey complete (see below); foreground-nav overlay migrated to typed reads with equivalence test; phase-log shows no full-log walk during a normal drain + nav burst | Overlay migration done; remaining hot readMerged callers (health/§15/ingestor/retrain-worker) migrated + equivalence-tested (PR TBD, 2026-08-16); default-ON flip evaluated and NOT shipped (test-fixture blocker, see landing note) |
 | F4 | Blob diet | Accumulator blob + append-index snapshot off pretty JSON (CBOR/compact or incremental); snapshot load <1s (baseline 2.5s); measured before/after | Pending (after F1–F3) |
 | F5 | Small-file stores → SQLite | page-content (703 files) + page-evidence (3,741 files) each one SQLite; one transaction per capture; #356/#357 manifest upserts deleted as obsolete; migration + rollback documented | Pending |
@@ -964,6 +964,129 @@ none qualified in this task's `deps`/`target`/`hlc` audit).
 4. Kick a fresh acceptance-sampler window; record numbers here.
 
 ## Landing notes (current state, dated)
+
+**2026-08-21 — F2 apply: hot-tail retirement (move-not-delete) + event-store
+vacuum, CLOSES F2 (feat/f2-retire-apply).** The soak window named in the F2
+row ("real-vault run: 185 shards, 178 eligible... APPLY still pending soak
+(~Aug 21)") is now open (user-consented); this PR implements `--apply` to
+the same safety bar as `compact-engagement --apply`, without touching
+`connectionsMaterializer.ts`.
+
+**Apply semantics (binding: no data loss).** Retirement is a MOVE, never a
+delete: each eligible day's `_BAC/log/<replica>/<day>.jsonl` shard is
+`rename()`'d to the sibling mirror `_BAC/retired/log/<replica>/<day>.jsonl`
+— same filesystem, atomic, one syscall per shard. History for a retired day
+stays served by the two sources already required `sealed-verified` before a
+day is ever eligible: the typed event-store mirror (F3's hot read source)
+and the sealed Parquet segment (`eventSeal.ts`). New exports on
+`analytics/hotTailRetirement.ts`: `hotTailRetireArmed` (env arm switch),
+`applyHotTailRetirement` (the apply loop), `retiredEventLogRoot` /
+`retiredShardPath`, and `listCanonicalEventShards`.
+
+**Reader-regression audit (the task's explicit ask — "verify what still
+reads the hot JSONL for retired days").** Grepped every `_BAC/log` walker in
+the package:
+- `sync/eventLog.ts`'s `readMerged`/`readReplica`/`listReplicaIds` already
+  tolerate an absent day file (ENOENT → `[]` / skip) — no code change
+  needed, only a new test proving it (`hotTailRetirement.test.ts`, "readers
+  still serve the full history after retirement"). `_BAC/retired` is a
+  SIBLING of `_BAC/log`, not a subdirectory, so every `_BAC/log`-rooted
+  walker excludes it BY CONSTRUCTION, not by an added filter.
+- **Two live regressions found and fixed.** `gc/storageRetirement.ts`'s
+  event-store-mirror retirement proof and `gc/ingressRetention.ts`'s
+  ingress-spool-day proof each hand-rolled their own `_BAC/log`-only shard
+  walk to reconstruct "the complete canonical event set" — both wired into
+  the live `gc --storage-retirement` CLI command. Without a fix, the first
+  F2-retired day would make both proofs see fewer canonical events than
+  exist and (fail-closed, but WRONGLY) refuse candidates they used to
+  verify — no data-loss risk, but a real regression of an already-shipped
+  feature. Fixed by extracting `listCanonicalEventShards` (walks BOTH
+  `_BAC/log` and `_BAC/retired/log`) into `hotTailRetirement.ts` and having
+  both modules call it instead of duplicating the old helper. Regression
+  tests added to both files' existing suites (move a canonical shard to the
+  retired mirror out-of-band, confirm the proof still verifies).
+- **One documented-but-dormant risk, not fixed.** `rebuildFromJsonl(logRoot)`
+  / `catchUpFromJsonl(logRoot)` exist on 7 typed stores (event store,
+  engagement-facts, timeline-facts, search-query-index, capture-text-fts,
+  thread-register, workstream-parent) and each only walks the single
+  `logRoot` it's handed. `grep -rn '\.rebuildFromJsonl\('` across the
+  package (excluding tests) found ZERO production call sites — so no LIVE
+  regression today — but `sync/lineage.ts` documents each as its store's
+  cold-repair entrypoint. Flagged in both `hotTailRetirement.ts`'s header
+  comment and `lineage.ts`'s `event-log` node: any future wiring (or an
+  operator invoking one by hand) must catch up from BOTH roots, retired
+  root FIRST (these stores gate re-ingestion below their own per-replica
+  watermark as "out of order", so ingesting the newer hot root first would
+  cause the older retired root's rows to be silently skipped).
+
+**Safety rails (mirrors `compact-engagement --apply`).** Two independent
+confirmations before anything moves: (1) `SIDETRACK_HOT_TAIL_RETIRE=1` —
+`hotTailRetireArmed()`, the module's own arm switch, not a CLI-only gate;
+(2) the vault's recall process-lock (`acquireRecallProcessLock`), refused
+outright if a live companion owns it — same reasoning as compact-engagement
+(a second process moving shard files while a live companion holds warm
+append indexes / a merged-log memo over the same files would desync those
+caches from disk). `applyHotTailRetirement` re-runs
+`buildHotTailRetirementReport` FRESH at the top of every apply — never
+trusts a caller-supplied report — and is fail-closed PER SHARD: one
+tampered seal / drifted store / uncovered-events day is skipped, every
+other still-eligible day in the same run still retires. Crash-safety:
+each shard's move is one `rename()`, so a crash mid-run leaves some shards
+retired and some not — both are valid states, and re-running recognises an
+already-moved shard (source absent, destination present) as a no-op
+success rather than an error. A found-during-implementation edge case, not
+in the original brief: a late peer arrival can re-open a hot shard for an
+already-retired day (`eventSeal.ts`'s own "late arrivals... re-sealed" note
+documents this at the store level); if BOTH the hot and retired paths exist
+for a day, apply refuses to `rename()` (which would silently overwrite the
+retired file) and skips with reason `retired-destination-exists`, leaving
+both files exactly as found — a deliberate reconcile pass, not a blind
+move, was judged the only safe response, and is covered by its own test.
+Receipts append to `_BAC/system/retirement-receipts.jsonl` (schema:
+replica/day/before-after bytes+sha256/eventsSealed/eventsLive/movedAt),
+bounded to the newest 20,000 lines via the same append-then-truncate-tail
+idiom as `attribution-v1/shadow.ts`'s on-disk shadow log.
+
+**Vacuum subcommand.** `event-store-vacuum --vault <path>` (new
+`gc/eventStoreVacuum.ts`): opens `_BAC/connections/event-store.db`
+read-write, runs `VACUUM`, reports bytes before/after. Same arm+lock
+discipline (`SIDETRACK_EVENT_STORE_VACUUM=1` + recall process-lock refusal).
+Separate from `connections/snapshot.ts`'s own VACUUM path, which is for the
+CONNECTIONS GRAPH generation only and is a documented no-op under in-place
+publish (see "Storage-tier incremental publish" design note above) — the
+event-store mirror never had a dedicated maintenance entrypoint before this.
+A clean no-op (not an error) when the file doesn't exist.
+
+**Tests (all new, all green).** `hotTailRetirement.test.ts`: 7 apply cases —
+moves eligible shards byte-identically + leaves a never-sealed day
+untouched + excluded from next report's discovery; readers (readMerged +
+typed store + sealed Parquet) still serve full history after retirement;
+second run is a clean no-op; drift-fail-closed (tampered seal skips only
+that shard); crash-resume (pre-moved shard recognised, remaining shard
+completes); never-clobber guard (both paths existing → skip, both files
+intact). `gc/eventStoreVacuum.test.ts`: arm-switch default-off, clean no-op
+on an absent file, freelist reclaimed on a bloated fixture with a surviving
+canary row proving no data loss. `gc/storageRetirement.test.ts` +
+`gc/ingressRetention.test.ts`: one regression test each proving their
+canonical-readback proofs still verify once a day has been F2-retired.
+`cli.test.ts`: arm-refusal, lock-refusal (mirrors the existing
+`compact-engagement`/`connections-rebuild` lock tests), happy-path +
+idempotent re-run for both `retire-hot-tail --apply` and
+`event-store-vacuum`. `npm run build` clean.
+
+**Deviations from the brief.** (1) The retired-destination-exists guard
+above — not specified in the original task, discovered while designing
+crash-safety around `eventSeal.ts`'s documented late-arrival re-seal
+behavior; judged necessary to hold the "never overwrite" invariant. (2) The
+`rebuildFromJsonl` dormant-risk item above is flagged/documented rather than
+fixed across 7 modules with zero production call sites — fixing unwired
+code speculatively was judged out of proportion; it is now visible in two
+places (`hotTailRetirement.ts` header, `lineage.ts`'s `event-log` node) for
+whoever wires one next.
+
+PR: feat(store): F2 apply — hot-tail retirement (move-not-delete) +
+event-store vacuum (branch `feat/f2-retire-apply`). Not merged — coordinator
+review pending per this task's "one PR; do not merge" instruction.
 
 **2026-08-21 — F9 idle I/O floor: drain gating + child self-rusage
 (perf/idle-drain-overhead, closes F9).** Task framing named

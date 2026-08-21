@@ -1,13 +1,15 @@
-// F2 — hot-tail retirement report (report-only).
+// F2 — hot-tail retirement: eligibility report + consent-gated apply.
 // docs/design/2026-08-01-columnar-event-tier.md, "step (3)" payoff: once a
 // day's events are sealed into the columnar tier and verify-green, the
 // corresponding `_BAC/log/<replica>/<day>.jsonl` shard no longer needs to be
-// READ or REWRITTEN — it can retire from the hot tail. That retirement
-// (APPLY) is a separate, consent-gated PR behind a soak period
-// (docs/plans/2026-08-15-foundation-program.md, F2 row). This module is the
-// ELIGIBILITY REPORT only: zero writes, computes per (replica, day) shard
-// whether retirement would be safe today, and — the actionable part — which
-// closed days are NOT yet covered by a verified seal (the blockers).
+// READ or REWRITTEN — it can retire from the hot tail. The top half of this
+// module is the ELIGIBILITY REPORT: zero writes, computes per (replica, day)
+// shard whether retirement would be safe today, and — the actionable part —
+// which closed days are NOT yet covered by a verified seal (the blockers).
+// The bottom half ("F2 APPLY") is the consent-gated destructive step,
+// unlocked after the soak period the report call above named
+// (docs/plans/2026-08-15-foundation-program.md, F2 row): it MOVES (never
+// deletes) each still-eligible shard to a sibling retired mirror.
 //
 // Design (F2 OLAP comparison, foundation-program.md): reuses the existing
 // DuckDB-over-Parquet facade (`eventScan.ts`'s `readSealedParquetDayStats` +
@@ -32,9 +34,11 @@
 // (cold path allowed per F3's own carve-out), never a hot serving path; this
 // report has no such need today.
 
-import { readdir, stat } from 'node:fs/promises';
-import { join } from 'node:path';
+import { appendFile, mkdir, readdir, readFile, rename, stat } from 'node:fs/promises';
+import { dirname, join } from 'node:path';
 
+import { sha256File } from '../gc/engagementCompactionManifest.js';
+import { writeFileAtomic } from '../vault/atomic.js';
 import {
   entryMatches,
   readSealedParquetDayStats,
@@ -50,6 +54,87 @@ const shardPath = (vaultRoot: string, replica: string, day: string): string =>
   join(eventLogRoot(vaultRoot), replica, `${day}.jsonl`);
 const eventStoreDbPath = (vaultRoot: string): string =>
   join(vaultRoot, '_BAC', 'connections', 'event-store.db');
+
+// F2 APPLY (this module's counterpart to the report above). Retirement
+// MOVES an eligible day's hot-tail shard to a sibling mirror tree —
+// `_BAC/retired/log/<replica>/<day>.jsonl` — NEVER deletes. History for a
+// retired day stays served by two sources already required
+// 'sealed-verified' before a day is ever eligible: the typed event-store
+// mirror (F3's hot read source) and the sealed Parquet segment
+// (eventSeal.ts). `_BAC/retired` is a SIBLING of `_BAC/log`, not a
+// subdirectory of it, so every walker that discovers shards by listing
+// `_BAC/log` (eventLog.ts's readMerged/readReplica/listReplicaIds, this
+// module's own scanHotTailShards below, compactionPlanner.ts,
+// engagementCompactionManifest.ts, connectionsMaterializer.ts — the last
+// out of bounds and untouched) excludes the retired tree BY CONSTRUCTION,
+// not by an added filter — verified by grepping every `_BAC/log` walker in
+// the package. `eventLog.ts`'s readers already tolerate an absent day file
+// (readLogFile / readReplica ENOENT -> []), so a retired day simply stops
+// appearing in readMerged() — exactly the intended F3 handoff ("the typed
+// store mirror is the hot read source, sealed Parquet covers history").
+//
+// TWO existing readers were found that DO need a fix, because their own
+// proofs reconstruct "the complete canonical event set" by walking
+// `_BAC/log` directly rather than reading the live store/manifest:
+// `gc/storageRetirement.ts`'s event-store-mirror retirement proof and
+// `gc/ingressRetention.ts`'s ingress-spool-day proof (both wired into the
+// live `gc --storage-retirement` CLI command). Without a fix, the first
+// F2-retired day would make both proofs see fewer canonical events than
+// exist and (correctly, FAIL CLOSED) refuse candidates they used to
+// verify — no data-loss risk, but a real regression of an already-shipped
+// feature. Fixed by `listCanonicalEventShards` below, which both modules
+// now call instead of each hand-rolling a `_BAC/log`-only shard walk.
+//
+// A THIRD reader family — `rebuildFromJsonl(logRoot)` / `catchUpFromJsonl
+// (logRoot)` on 7 typed stores (event store, engagement-facts,
+// timeline-facts, search-query-index, capture-text-fts, thread-register,
+// workstream-parent) — also only walks the single `logRoot` it is handed.
+// `grep -rn '\.rebuildFromJsonl\('` across the package (excluding tests)
+// found ZERO production call sites today, so there is no LIVE regression.
+// But `sync/lineage.ts` documents `rebuildFromJsonl` as each store's
+// cold-repair entrypoint; a future wiring (or an operator invoking one by
+// hand) that reads only `_BAC/log` would silently miss any already-
+// retired day. Flagged here and in `sync/lineage.ts`'s `event-log` node
+// rather than fixed speculatively across 7 unwired modules: if any of
+// these gets a real call site, it must catch up from BOTH roots, RETIRED
+// FIRST (these stores gate re-ingestion of a seq at/below their own
+// per-replica watermark as "out of order", so ingesting the newer hot root
+// first would cause the older retired root's rows to be skipped).
+
+const RETIRED_LOG_ROOT_SEGMENTS = ['_BAC', 'retired', 'log'] as const;
+
+export const retiredEventLogRoot = (vaultRoot: string): string =>
+  join(vaultRoot, ...RETIRED_LOG_ROOT_SEGMENTS);
+export const retiredShardPath = (vaultRoot: string, replica: string, day: string): string =>
+  join(retiredEventLogRoot(vaultRoot), replica, `${day}.jsonl`);
+
+/**
+ * Every canonical event-log shard path across BOTH the hot tail
+ * (`_BAC/log`) and the F2-retired mirror (`_BAC/retired/log`) — the
+ * complete on-disk canonical event set regardless of retirement state.
+ * Shared by `storageRetirement.ts` and `ingressRetention.ts` so their
+ * canonical-readback proofs stay correct once any day retires. This
+ * module's OWN report/apply logic deliberately does not use this — it
+ * needs to distinguish hot-vs-retired, not merge them.
+ */
+export const listCanonicalEventShards = async (vaultRoot: string): Promise<readonly string[]> => {
+  const paths: string[] = [];
+  for (const root of [eventLogRoot(vaultRoot), retiredEventLogRoot(vaultRoot)]) {
+    for (const replica of await listReplicaDirs(root)) {
+      const dir = join(root, replica);
+      let names: readonly string[];
+      try {
+        names = await readdir(dir);
+      } catch {
+        continue;
+      }
+      for (const name of [...names].sort()) {
+        if (name.endsWith('.jsonl')) paths.push(join(dir, name));
+      }
+    }
+  }
+  return paths;
+};
 
 export type ShardRetirementVerdict =
   /** Manifest, parquet, and the live store day-stats all agree — the day is
@@ -430,5 +515,265 @@ export const buildHotTailRetirementReport = async (
     eventStoreMirrorPresent: storeStats.available,
     shards,
     totals,
+  };
+};
+
+// ===========================================================================
+// F2 APPLY
+// ===========================================================================
+
+/**
+ * Is the destructive apply armed? Defaults OFF, same posture as
+ * `compactionPlanner.ts`'s `engagementCompactArmed` — moving hot-tail
+ * shards out of `_BAC/log` must be opted into explicitly, in addition to
+ * `--apply` itself and the CLI's own recall process-lock check.
+ */
+export const hotTailRetireArmed = (): boolean => {
+  const raw = process.env['SIDETRACK_HOT_TAIL_RETIRE'];
+  return raw === '1' || raw === 'true';
+};
+
+const RETIREMENT_RECEIPTS_RELATIVE_PATH = ['_BAC', 'system', 'retirement-receipts.jsonl'] as const;
+/** Bounded, same idiom as `attribution-v1/shadow.ts`'s on-disk shadow log:
+ *  append, then rewrite-truncate the tail once the cap is crossed. */
+export const RETIREMENT_RECEIPTS_MAX_LINES = 20_000;
+
+export const retirementReceiptsPath = (vaultRoot: string): string =>
+  join(vaultRoot, ...RETIREMENT_RECEIPTS_RELATIVE_PATH);
+
+export interface HotTailRetirementReceipt {
+  readonly schemaVersion: 1;
+  readonly replica: string;
+  readonly day: string;
+  readonly beforeBytes: number;
+  readonly beforeSha256: string;
+  /** Equal to beforeBytes/beforeSha256 by construction: a same-filesystem
+   *  `rename()` cannot change file content, only its directory entry, so
+   *  re-hashing the destination would be pure overhead — recorded anyway
+   *  for a receipt schema that reads naturally as "before/after". */
+  readonly afterBytes: number;
+  readonly afterSha256: string;
+  readonly eventsSealed: number;
+  readonly eventsLive: number | null;
+  readonly movedAt: string;
+}
+
+export type HotTailRetirementSkipReason =
+  /** Verdict was not `sealed-verified` in THIS run's fresh report — the
+   *  per-shard fail-closed gate. */
+  | 'not-eligible'
+  /** Eligible, but there is nothing on disk to move (already-empty shard
+   *  accounting, or the file vanished between the report and the move). */
+  | 'source-absent'
+  /** Both the hot shard AND its retired destination exist — a late peer
+   *  arrival re-opened this day's hot shard after an earlier retirement
+   *  (see eventSeal.ts's "late arrivals... re-sealed" note). A rename
+   *  would silently OVERWRITE the previously-retired bulk file, which
+   *  this feature must never do. Left exactly as found; needs a
+   *  deliberate reconcile pass, not a blind move. */
+  | 'retired-destination-exists'
+  /** The move itself failed (I/O error, cross-device rename, a post-move
+   *  size mismatch) — the source is left untouched (rename either fully
+   *  succeeds or doesn't happen at all). */
+  | 'move-failed';
+
+export interface HotTailRetirementShardOutcome {
+  readonly replica: string;
+  readonly day: string;
+  readonly verdict: ShardRetirementVerdict;
+  readonly outcome: 'moved' | 'already-retired' | 'skipped';
+  readonly reason?: HotTailRetirementSkipReason;
+  readonly bytes: number;
+}
+
+export interface HotTailRetirementApplyResult {
+  readonly vaultRoot: string;
+  readonly startedAt: string;
+  readonly finishedAt: string;
+  /** Newly moved THIS run. */
+  readonly shardsRetired: number;
+  /** Already retired by an earlier (possibly crashed) run — idempotent
+   *  no-op successes, counted separately from `shardsRetired` so a
+   *  second run visibly reports "nothing new happened" rather than
+   *  reclaiming credit for work a prior run already did. */
+  readonly shardsAlreadyRetired: number;
+  readonly shardsSkipped: number;
+  readonly bytesMoved: number;
+  readonly outcomes: readonly HotTailRetirementShardOutcome[];
+  readonly receiptPath: string;
+  readonly errors: readonly string[];
+}
+
+const truncateReceiptsLog = async (path: string): Promise<void> => {
+  const raw = await readFile(path, 'utf8').catch(() => '');
+  if (raw.length === 0) return;
+  const lines = raw.split('\n').filter((line) => line.length > 0);
+  if (lines.length <= RETIREMENT_RECEIPTS_MAX_LINES) return;
+  const kept = lines.slice(lines.length - RETIREMENT_RECEIPTS_MAX_LINES);
+  await writeFileAtomic(path, `${kept.join('\n')}\n`);
+};
+
+/** Append receipts and enforce the bounded tail. No-op (returns the path
+ *  without touching disk) when there is nothing to record. */
+const appendReceipts = async (
+  vaultRoot: string,
+  records: readonly HotTailRetirementReceipt[],
+): Promise<string> => {
+  const path = retirementReceiptsPath(vaultRoot);
+  if (records.length === 0) return path;
+  await mkdir(dirname(path), { recursive: true });
+  const body = `${records.map((record) => JSON.stringify(record)).join('\n')}\n`;
+  await appendFile(path, body, 'utf8');
+  await truncateReceiptsLog(path);
+  return path;
+};
+
+/**
+ * Apply hot-tail retirement: MOVE (never delete) every shard this run's
+ * OWN fresh eligibility computation confirms `sealed-verified` from
+ * `_BAC/log/<replica>/<day>.jsonl` to `_BAC/retired/log/<replica>/<day>.jsonl`.
+ *
+ * RE-VALIDATES EVERY PROOF AT APPLY TIME: builds a brand-new
+ * `buildHotTailRetirementReport` rather than trusting any report the
+ * caller already has — a seal tampered, a store drifted, or a manifest
+ * gone stale since an earlier `--report` run all show up here as a fresh
+ * verdict, and only that fresh verdict gates the move. FAIL CLOSED PER
+ * SHARD: one shard's drift skips only that shard, matching
+ * `compactionPlanner.ts`'s apply posture — a vault with one tampered seal
+ * still retires every other eligible day in the same run.
+ *
+ * CRASH-SAFE: each shard's move is one same-filesystem `rename()`, atomic
+ * by construction (a shard is either fully hot or fully retired, never
+ * torn). A crash mid-run leaves some shards retired and some not — both
+ * are valid states. Re-running this function resumes correctly: a shard
+ * already moved (source absent, destination present) is reported
+ * `already-retired` and skipped, not re-attempted or treated as an error.
+ */
+export const applyHotTailRetirement = async (
+  vaultRoot: string,
+  options: { readonly now?: () => Date } = {},
+): Promise<HotTailRetirementApplyResult> => {
+  const now = options.now ?? ((): Date => new Date());
+  const startedAt = now().toISOString();
+
+  const report = await buildHotTailRetirementReport(vaultRoot, options);
+
+  const outcomes: HotTailRetirementShardOutcome[] = [];
+  const receipts: HotTailRetirementReceipt[] = [];
+  const errors: string[] = [];
+  let shardsRetired = 0;
+  let shardsAlreadyRetired = 0;
+  let shardsSkipped = 0;
+  let bytesMoved = 0;
+
+  const skip = (
+    shard: HotTailShardReport,
+    reason: HotTailRetirementSkipReason,
+    message?: string,
+  ): void => {
+    shardsSkipped += 1;
+    outcomes.push({
+      replica: shard.replica,
+      day: shard.day,
+      verdict: shard.verdict,
+      outcome: 'skipped',
+      reason,
+      bytes: 0,
+    });
+    if (message !== undefined) errors.push(message);
+  };
+
+  for (const shard of report.shards) {
+    if (!shard.retirementEligible) {
+      // 'open' days (today / future-dated) are excluded entirely — noise,
+      // never a real skip, mirroring the report's own blocker filter.
+      if (shard.verdict !== 'open') skip(shard, 'not-eligible');
+      continue;
+    }
+
+    const src = shardPath(vaultRoot, shard.replica, shard.day);
+    const dest = retiredShardPath(vaultRoot, shard.replica, shard.day);
+    const [srcInfo, destInfo] = await Promise.all([
+      stat(src).catch(() => null),
+      stat(dest).catch(() => null),
+    ]);
+
+    if (srcInfo === null && destInfo !== null) {
+      // Already retired by an earlier (possibly crashed) run.
+      shardsAlreadyRetired += 1;
+      outcomes.push({
+        replica: shard.replica,
+        day: shard.day,
+        verdict: shard.verdict,
+        outcome: 'already-retired',
+        bytes: destInfo.size,
+      });
+      continue;
+    }
+
+    if (srcInfo === null && destInfo === null) {
+      skip(shard, 'source-absent');
+      continue;
+    }
+
+    if (srcInfo !== null && destInfo !== null) {
+      skip(
+        shard,
+        'retired-destination-exists',
+        `${shard.replica}/${shard.day}: retired destination already exists — refusing to overwrite, needs a manual reconcile pass`,
+      );
+      continue;
+    }
+
+    // Normal case: src exists, dest does not. Move it.
+    const info = srcInfo as NonNullable<typeof srcInfo>;
+    try {
+      const beforeSha256 = await sha256File(src);
+      await mkdir(dirname(dest), { recursive: true });
+      await rename(src, dest);
+      const after = await stat(dest);
+      if (after.size !== info.size) {
+        throw new Error(`post-rename size mismatch: before=${String(info.size)} after=${String(after.size)}`);
+      }
+      bytesMoved += info.size;
+      shardsRetired += 1;
+      receipts.push({
+        schemaVersion: 1,
+        replica: shard.replica,
+        day: shard.day,
+        beforeBytes: info.size,
+        beforeSha256,
+        afterBytes: after.size,
+        afterSha256: beforeSha256,
+        eventsSealed: shard.eventsSealed,
+        eventsLive: shard.eventsLive,
+        movedAt: now().toISOString(),
+      });
+      outcomes.push({
+        replica: shard.replica,
+        day: shard.day,
+        verdict: shard.verdict,
+        outcome: 'moved',
+        bytes: info.size,
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      skip(shard, 'move-failed', `${shard.replica}/${shard.day}: ${message}`);
+    }
+  }
+
+  const receiptPath = await appendReceipts(vaultRoot, receipts);
+
+  return {
+    vaultRoot,
+    startedAt,
+    finishedAt: now().toISOString(),
+    shardsRetired,
+    shardsAlreadyRetired,
+    shardsSkipped,
+    bytesMoved,
+    outcomes,
+    receiptPath,
+    errors,
   };
 };

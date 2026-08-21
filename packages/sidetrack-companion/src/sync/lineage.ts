@@ -76,7 +76,18 @@ export const LINEAGE_REGISTRY: readonly LineageNode[] = [
   {
     id: CANONICAL_EVENT_LOG,
     label: 'Canonical event log (JSONL)',
-    path: '_BAC/log/<replicaId>/<date>.jsonl',
+    // F2 (2026-08-21): a sealed+verified day may be RETIRED (moved, never
+    // deleted — analytics/hotTailRetirement.ts's applyHotTailRetirement)
+    // to the sibling mirror `_BAC/retired/log/<replicaId>/<date>.jsonl`.
+    // Every store below whose rebuildEntrypoint reads `_BAC/log` directly
+    // (rebuildFromJsonl/catchUpFromJsonl(logRoot)) has NO production call
+    // site today (verified by grep, 2026-08-21) so this is a documentation
+    // fix, not a live regression — but any FUTURE wiring, or an operator
+    // invoking one by hand, must pass BOTH roots (retired root FIRST) to
+    // see the complete canonical set. gc/storageRetirement.ts and
+    // gc/ingressRetention.ts already do this via
+    // analytics/hotTailRetirement.ts:listCanonicalEventShards.
+    path: '_BAC/log/<replicaId>/<date>.jsonl (or _BAC/retired/log/<replicaId>/<date>.jsonl once F2-retired)',
     derivesFrom: [],
     sourceEventTypes: [],
     rebuildEntrypoint: 'sync/eventLog.ts:createEventLog',
