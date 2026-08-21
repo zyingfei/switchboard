@@ -627,6 +627,110 @@ decisions; the registry keeps deciding both guards. Registry-replacement is
 a follow-up PR gated on shadow-agreement evidence from the real vault (see
 PR body for the actual numbers).
 
+### Follow-up: opener-independent hub signals — task #22 (2026-08-21)
+
+Closes the "Second limitation" above, using the SAME evidence-first
+discipline: measured before writing a line of new logic
+(`scripts/measure-learned-aggregator-stats.ts`, extended to a per-domain
+breakdown + a keyword-index/keyword-concepts join for entropy), THEN
+implemented, THEN re-measured on the same vault snapshot. See the PR body
+for the full before/after table and the disagreement-sample classification;
+summary below.
+
+**Root cause, confirmed by measurement (not assumption).** The blind-spot
+domains (github.com, reddit.com, chatgpt.com, claude.ai) had
+`hubCandidateCount: 0, maxQualifyingOutlinkFanout: 0` on the real vault —
+not "low", literally zero qualifying same-domain opener evidence, no matter
+how many times the domain was visited. Confirms the prior note's hypothesis
+exactly.
+
+**Three new signals, all opener-independent, all structural** (no domain
+list — see `learnedAggregatorStats.ts`'s own header for the exact gates and
+thresholds):
+- **(a) URL-population shape** — `deepSingleVisitUrlCount` (distinct
+  `DEEP_PATH_MIN_SEGMENTS`-or-deeper paths seen exactly once) +
+  `shallowHighRevisitUrlCount` (distinct `SHALLOW_PATH_MAX_SEGMENTS`-or-shallower
+  paths revisited). Both required — this is what tells a hub-shaped
+  population apart from a single-source blog with deep dated permalinks
+  (many single-visit deep URLs, but nothing shallow ever gets revisited).
+  The dominant fix for github.com/reddit.com/claude.ai's is-aggregator
+  recognition.
+- **(b) Keyword-concept entropy** — PR #385's counter, previously
+  diagnostic-only, now consulted as a VETO (can turn a structurally
+  hub-shaped domain into `not-aggregator` given low entropy + enough
+  samples; can never manufacture a hub call on its own — see
+  `MIN_KEYWORD_CONCEPT_SAMPLES_FOR_VETO`). Measured coverage on the real
+  vault is thin (65 pages tagged; 5 on github.com, 0 on
+  reddit.com/chatgpt.com/claude.ai) — this signal did NOT move the
+  blind-spot domains' numbers directly, but is wired in correctly for when
+  keyword coverage grows, and is unit-tested on synthetic fixtures either
+  way.
+- **(c) Shallow-path title churn** — the existing per-URL churn signal,
+  aggregated across a domain's shallow paths specifically. Closed
+  chatgpt.com's is-aggregator recognition (chatgpt.com already had
+  `hub: true` from the original fan-out signal in some vault snapshots, but
+  this signal is what qualifies domains — x.com in this vault's case —
+  that have neither fan-out nor population-shape evidence).
+
+**Opener-independent per-URL item inference, added alongside the domain gate.**
+Once a domain is hub-qualified by ANY gate (fan-out OR population-shape OR
+shallow-churn), a URL with a DEEP path and low self-fan-out is presumptively
+an `item` even with zero opener/inbound evidence — the same reasoning signal
+(a) uses at the domain level, applied per-URL. This is what actually
+resolves individual github/reddit/chatgpt/claude.ai items that arrived via
+external link or bookmark.
+
+**Measured result (per-domain, registry-covered, real vault, 2026-08-21).**
+Collapsed is-aggregator (feed|item vs. not-aggregator) agreement on
+registry-covered domains: **73.3% → 98.7%**. `registryOnlyAggregatorCount`
+(registry protects, learned doesn't — the dangerous under-protection
+direction): **628 → 30** (95% reduction); the residual 30 are domains below
+`MIN_DOMAIN_URLS_FOR_HUB` (medium.com: 3 URLs; gitlab.com/stackexchange.com/
+stackoverflow.com: 1 URL each) or below the population/churn bars
+(substack.com, t.co) — correctly conservative, and still fully protected via
+the registry-fallback OR-combine (see below), never a regression.
+
+**Disagreement-sample classification (the task's explicit bar: learned-wrong
+≈ 0, not blind 100% agreement).** Sampled and attributed every remaining
+`item→feed` disagreement on the four named blind-spot domains
+(github.com 71, reddit.com 29, chatgpt.com 208, claude.ai 4): 96-100% of
+each domain's disagreements trace to ONE cause — the PRE-EXISTING per-URL
+title-churn-as-feed heuristic (not a new signal from this PR) misfiring on
+platforms that inject volatile metadata into a page's `<title>` across
+captures (reddit vote/comment counts, GitHub notification-count title
+prefixes, ChatGPT/Claude.ai auto-renaming a new conversation after its first
+exchange). This IS a genuine "learned-wrong" pattern, but it fails in the
+SAFE direction the module's own binding cold-start rule explicitly allows
+("wrong by over-suppressing... never wrong by under-suppressing") — it
+quarantines a real item like a feed page, costing it some content-similarity
+signal, never resurrecting the 2026-07-10 false-friend. A handful of other
+disagreements (google.com's `/search` pages, ycombinator.com's `/item?id=`
+pages, youtube.com's `/watch?v=` pages — all query-string-identity URLs, not
+introduced or worsened by this PR) share a known, documented limitation:
+`DEEP_PATH_MIN_SEGMENTS` is a PATH-segment count and is blind to
+query-string identity. Left as a follow-up, not fixed here (fixing it
+generically without a per-domain query-param allowlist is a harder problem
+than this PR's scope).
+
+**Serving flip — SCOPED, not a full replacement.** Per the measurement:
+the IS-AGGREGATOR (hub) boolean is now consulted at serving time
+(`ranker/candidates.ts`, `tabsession/similarity.ts`), OR-COMBINED with the
+registry behind `SIDETRACK_LEARNED_AGGREGATOR_SERVE` (default ON, `=0` kill
+switch reverts to byte-identical pre-task-#22 behavior). OR-combine means
+this is STRICTLY ADDITIVE — quarantine protection can only be GAINED
+(closing the blind spot: 677 hostnames on the live vault the registry has no
+profile for at all), never lost (the registry's own 'feed'/'item' call
+alone still fully quarantines, unconditionally). The FEED-VS-ITEM
+sub-classification — which only matters when the separately-gated,
+default-OFF `SIDETRACK_AGGREGATOR_ITEM_SIGNALS` narrowing is on — stays
+REGISTRY-ONLY: the title-churn false-negative above means it is not yet
+replacement-grade, and flipping it would have zero effect on default-flag
+serving anyway (both call sites treat feed and item identically until that
+separate flag is turned on). `aggregatorProfiles.ts` is NOT deleted or
+deprecated — it is the fallback for every OR-combine and the sole decider
+for feed-vs-item; a follow-up soak-and-measure PR is the earliest point to
+revisit that.
+
 ## Columnar scan routing — design note (2026-08-18)
 
 Binding user rule: design before code. Task #35, follow-up to
@@ -1159,6 +1263,34 @@ extra read cost. Re-verified: the exact failing ordering
 (`companion.test.ts` then `contentLane.test.ts`) now passes (30 pass / 0
 fail, was 29 pass / 1 fail); full `bun test` and `bun run build` re-run
 clean.
+
+**2026-08-21 — task #22: opener-independent hub signals, learned aggregator
+to replacement grade on the IS-AGGREGATOR boundary
+(feat/aggregator-shadow-close).** Closes PR #373's named blind spot: three
+new opener-independent signals in `learnedAggregatorStats.ts` (URL-population
+shape, keyword-concept-entropy veto, shallow-path title churn — see the
+design note above for the exact gates) plus an opener-independent per-URL
+item inference. Measured before AND after on the same real-vault snapshot
+(`scripts/measure-learned-aggregator-stats.ts`, extended with a per-domain
+breakdown + keyword-index/keyword-concepts join): collapsed is-aggregator
+agreement on registry-covered domains **73.3% → 98.7%**;
+`registryOnlyAggregatorCount` (the dangerous under-protection direction)
+**628 → 30**. Sampled every remaining disagreement on the four named
+blind-spot domains (github/reddit/chatgpt/claude.ai, 312 total
+`item→feed` disagreements) and attributed 96-100% of each domain's count to
+ONE pre-existing (not introduced by this PR) cause: the per-URL
+title-churn-as-feed heuristic misfiring on platforms with volatile
+in-`<title>` metadata — a safe-direction ("wrong by over-suppressing")
+failure per the module's own binding cold-start rule, never a false-friend.
+Serving flip is SCOPED: the is-aggregator boolean is now consulted at
+serving time (`candidates.ts`, `tabsession/similarity.ts`), OR-combined with
+the registry (`SIDETRACK_LEARNED_AGGREGATOR_SERVE`, default ON, `=0` kill
+switch is byte-identical to before) — additive-only by construction, so it
+cannot regress the registry's existing protection. The feed-vs-item
+sub-classification stays registry-only (not yet replacement-grade, and
+inert under today's default `SIDETRACK_AGGREGATOR_ITEM_SIGNALS=off` anyway).
+`aggregatorProfiles.ts` is NOT deleted — it is the OR-combine fallback and
+the sole feed/item decider. See PR body for the full per-domain table.
 
 **2026-08-21 — F2 apply: hot-tail retirement (move-not-delete) + event-store
 vacuum, CLOSES F2 (feat/f2-retire-apply).** The soak window named in the F2
@@ -3509,3 +3641,205 @@ test, pre-existing, passes clean in isolation — not touched by this PR).
 
 PR: test(resolver): acceptance harness + 64-bit ec digest + candidate-window
 truncation mark (branch `test/resolver-acceptance-harness`).
+
+**2026-08-21 — HNSW write delta-gate + rowid-driven replaceScopeRows (perf/hnsw-gate-rowid-scopes).**
+Not an F1–F7 item; ships the two concrete follow-ups the 2026-08-21 F9
+landing note above filed and explicitly did NOT implement: the 89.43MB
+HNSW wholesale rewrite (protected-file-adjacent, fix layer 3) and the
+`replaceScopeRows` `deleteScopeEdges`/`deleteOrphanEdges` allow-listed
+scans (also fix layer 3, "verified 54x faster... NOT applied in this
+PR"). Per that note's own instruction, this PR re-derives both rather
+than blindly reapplying the cited numbers — and the re-derivation
+overturned parts of the cited mechanism, reported honestly below per
+"evidence before conclusions."
+
+**Win 1 — HNSW write delta-gate.** The write is `visitSimilarityHnsw.ts`'s
+`persist()` (`packages/sidetrack-companion/src/connections/
+visitSimilarityHnsw.ts`) — the lowest-level call is
+`await loaded.index.writeIndex(indexTmpPath)` (line ~528, hnswlib-node's
+native binding), reached from `connectionsMaterializer.ts`'s
+`buildHnswVisitSimilarity` → `loadedHnswStore.persist()` (materializer
+untouched, per the task's constraint — `persist()`'s existing public
+signature takes no arguments and stays that way). `persist()` already had
+a coarse boolean `dirty` skip (added 2026-08-15, `7993eefd`) — but
+`insertOrUpdate`/`delete` set `dirty = true` unconditionally on every
+call, including a redundant re-insert of an ALREADY-published, byte-
+identical embedding (the materializer's `carryForwardSimilarity`-style
+re-insertion of every carried-forward visit on graph-touching drains —
+exactly the F9 note's measured case: one new visit forced the FULL
+89.43MB corpus to rewrite, not just that one vector). Fix: a content
+signature — SHA-256 over `schemaVersion` + `dimension` + vector identity
++ sorted `(visitId, label, embedding-bytes)` tuples, computed from
+`LoadedState`'s own in-memory maps and `index.getPoint()` reads (no
+external input needed, so no materializer change required) — compared
+against a signature persisted in a new sidecar-adjacent file,
+`visit-similarity-hnsw.sig` (unversioned, always describing whatever
+`.current` currently names). On a match, `persist()` skips
+`writeIndex()`/sidecar/pointer entirely and logs
+`[hnsw.write] skipped signature=… count=… bytes=…` (bytes = the on-disk
+size of the artifact NOT rewritten); on a mismatch it does the existing
+full write, THEN — strictly AFTER the artifact is fully published, never
+before — writes the new `.sig` via the same tmp+rename atomic pattern
+already used for `.bin`/`.json`/`.current`, and logs
+`[hnsw.write] written signature=… count=… bytes=…`. Crash safety: a
+missing or garbage-content `.sig` (any read failure, or content failing a
+64-hex-char sha256 shape check) is treated identically to "no match" —
+the next `persist()` call redoes the full write, which is safe (one
+wasted rewrite, never a silently-stale skip) and self-heals the `.sig`
+file. Deliberate deviation from the task's literal "count + xxhash/fnv
+over sorted edge ids" suggestion: the signature also hashes each
+embedding's bytes (via `Float64Array`-reinterpreted bit patterns), not
+just the id/label set — an id/label set unchanged since the last publish
+does not prove the underlying VECTOR values are unchanged (a genuine
+re-embed of an already-known visit, same id, same label, different
+value, is a real content change an id-only signature would silently
+drop); the extra `getPoint()` reads are in-memory native-binding calls
+over already-loaded vectors, vastly cheaper than the 89MB write they
+gate. Uses `node:crypto`'s `createHash('sha256')`, matching the
+established "diff-aware putCurrent" precedent (PR #391,
+`contentSignatureForSnapshot` in `connections/snapshot.ts`) rather than
+xxhash/fnv, for consistency with the codebase's own existing signature-
+gated-skip idiom.
+
+*Verification, `visitSimilarityHnsw.test.ts`.* New `describe('persist()
+delta-gate ...)` block (7 tests, all passing alongside the 8 pre-existing
+tests in the file, 15/15): skip when a redundant mutation reproduces
+already-published content (no new version file, pointer unchanged);
+write + correct served content when an existing embedding's VALUE
+actually changes (same id/label, proves the embedding-bytes-in-signature
+design decision is load-bearing, not decorative); write when a visit is
+added or deleted even if all other visits are unchanged; two crash-safety
+tests (missing `.sig`, corrupt `.sig` — both force a rewrite despite
+logically-unchanged content); one measured test (500-vector corpus, 32
+dims, 10 consecutive redundant carry-forward drains): **10/10 skipped, 0
+rewrites**, each avoiding a 138,204-byte rewrite it would otherwise have
+paid. Live corroboration: the existing real-forked-child integration
+suite (`connectionsHnswReconcileIntegration.test.ts`, 13/13 pass
+unmodified, including the D4 "reuses the persisted similarity revision on
+a re-drain over an unchanged corpus" case) now visibly logs
+`[reconcile.child] [hnsw.write] written …` / (on unchanged re-drains)
+would log `skipped` through the real child process — the gate is wired
+into the actual drain path, not just unit-tested in isolation.
+
+**Win 2 — `replaceScopeRows` rowid-driven rewrite.** Target statements:
+`deleteScopeEdges` (allow-listed `SCAN connections_scope_edges`) and
+`deleteOrphanEdges` (allow-listed `SCAN edges`) in `connections/
+snapshot.ts`'s `#replaceScopeRows`. **Re-derivation finding, reported
+honestly per "evidence before conclusions" / "retract premises when data
+disagrees":** the F9 note's literal cited shape — `DELETE FROM t WHERE
+rowid IN (SELECT c.rowid FROM small_temp s JOIN t c ON …)` — does NOT
+reliably avoid the scan on this repo's bun:sqlite/SQLite version: an
+ordinary `JOIN` is reorderable, and at this statement's real selectivity
+the planner chose to drive the join from the BIG table anyway (`SCAN c`
+in `EXPLAIN QUERY PLAN`, with a Bloom-filter pre-check replacing the
+correlated subquery) — measured NO reliable speedup building and timing
+this shape directly (sometimes a small regression). Two alternatives were
+spiked and compared: forcing join order with `CROSS JOIN` (SQLite
+disables reordering for a join spelled `CROSS JOIN`), and restating the
+predicate as a row-value `(col1, col2) IN (subquery)` membership test
+with no JOIN at all. The row-value `IN` form won on both simplicity and
+measured speed and is what shipped:
+`deleteScopeEdges` → `DELETE FROM connections_scope_edges WHERE
+(scope_kind, scope_id) IN (SELECT scope_kind, scope_id FROM
+temp_replace_scopes)`; `deleteOrphanEdges` → `DELETE FROM edges WHERE
+(src, dst) IN (SELECT edge_src, edge_dst FROM temp_replace_edges) AND
+NOT EXISTS (SELECT 1 FROM connections_scope_edges c WHERE c.edge_src =
+edges.src AND c.edge_dst = edges.dst)`. Both now resolve via `SEARCH
+<table> USING (COVERING) INDEX … (col=?…)` — no `SCAN` of either
+statement's own target table or the joined table, `EXPLAIN QUERY PLAN`-
+verified.
+
+**A second, sharper finding from the same re-derivation:** naively
+extending the row-value idiom to `deleteOrphanEdges`'s orphan check
+(`(src, dst) NOT IN (SELECT edge_src, edge_dst FROM
+connections_scope_edges)`) is not just unhelpful but **catastrophic** —
+measured **~102x-340x SLOWER** (9+ seconds vs tens of ms on a 110k-row
+fixture) than the original `EXISTS`-correlated shape, almost certainly
+SQL's three-valued NULL-comparison semantics forcing SQLite into a much
+more conservative plan for a row-value `NOT IN` against a large, non-
+uniquely-keyed subquery. `deleteOrphanEdges` therefore keeps `NOT EXISTS`
+for that half — still index-driven via the existing
+`idx_scope_edges_edge(edge_src, edge_dst)` index — and only replaces the
+OTHER (membership-in-the-touched-set) half with row-value `IN`. This trap
+is committed as a permanent regression guard (see tests below) so nobody
+"simplifies" the `NOT EXISTS` into `NOT IN` later without re-discovering
+this the hard way.
+
+*Measured (`snapshot.replaceScopeRowsRowid.perf.test.ts`, realistic-
+selectivity fixture: 110,000 edges, 50,000 total distinct scopes
+accumulated, only 4,742 replaced this one drain — matching the live
+phase-log line the F9 investigation cited, "scopes=4742" touched out of a
+much larger accumulated total; an earlier, ABANDONED fixture that
+replaced 100% of the scope population showed NO speedup at all, since
+both the old scan and the new search must visit every row when literally
+every row matches — not a real scoped-timeline-delta's shape).*
+`deleteScopeEdges`: real runs measured 2.6x–2.8x faster; `deleteOrphanEdges`:
+1.3x–1.7x faster. Both real, reproducible, `EXPLAIN QUERY PLAN`-verified
+as SCAN→SEARCH — but **not the 54x the F9 note cited**, which was
+measured against a real, much larger (400+MB), disk-cache-pressured
+generation file; this suite's in-memory/small-file synthetic fixtures
+understate the real-vault win (the PLAN SHAPE change is the asymptotic,
+load-bearing property; the wall-clock ratio on a small fixture is a
+lower bound, not the real number). Reported honestly rather than
+re-asserting the original figure unverified.
+
+*Tests.* `snapshot.replaceScopeRowsRowid.perf.test.ts` (new): (1)
+equivalence — OLD (EXISTS-correlated, embedded verbatim from the pre-
+rewrite statement) vs NEW (shipped) SQL delete the IDENTICAL row set on
+three fixtures, including the #378-adjacent many-scope-groups-in-one-
+table shape and explicit edge cases (an edge orphaned by the delta, an
+edge kept alive by a surviving scope, an edge untouched entirely, an edge
+with two scope refs where only one is removed); (2) measured speed (above
+numbers, `expect(newMs).toBeLessThan(oldMs)` — asserts direction, not a
+pinned ratio, to avoid flaking on a shared box, exact numbers logged for
+the record); (3) a dedicated NOT-IN-trap regression guard, sized to
+reproduce a clear (~100x) ratio in under a second rather than the 9+
+seconds the full 110k-row fixture takes. `queryPlanLint.test.ts`: the two
+`HOT_STATEMENTS` entries' `sql` text updated to the shipped shape and
+`allowScanTables` REMOVED (both now covered by the generic "no SCAN of
+any LARGE_TABLES entry" check); a new `describe('queryPlanLint — proves
+the row-value IN rewrite holds ...)` block adds the task's requested
+POSITIVE pin (asserts the exact `SEARCH … USING (COVERING) INDEX … (col=?
+…)` line appears, not just "no SCAN") plus two regression tests that
+`unexpectedScans` on the OLD, pre-rewrite EXISTS-correlated SQL text
+still correctly reports `['connections_scope_edges']` / `['edges']` —
+proving the lint's protective intent survives the allow-list removal, per
+the #378-incident-scarred "prove the new shape with the plan lint, don't
+just delete the guard" rule. `snapshot.replaceScopeRows.perf.test.ts`
+(the #378 fix's own suite, unmodified) still passes — the missing-index
+fix and this rewrite are independent and compose cleanly.
+
+**Full verification.** `bun test`: 3888 pass / 8 skip / 0 fail across 420
+files (companion package; `src/connections/` — 578 pass/0 fail — and
+`connectionsHnswReconcileIntegration.test.ts` — 13/13 — rerun in
+isolation twice on a loaded machine, both clean, no flakes). `tsc
+--noEmit`: 152 pre-existing errors, unchanged, zero in any touched file
+(same baseline PR #402 recorded). `eslint` on every touched/new file: 0
+errors (a handful of pre-existing `import()`-type-annotation warnings,
+same convention already present in the sibling files this PR's new file
+copies its `captureDb` pattern from). `bun run build` clean across
+companion/extension/mcp.
+
+**Deviations from the task brief, stated plainly.** (1) The HNSW
+signature hashes embedding bytes, not just ids — see Win 1's rationale;
+this is MORE than "count + hash over sorted edge ids" asked for, for
+correctness. (2) `node:crypto` sha256 used instead of xxhash/fnv,
+matching PR #391's existing precedent rather than introducing a new
+hashing primitive. (3) The rowid-driven rewrite as literally specified
+(`rowid IN (SELECT … JOIN …)`) was tried, measured to NOT reproduce a
+real speedup, and replaced with an empirically faster/simpler row-value
+`IN` form — retracting the task's `rowid IN (JOIN)` framing per "evidence
+before conclusions," while keeping the SAME target statements, the same
+allow-list removal, and the same "prove it with the plan lint" discipline
+the task asked for. (4) The measured speedup is real but far below the
+task's cited 54x figure on the fixtures this suite can run in CI —
+reported honestly with an explanation (disk-cache-pressure effects on a
+real multi-hundred-MB file vs. an in-memory/small-file synthetic fixture)
+rather than silently re-asserting the bigger number. (5) A NEW, previously
+undocumented hazard (`NOT IN` catastrophically slow on this exact schema
+shape) was found and is now a permanent regression guard — not asked for
+explicitly, but directly load-bearing for not shipping a regression while
+chasing the requested speedup.
+
+PR: perf(store): HNSW write delta-gate + rowid-driven replaceScopeRows
+(branch `perf/hnsw-gate-rowid-scopes`).

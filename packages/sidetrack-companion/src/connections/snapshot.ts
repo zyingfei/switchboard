@@ -7434,15 +7434,35 @@ export class SqliteConnectionsStore implements ConnectionsStore {
              AND s.scope_id = connections_scope_nodes.scope_id
          )`,
       );
+      // Row-value IN rewrite (2026-08-21, F9 follow-up — re-derived from the
+      // #402 investigation's spike, docs/plans/2026-08-15-foundation-
+      // program.md's 2026-08-21 F9 landing note; RE-DERIVED, not copied
+      // verbatim — see that landing note's "Deviation" for why the actual
+      // shipped shape differs from the investigation's literal
+      // `rowid IN (SELECT ... JOIN ...)` suggestion). The old EXISTS-
+      // correlated shape (still used by deleteScopeNodes/deleteOrphanNodes
+      // above, deliberately left alone — the #378 incident's own accepted-
+      // cost statements, out of THIS change's scope) forces SQLite to
+      // iterate connections_scope_edges via a per-row CORRELATED SCALAR
+      // SUBQUERY search into the small temp table — `SCAN
+      // connections_scope_edges` in EXPLAIN QUERY PLAN. Restating the same
+      // predicate as a row-value `IN` membership test against the small
+      // driver table lets SQLite use connections_scope_edges' own
+      // (scope_kind, scope_id, ...) primary-key index as a SEARCH, with
+      // `temp_replace_scopes` probed `FOR IN-OPERATOR` — no SCAN of either
+      // table. Measured faster on a 110k-row/4,742-scope synthetic fixture
+      // matching this store's real-vault scale (see
+      // snapshot.replaceScopeRowsRowid.perf.test.ts for the exact ratio;
+      // margin varies by run/fixture, generously bounded there rather than
+      // pinned to one number). Same rows deleted either way — the perf
+      // test's own before/after row-set comparison pins this, including
+      // the #378-adjacent many-scope-groups-in-one-table shape.
       const deleteScopeEdges = budgetedStatement(
         db,
         'connections.replaceScopeRows.deleteScopeEdges',
         `DELETE FROM connections_scope_edges
-         WHERE EXISTS (
-           SELECT 1
-           FROM temp_replace_scopes s
-           WHERE s.scope_kind = connections_scope_edges.scope_kind
-             AND s.scope_id = connections_scope_edges.scope_id
+         WHERE (scope_kind, scope_id) IN (
+           SELECT scope_kind, scope_id FROM temp_replace_scopes
          )`,
       );
       const deleteOrphanNodes = budgetedStatement(
@@ -7458,15 +7478,34 @@ export class SqliteConnectionsStore implements ConnectionsStore {
       );
       // THE incident statement (see this module's / sqlBudget.ts's header):
       // fires trg_edges_index_ad once per row deleted from `edges`, which
-      // scans `edges_index` in full without idx_edges_index_src_dst.
+      // scans `edges_index` in full without idx_edges_index_src_dst -- that
+      // hazard is unrelated to (and already fixed independently of) the
+      // rowid rewrite below; idx_edges_index_src_dst still guards the
+      // trigger regardless of how deleteOrphanEdges itself locates its rows.
+      //
+      // Row-value IN rewrite (2026-08-21, F9 follow-up — see the comment on
+      // deleteScopeEdges above for the general mechanism/citation).
+      // `edges` is filtered by a row-value `IN` membership test against the
+      // small `temp_replace_edges` driver table, resolving via `edges`' own
+      // (src, dst) primary-key index instead of a full-table SCAN.
+      // DELIBERATE CHOICE, found empirically while re-deriving this rewrite
+      // (see the F9 landing note's "Deviation" section): the orphan check
+      // stays `NOT EXISTS` (a correlated subquery), NOT `NOT IN` — SQLite's
+      // three-valued NULL logic makes a row-value `NOT IN (subquery-over-a-
+      // non-uniquely-keyed-large-table)` catastrophically slow in practice
+      // (measured ~340x SLOWER than the original EXISTS-correlated shape on
+      // this exact table pair, 9+ seconds vs tens of ms — see the perf
+      // test's comment), the opposite of this change's goal. `NOT EXISTS`
+      // has no such trap and still resolves via
+      // connections_scope_edges' existing idx_scope_edges_edge(edge_src,
+      // edge_dst) index as a SEARCH. No SCAN of `edges` or
+      // `connections_scope_edges` in the resulting plan.
       const deleteOrphanEdges = budgetedStatement(
         db,
         'connections.replaceScopeRows.deleteOrphanEdges',
         `DELETE FROM edges
-         WHERE EXISTS (
-           SELECT 1
-           FROM temp_replace_edges t
-           WHERE t.edge_src = edges.src AND t.edge_dst = edges.dst
+         WHERE (src, dst) IN (
+           SELECT edge_src, edge_dst FROM temp_replace_edges
          )
            AND NOT EXISTS (
              SELECT 1

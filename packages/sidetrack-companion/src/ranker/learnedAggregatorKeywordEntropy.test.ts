@@ -1,10 +1,14 @@
 import { describe, expect, it } from 'vitest';
 
 import {
+  MIN_DEEP_SINGLE_VISIT_URLS_FOR_HUB,
+  MIN_HUB_CANDIDATE_REVISITS,
+  MIN_KEYWORD_CONCEPT_SAMPLES_FOR_VETO,
   applyAggregatorObservations,
   createEmptyAggregatorStatsState,
   isLearnedAggregatorHost,
   registrableDomainOf,
+  type AggregatorStatsState,
   type AggregatorVisitObservation,
 } from './learnedAggregatorStats.js';
 
@@ -57,13 +61,15 @@ describe('DomainAggregatorCounters.keywordConceptEntropyBits', () => {
     expect(stats?.keywordConceptEntropyBits).toBe(0);
   });
 
-  it('is SHADOW ONLY — does not change isLearnedAggregatorHost for a structurally single-source domain', () => {
+  it('a VETO needs a structural gate to veto — high entropy alone (no fan-out, no population shape) never independently qualifies a domain', () => {
     const state = createEmptyAggregatorStatsState();
     const concepts = ['concept-a', 'concept-b', 'concept-c', 'concept-d', 'concept-e', 'concept-f'];
-    // Diverse CONTENT, but no same-domain outlink fan-out at all — this
-    // domain does not structurally qualify as a hub, and adding diverse
-    // keyword-concept data must not flip that (the classifier does not
-    // consult this signal).
+    // Diverse CONTENT, but no same-domain outlink fan-out AND no
+    // population-shape evidence at all — this domain does not structurally
+    // qualify as a hub, and adding diverse keyword-concept data must not
+    // flip that (the veto can only SUBTRACT from a structural "yes", never
+    // manufacture one on its own — see MIN_KEYWORD_CONCEPT_SAMPLES_FOR_VETO's
+    // own comment).
     const observations: AggregatorVisitObservation[] = concepts.map((conceptId, i) => ({
       canonicalUrl: diverseUrl(`/post-${String(i)}`),
       observedAtMs: 1_000 + i,
@@ -86,5 +92,81 @@ describe('DomainAggregatorCounters.keywordConceptEntropyBits', () => {
     ]);
     const after = state.domainStats(registrableDomainOf(DIVERSE_DOMAIN))?.keywordConceptEntropyBits;
     expect(after).toBeGreaterThan(before ?? -1);
+  });
+});
+
+// Signal (b) — the content-coherence VETO (2026-08-21, task #22). Wires
+// keywordConceptEntropyBits into isLearnedAggregatorHost's decision for the
+// first time: low entropy (a coherent single content source) with ENOUGH
+// samples overrides a structural hub call the population-shape (a) or
+// shallow-churn (c) signals would otherwise make — the false-positive guard
+// those signals' own doc comments name (a single-author blog with many deep
+// dated permalinks, or a stable page whose title happens to have churned a
+// couple of times).
+describe('keywordConceptEntropyBits as a content-coherence VETO', () => {
+  const VETO_HUB_DOMAIN = 'veto-hub.test';
+  const vetoHubUrl = (path: string): string => `https://${VETO_HUB_DOMAIN}${path}`;
+
+  // Population-shape hub evidence (signal a) — see
+  // learnedAggregatorPopulationShape.test.ts for signal (a) in isolation;
+  // this file only cares about vetoing it.
+  const seedPopulationHub = (state: AggregatorStatsState): void => {
+    const observations: AggregatorVisitObservation[] = [];
+    for (let index = 0; index < MIN_DEEP_SINGLE_VISIT_URLS_FOR_HUB; index += 1) {
+      observations.push({ canonicalUrl: vetoHubUrl(`/posts/item-${String(index)}`), observedAtMs: 1_000 + index });
+    }
+    for (let visit = 0; visit < MIN_HUB_CANDIDATE_REVISITS; visit += 1) {
+      observations.push({ canonicalUrl: vetoHubUrl('/home'), observedAtMs: 5_000 + visit });
+    }
+    applyAggregatorObservations(state, observations);
+  };
+
+  it('a population-shaped hub is VETOED back to not-aggregator when enough samples show low entropy (a coherent single source)', () => {
+    const state = createEmptyAggregatorStatsState();
+    seedPopulationHub(state);
+    expect(isLearnedAggregatorHost(state, VETO_HUB_DOMAIN)).toBe(true); // structurally shaped, pre-veto
+
+    const lowEntropyObservations: AggregatorVisitObservation[] = Array.from(
+      { length: MIN_KEYWORD_CONCEPT_SAMPLES_FOR_VETO },
+      (_, i) => ({
+        canonicalUrl: vetoHubUrl(`/kw/tag-${String(i)}`), // fresh URLs — do NOT revisit the population-shape seed set
+        observedAtMs: 9_000 + i,
+        keywordConceptIds: ['concept-rust'], // every tagged page shares ONE concept
+      }),
+    );
+    applyAggregatorObservations(state, lowEntropyObservations);
+    expect(isLearnedAggregatorHost(state, VETO_HUB_DOMAIN)).toBe(false);
+  });
+
+  it('cold-start gate on the veto itself: low entropy with TOO FEW keyword-concept samples does NOT veto', () => {
+    const state = createEmptyAggregatorStatsState();
+    seedPopulationHub(state);
+    const tooFewObservations: AggregatorVisitObservation[] = Array.from(
+      { length: MIN_KEYWORD_CONCEPT_SAMPLES_FOR_VETO - 1 },
+      (_, i) => ({
+        canonicalUrl: vetoHubUrl(`/kw/tag-${String(i)}`), // fresh URLs — do NOT revisit the population-shape seed set
+        observedAtMs: 9_000 + i,
+        keywordConceptIds: ['concept-rust'],
+      }),
+    );
+    applyAggregatorObservations(state, tooFewObservations);
+    expect(isLearnedAggregatorHost(state, VETO_HUB_DOMAIN)).toBe(true); // still structurally shaped, no veto
+  });
+
+  it('HIGH entropy (diverse concepts) with enough samples does NOT veto — the structural hub call stands', () => {
+    const state = createEmptyAggregatorStatsState();
+    seedPopulationHub(state);
+    const diverseObservations: AggregatorVisitObservation[] = [
+      'concept-rust',
+      'concept-baking',
+      'concept-astronomy',
+      'concept-finance',
+    ].map((conceptId, i) => ({
+      canonicalUrl: vetoHubUrl(`/kw/tag-${String(i)}`), // fresh URLs — do NOT revisit the population-shape seed set
+      observedAtMs: 9_000 + i,
+      keywordConceptIds: [conceptId],
+    }));
+    applyAggregatorObservations(state, diverseObservations);
+    expect(isLearnedAggregatorHost(state, VETO_HUB_DOMAIN)).toBe(true);
   });
 });
