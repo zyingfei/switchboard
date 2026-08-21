@@ -1381,6 +1381,144 @@ extra read cost. Re-verified: the exact failing ordering
 fail, was 29 pass / 1 fail); full `bun test` and `bun run build` re-run
 clean.
 
+**2026-08-21 — task #23: FEED-VS-ITEM v2 — oscillation-aware churn +
+structural item inference (feat/feed-item-signals-v2).** Follow-up to the
+entry directly below, closing its two named residuals: (1) the oscillating-
+placeholder-title shape settle-window couldn't cover, and (2) the deep-path
+item-inference heuristic's overreach (x.com, reddit `/r/<sub>` roots,
+checkout/marketing paths). Both fixed structurally in
+`learnedAggregatorStats.ts` (no domain list):
+
+- **Oscillation-set tracking** (`distinctNormalizedTitles`, bounded at
+  `MAX_TRACKED_DISTINCT_TITLES_PER_URL = 8`). A transition to a title THIS
+  URL has shown before is a return to a known value, not novel content —
+  churn now requires a title never seen before for this URL. A small
+  alternating set (placeholder + real title, maybe a third transient value)
+  never accumulates novel titles past its first lap; a genuinely rotating
+  feed does, every capture.
+- **Domain-boilerplate title exclusion** (`titleDistinctUrlCounts`, bounded
+  at `MAX_TRACKED_DOMAIN_TITLES = 128` tracked keys). A title recurring
+  across `>= MIN_DISTINCT_URLS_FOR_BOILERPLATE_TITLE = 5` DISTINCT URLs on
+  one domain is the platform's generic loading chrome, not this page's
+  content — learned per-domain from data already folded into the existing
+  per-domain aggregates. Closes the gap oscillation-tracking alone can't: a
+  URL captured only 2-3 times (placeholder, placeholder, real title) never
+  "returns" to the placeholder within its own history, but the SAME
+  placeholder recurring across many sibling URLs is still recognizable.
+  Both signals are scoped to the PER-URL churn count only — deliberately
+  NOT applied to the domain-level shallow-path churn aggregate (signal (c)
+  from task #22), which keeps using the pre-existing metadata-robust-only
+  churn test. Measured cost of NOT scoping this (an intermediate build):
+  starved reddit.com/claude.ai/openai.com/youtube.com/… of their only
+  learned hub-qualifying evidence, silently disabling the learned
+  classifier for them (SAFE — registry-covered, OR-combine protects them —
+  but an avoidable regression this task caught via the real-vault
+  re-measurement below, not via unit tests, and does not need to pay for).
+- **Sibling-fan-out veto + revisit-concentration/title-stability votes.**
+  Deep path is now NECESSARY, never SUFFICIENT. A URL that is itself the
+  shared path-prefix of `>= PREFIX_PARENT_MIN_CHILDREN` (mirrors
+  `MIN_HUB_FANOUT = 8`) distinct deeper URLs (reddit's `/r/sub` is the
+  parent path of every `/r/sub/comments/…` thread) is vetoed outright — a
+  listing, not an item — regardless of the votes below. Otherwise, item
+  classification requires deep-path AND (single-visit-pattern OR
+  title-stability): single-visit-pattern is `visitCount <=
+  SINGLE_VISIT_PATTERN_MAX_VISITS (2)`, keyed on SESSION_GAP_MS
+  (30-minute, the same session-boundary convention
+  `dispatch/correlation.ts`'s `MATCH_WINDOW_MS` already uses)
+  session-gap-separated DISTINCT VISITS — NOT raw `observationCount`. A
+  mid-task real-vault measurement caught this distinction was load-bearing:
+  a single open-tab dwell routinely folds several raw observations (its own
+  `navigation.committed` plus periodic `BROWSER_TIMELINE_OBSERVED`
+  re-captures — the live test vault measures ~2.5 timeline captures per
+  navigation), and an early build that keyed the vote on raw
+  `observationCount <= 2` wrongly read that capture density as "revisited",
+  regressing `github.com` agreement 95.2%→73.7% (real `github.com/owner/
+  repo` pages, single visit, 3 raw observations) before the session-gap fix
+  (`visitCount`) was added.
+
+**Re-measured on a fresh read-only SQLite-backup snapshot of the real test
+vault** (same procedure as the entry below; 28,000 events, 4,698 distinct
+URLs). Overall agreement (4,698 URLs) **72.0% → 75.1%**; registry-covered
+agreement (2,348 URLs) **67.9% → 74.1%**. Per-domain (agreement %,
+`item→feed`/SAFE and `feed→item`/DANGEROUS disagreement counts):
+
+| domain | agreement before→after | item→feed (safe) before→after | feed→item (dangerous) before→after |
+|---|---|---|---|
+| github.com | 95.2%→97.8% | 12→4 | 3→3 |
+| chatgpt.com | 40.0%→86.9% | 155→24 | 10→12 |
+| reddit.com | 50.0%→86.8% | 15→1 | 4→4 |
+| claude.ai | 76.9%→84.6% | 3→0 | 0→2 |
+| google.com | 73.2%→74.8% | 11→3 | 213→208 |
+| ycombinator.com | 79.1%→79.3% | 106→105 | 21→21 |
+| x.com | 36.9%→19.4% | 0→0 | 65→83 |
+| openai.com | 27.5%→19.6% | 0→0 | 37→41 |
+| youtube.com | 20.4%→20.4% | 37→37 | 2→2 |
+
+**The SAFE direction (over-suppression) improved sharply** — overall
+`item→feed` 339→174 — closing almost all of the oscillating-placeholder
+residual named below: github.com, chatgpt.com, reddit.com, claude.ai all
+gained double-digit agreement points.
+
+**Honest finding: the DANGEROUS direction (under-suppression) did NOT
+shrink net** — overall `feed→item` 355→376 — so per this module's own
+binding COLD-START RULE, feed-vs-item is NOT extended to serving. Sampled
+and classified the residual disagreements:
+- **x.com dangerous count grew (65→83), not resolved as hoped.** The task's
+  own hope — "the always-feed-by-policy platforms should emerge naturally
+  from recurring-revisit + high child-fan-out" — was verified, not assumed,
+  and the honest answer is no: individual tweet permalinks are deep,
+  overwhelmingly single-visit, structurally indistinguishable from a real
+  item. x.com's registry "always feed" is a deliberate PLATFORM POLICY
+  (short/ephemeral content), not a content-stability fact — no structural
+  signal can recover a policy decision from behavior alone.
+- **google.com's large, ~unchanged dangerous count (213→208) is
+  PRE-EXISTING and out of this task's scope.** Traced to the `reachedFromHub`
+  opener-chain signal (PR #373/#406, untouched here), not the deep-path
+  signal this task changed — confirmed the misfiring URLs (Google search
+  results, oauth/accounts/mail/drive flows) are SHALLOW (1 path segment),
+  never entering the deep-path gate at all; they're reached via an opener
+  edge from a hub-shaped `www.google.com` session instead. Flagged as a
+  named follow-up needing its own fix.
+- **NEW finding: `platform.openai.com` settings/dashboard SPA pages** (e.g.
+  `/settings/organization/billing/…`) are single-visit AND spuriously
+  title-stable — client-side route changes that don't always update
+  `document.title` lag the visible page one capture behind, so consecutive
+  DIFFERENT settings pages read as zero title churn. A structural blind
+  spot distinct from x.com/google.com's, not fixed here.
+- **chatgpt.com's small residual growth (10→12) is the SAME checkout/
+  marketing/library/project-workspace pattern** PR #408 already named,
+  still present (`/g/<gpt>/project`, `/checkout/…`, `/business/enterprise`,
+  `/library`): single-visit, title-stable, structurally identical to a real
+  conversation thread by every signal available here.
+- claude.ai's small residual growth (0→2) was not individually sampled
+  (small magnitude); flagged as residual.
+
+**Decision (per this task's own bar — "IF learned-wrong ≈ 0 both
+directions: extend the serve"): NOT extended.** Learned-wrong is not ≈0 in
+the dangerous direction (net growth, concentrated on x.com's policy-vs-
+structure conflict plus the pre-existing `reachedFromHub` blind spot on
+google.com). Ships the oscillation-aware churn + structural item-inference
+fixes on their own merits — they measurably close the SAFE-direction
+residual task #22 named, github.com/chatgpt.com/reddit.com/claude.ai all
+improved, several with double-digit agreement gains — while feed-vs-item
+stays registry-only. `SIDETRACK_LEARNED_AGGREGATOR_SERVE`'s existing
+IS-AGGREGATOR (hub) serving flip (task #22) is UNCHANGED by this task
+(registry-covered domains: `registryOnlyAggregatorCount` back to exactly
+59, matching task #22's baseline — the signal (c) decoupling fix above
+restored parity). Named follow-ups (none fixed here, to avoid scope creep
+into unverified changes): x.com/similar short-content-platform policy
+override, google.com's `reachedFromHub` shallow-URL blind spot, SPA
+title-lag on settings-chrome apps, and the checkout/marketing/workspace
+pattern generally. Full unit coverage:
+`learnedAggregatorTitleOscillation.test.ts` (2/3-value oscillation not
+churn, novel-title stream still churns, domain-boilerplate exclusion +
+threshold behavior, end-to-end classification),
+`learnedAggregatorDeepPathEvidence.test.ts` (single-visit-pattern vs.
+session-gap-separated recurring-revisit, title-stability fallback,
+sibling-fan-out veto — hub-root/item-leaf/subreddit-root fixtures side by
+side, conservative-combination gating). Full `bun test` and `npm run build`
+clean throughout.
+
 **2026-08-21 — task #22 remainder: metadata-robust title churn
 (feat/title-churn-robustness).** Follow-up to the entry directly below.
 That entry's disagreement sampling attributed 96-100% of every
