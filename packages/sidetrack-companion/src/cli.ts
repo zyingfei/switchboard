@@ -256,6 +256,25 @@ export const renderHelp = (): string =>
     '    process-lock (VACUUM rewrites the whole file). A clean no-op when',
     '    the file does not exist.',
     '',
+    'Event-store-repair-days subcommand (F2 follow-up — mirror day repair):',
+    '  sidetrack-companion event-store-repair-days --vault <path>',
+    '      [--replica <id>] [--day <YYYY-MM-DD>] [--json]',
+    '    Re-ingests a (replica, day) shard\'s canonical JSONL events into the',
+    '    typed event-store mirror (_BAC/connections/event-store.db) via the',
+    '    store\'s own idempotent ingest path — fixes retire-hot-tail\'s',
+    '    "store-drift" verdict when it is caused by the mirror having ZERO',
+    '    rows for a day whose canonical shard genuinely has events (a',
+    '    condition the live companion\'s ordinary catch-up never revisits on',
+    '    its own). Default (no --replica/--day): auto-discovers every',
+    '    (replica, day) with events on disk but no mirror rows. With',
+    '    --replica/--day: targets exactly that key regardless of its current',
+    '    row count. Uses listCanonicalEventShards, so an already-retired day',
+    '    (_BAC/retired/log) is repairable too. Idempotent: re-running is a',
+    '    no-op (INSERT OR IGNORE keyed on the replica/seq dot). Requires',
+    '    SIDETRACK_EVENT_STORE_REPAIR=1 in the environment and refuses if a',
+    '    live companion holds the recall process-lock (this writes rows into',
+    '    the SAME event-store.db a live companion has open read-write).',
+    '',
     'Connections-rebuild subcommand (user-consented full replay):',
     '  sidetrack-companion connections-rebuild --vault <path> [--json]',
     '    Rebuilds the connections graph from the COMPLETE event source and',
@@ -1770,6 +1789,104 @@ const runEventStoreVacuumSubcommand = async (
   }
 };
 
+// F2 follow-up — event-store mirror day repair. Same safety bar as
+// event-store-vacuum: SIDETRACK_EVENT_STORE_REPAIR=1 arm switch + the
+// vault's recall process-lock, refused outright if a live companion owns it
+// (this writes rows into the SAME event-store.db a live companion has open
+// read-write — a second writer racing that file is exactly the desync the
+// process-lock exists to prevent, identically to event-store-vacuum's own
+// reasoning). See gc/eventStoreMirrorRepair.ts for the full store-drift /
+// idempotent-ingest rationale.
+const runEventStoreRepairDaysSubcommand = async (
+  argv: readonly string[],
+  streams: CliStreams,
+): Promise<number> => {
+  if (argv.includes('--help') || argv.includes('help')) {
+    writeLine(
+      streams.stdout,
+      'Usage: sidetrack-companion event-store-repair-days --vault <path> ' +
+        '[--replica <id>] [--day <YYYY-MM-DD>] [--json]',
+    );
+    return 0;
+  }
+  const vaultPath = findArgValue(argv, '--vault');
+  if (vaultPath === undefined || vaultPath.length === 0) {
+    writeLine(streams.stderr, '--vault <path> is required for event-store-repair-days.');
+    return 2;
+  }
+  const replica = findArgValue(argv, '--replica');
+  const day = findArgValue(argv, '--day');
+  const json = argv.includes('--json');
+
+  const { eventStoreRepairArmed } = await import('./gc/eventStoreMirrorRepair.js');
+  if (!eventStoreRepairArmed()) {
+    writeLine(
+      streams.stderr,
+      'event-store-repair-days refuses: SIDETRACK_EVENT_STORE_REPAIR is not set to 1/true.',
+    );
+    writeLine(
+      streams.stderr,
+      "This is gc/eventStoreMirrorRepair.ts's own arm switch — set it explicitly in the",
+    );
+    writeLine(streams.stderr, 'environment to confirm the re-ingest; the command alone is not enough.');
+    return 1;
+  }
+
+  const { acquireRecallProcessLock, RecallLockHeldError } = await import('./recall/recovery.js');
+  let lock;
+  try {
+    lock = await acquireRecallProcessLock(vaultPath);
+  } catch (error) {
+    if (error instanceof RecallLockHeldError) {
+      writeLine(
+        streams.stderr,
+        `event-store-repair-days refuses: a live companion (pid ${String(error.pid)}) owns ${vaultPath}.`,
+      );
+      writeLine(
+        streams.stderr,
+        'Stop it first — this writes rows into the SAME event-store.db it holds open read-write.',
+      );
+      return 1;
+    }
+    throw error;
+  }
+  try {
+    const { repairEventStoreMirrorDays } = await import('./gc/eventStoreMirrorRepair.js');
+    const result = await repairEventStoreMirrorDays(vaultPath, {
+      ...(replica === undefined ? {} : { replica }),
+      ...(day === undefined ? {} : { day }),
+    });
+    if (json) {
+      writeLine(streams.stdout, JSON.stringify({ mode: 'repair', result }, null, 2));
+      return result.errors.length === 0 ? 0 : 1;
+    }
+    writeLine(
+      streams.stdout,
+      `event-store-repair-days: vault=${vaultPath} candidatesConsidered=${String(
+        result.candidatesConsidered,
+      )} daysRepaired=${String(result.totals.daysRepaired)} daysAlreadyOk=${String(
+        result.totals.daysAlreadyOk,
+      )} rowsInsertedTotal=${String(result.totals.rowsInsertedTotal)}`,
+    );
+    for (const outcome of result.outcomes) {
+      const malformedSuffix =
+        outcome.malformedLines > 0 ? `\tmalformedLines=${String(outcome.malformedLines)}` : '';
+      writeLine(
+        streams.stdout,
+        `  ${outcome.replica}\t${outcome.day}\trowsBefore=${String(
+          outcome.rowsBefore,
+        )}\trowsAfter=${String(outcome.rowsAfter)}\tcanonicalEvents=${String(
+          outcome.canonicalEvents,
+        )}${malformedSuffix}`,
+      );
+    }
+    for (const error of result.errors) writeLine(streams.stderr, error);
+    return result.errors.length === 0 ? 0 : 1;
+  } finally {
+    await lock.release();
+  }
+};
+
 // F8 IVM plan, W3 — Recovery consent rule (docs/plans/2026-08-16-f8-ivm-
 // designs.md, "Recovery consent rule"). The materializer never auto-
 // invokes a full replay for a catastrophic-recovery condition on a
@@ -2002,6 +2119,9 @@ export const runCli = async (argv: readonly string[], streams: CliStreams): Prom
   }
   if (argv[0] === 'event-store-vacuum') {
     return await runEventStoreVacuumSubcommand(argv, streams);
+  }
+  if (argv[0] === 'event-store-repair-days') {
+    return await runEventStoreRepairDaysSubcommand(argv, streams);
   }
   if (argv[0] === 'recall') {
     return await runRecallSubcommand(argv, streams);

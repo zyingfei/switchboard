@@ -3648,3 +3648,102 @@ chasing the requested speedup.
 
 PR: perf(store): HNSW write delta-gate + rowid-driven replaceScopeRows
 (branch `perf/hnsw-gate-rowid-scopes`).
+
+**2026-08-21 — event-store mirror day repair, F2 addendum
+(fix/event-store-day-repair).** Built `event-store-repair-days`
+(`src/gc/eventStoreMirrorRepair.ts`, wired in `cli.ts`) per this task's
+brief: idempotent, watermark-gate-FREE re-ingestion of a (replica, day)'s
+canonical JSONL events into the typed event-store mirror via
+`EventStore.ingestMany` (`INSERT OR IGNORE` on the `(replica_id, seq)`
+primary key) — fixes the general bug class where a day's mirror rows go
+missing while `catchUpFromJsonl`'s `shard_progress` bookkeeping (size/mtime
+tracked per shard file) never revisits an already-fully-read shard again.
+Default discovery (no `--replica`/`--day`): every (replica, day) with a
+canonical shard on disk — via `listCanonicalEventShards`, so an
+already-F2-retired day works too — but zero mirror rows. Explicit
+`--replica`/`--day` bypasses the zero-rows filter (targets that key
+unconditionally; a no-op if already fine). Same safety bar as
+`event-store-vacuum`: `SIDETRACK_EVENT_STORE_REPAIR=1` arm switch + the
+recall process-lock, refused outright if a live companion owns it. 7 module
+tests (fixture repair, idempotent re-run via explicit filter, malformed-line
+handling, already-F2-retired-day repair, discovery-filter correctness,
+clean no-op) + 6 CLI tests (missing `--vault`, unarmed refusal, lock-held
+refusal, clean no-op, happy path + idempotent re-run) — all green; full
+`bun test` 3935 pass/8 skip/0 fail across 424 files (after `npm run build`,
+required for the pre-existing HNSW-reconcile-child/in-place-publish
+integration tests that fork a `dist/` entrypoint — 0 failures attributable
+to this change); `tsc --noEmit` 152 pre-existing errors, unchanged, zero in
+any touched/new file; `eslint` 0 errors on every touched/new file.
+
+**Real-vault verification surfaced a wrong premise — reported per the
+debugging doctrine ("evidence before conclusions... retract premises when
+data disagrees"), not silently patched over.** Task hypothesis: the 6 named
+store-drift shards (replica `819ef08e-b4d4-4e8e-b230-60e33e96142f`, days
+2026-06-15/06-26/07-02/07-03/07-04/07-05) have a mirror missing REAL events
+still present in canonical JSONL. Verified on a COPY of
+`~/.sidetrack-vault-test` (`cp -Rc` for `_BAC/log` + `_BAC/retired` +
+`_BAC/seal`; `sqlite3 <src> ".backup <dest>"` for
+`_BAC/connections/event-store.db` — WAL-safe online backup against the live
+companion, which was never contacted/restarted/disrupted throughout, confirmed
+still running the whole time; `retire-hot-tail --report` on the copy
+reproduced the exact 6 named shards first, before any repair attempt).
+Direct inspection FALSIFIES the premise: all 6 canonical
+`_BAC/log/<replica>/<day>.jsonl` shards are literally 0 bytes (identical
+mtime, Aug 15 21:56 — the F1 `compact-engagement --apply` idle-window run
+per the F1 goal-register row above), and the mirror's row count for all 6 is
+ALSO 0 — matching the JSONL, not drifted from it. The `compacted_events`
+ledger carries 192,265 rows for this replica across the 6 days' seq span
+(369310-565761), confirming a receipt-verified F1 compaction fully dropped
+every event in these specific days (unlike the PARTIAL-drop compaction-aware
+test in `hotTailRetirement.test.ts`, where an undropped aggregate event
+keeps the day visible to the sealer). Running `event-store-repair-days`
+against these exact 6 days (default discovery correctly found EXACTLY these
+6 and nothing else across the 2.3GB copy — matching the task's own claim
+precisely) is a correct, honest no-op: `canonicalEvents=0` for all 6
+(nothing to re-ingest), `retire-hot-tail --report` byte-for-byte unchanged
+after (`storeDriftShards` stays 6). The tool is not broken — there is
+genuinely nothing left in canonical JSONL to repair for these 6 days.
+
+**Real root cause (a second, more precise bug, found not guessed):
+`eventSeal.ts`'s day-discovery can never re-seal a day that compacted to
+EXACTLY zero rows.** `runEventSealPass` discovers candidate days via
+`for (const stat of store.sealDayStats(replica))`, and `sealDayStats` is a
+`GROUP BY day` SQL aggregate — which structurally never emits a row for a
+day with zero matching rows. A day whose live row count drops from N to 0
+(full compaction, this case) therefore becomes permanently invisible to the
+same re-seal self-heal path the compaction-aware test proves DOES work when
+at least one row (e.g. a surviving aggregate) keeps the day in
+`sealDayStats`'s output. Confirmed directly: `seal --dry-run`
+(`SIDETRACK_EVENT_STORE=1`) against the copy classifies all 234
+currently-sealed-verified days as `skippedAlreadySealed` and never even
+visits the 6 drifted days — not planned, not skipped, not counted anywhere;
+the loop structurally cannot reach them. THIS is the actual, load-bearing
+fix needed to close these 6 real shards — touches the columnar seal write
+path (`src/analytics/eventSeal.ts`), a different subsystem with its own
+segment-verification contract, deliberately NOT bundled into this PR (one
+goal per PR, per repo convention) — filed here as a concrete,
+ready-to-implement follow-up: extend the day-discovery loop to also plan a
+re-seal (rows=0) for any manifest entry whose `(replica, day)` no longer
+appears in `sealDayStats`'s output at all.
+
+**Mechanism proven correct at real vault scale (the tool DOES work, on the
+failure class it actually targets).** To close the loop honestly rather than
+stop at a negative result, manufactured a genuine instance of the ORIGINALLY
+hypothesized bug on the same copy: deleted the mirror's 22,963 rows for
+`2026-08-05` (a real, already-F2-retired, otherwise-healthy day) —
+`retire-hot-tail --report` correctly flipped it to `store-drift`
+(`storeDriftShards` 6→7). `event-store-repair-days --replica
+819ef08e-b4d4-4e8e-b230-60e33e96142f --day 2026-08-05` restored
+`rowsAfter=22963` (`canonicalEvents=22963`, read from `_BAC/retired/log` —
+proving the `listCanonicalEventShards` already-retired-day path at real
+scale, not just the unit fixture) — `retire-hot-tail --report` flipped it
+straight back to `sealed-verified` (`eventsLive=22963` matches
+`eventsSealed`; `storeDriftShards` 7→6, `shardsEligible` back to 234).
+Re-running the identical repair immediately after: `rowsInsertedTotal=0`,
+`daysAlreadyOk=1` — idempotent at real vault scale, not just the synthetic
+test fixtures.
+
+PR: fix(store): event-store mirror day repair — unblock store-drift
+retirement shards (branch `fix/event-store-day-repair`). Not merged —
+coordinator review pending per this task's "one PR; do not merge"
+instruction.
