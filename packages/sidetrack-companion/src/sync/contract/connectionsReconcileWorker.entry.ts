@@ -21,6 +21,18 @@ import { loadOrCreateReplica } from '../replicaId.js';
 import { createTimelineStore } from '../../timeline/projection.js';
 import { createConnectionsMaterializer } from './connectionsMaterializer.js';
 import type { ReconcileWorkerJob, ReconcileWorkerResult } from './connectionsReconcileWorker.js';
+import {
+  ensureTopicFullTimelineSourceDefault,
+  wrapTopicRevisionStoreForProduction,
+} from '../../connections/topicProductionRevival.js';
+import { createTopicRevisionStore } from '../../producers/topic-revision.js';
+
+// W5 — topic production revival (see topicProductionRevival.ts's header).
+// Same posture as connectionsReconcileChild.entry.ts's sibling seed: this
+// worker_thread is a real drain writer too, so it needs its own default
+// even though it also inherits the parent's process.env via the `env`
+// option `runReconcileInWorker` passes at construction.
+ensureTopicFullTimelineSourceDefault();
 
 const post = (result: ReconcileWorkerResult): void => {
   parentPort?.postMessage(result);
@@ -42,6 +54,9 @@ const run = async (): Promise<void> => {
       eventLog,
       timelineStore,
       store,
+      topicRevisionStore: wrapTopicRevisionStoreForProduction(
+        createTopicRevisionStore(job.vaultRoot),
+      ),
     });
     await materializer.catchUp(eventLog);
     const metadata =

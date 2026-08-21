@@ -965,6 +965,155 @@ none qualified in this task's `deps`/`target`/`hlc` audit).
 
 ## Landing notes (current state, dated)
 
+**2026-08-21 — W5: topic production revival + parity instrumentation
+(fix/topic-production-revival).** Task #20 (W5) reported topics stuck at
+zero on both the live and test companions (`workGraphHealth.topicProducer
+.topicCount=0`, `activeRevision leiden-cpm`, `lineageCount=156`/`96`) since
+the banner-era topic-cadence freeze was removed. The task's working
+hypothesis was a latched drift breaker. That hypothesis was WRONG — the
+drift monitor (`connections/drift/driftMonitor.ts`) is purely observational
+(its own header: "never rebuilds topics or similarity; only reads the
+diagnostic numbers the materializer already computed") and holds no
+persisted state that gates production. `driftTripped=topicCount` is a
+correct SYMPTOM report, not a cause.
+
+**Actual root cause, confirmed against both real vaults' on-disk state**:
+`~/.sidetrack-vault/_BAC/connections/topics/current.json` and
+`~/.sidetrack-vault-test/_BAC/connections/topics/current.json` both hold a
+zero-topic active revision whose ENTIRE lineage is `kind: 'death'` entries
+(156 / 96 of them), all dated to a SINGLE timestamp — a one-shot collapse,
+not ongoing churn. `connectionsMaterializer.ts`'s served leiden-cpm build
+(`servedProducer === 'leiden-cpm'` branch) sources its visit list from
+`topicVisitsForBuild`, which — unless the pre-existing (default-OFF)
+`SIDETRACK_CONNECTIONS_TOPIC_FULL_TIMELINE` flag is set — is the CURRENT
+DRAIN'S OWN delta window only (`readMergedSince(appliedFrontier)` →
+`buildTimelineDays`), not the full corpus. `visitSimilarity` itself is
+already window-independent (the W1/M3 full-corpus lane), so a late signal
+(e.g. an `ENGAGEMENT_SESSION_AGGREGATED` that requalifies an old,
+previously-sub-gate visit) can change `visitSimilarity.revisionId` —
+tripping the topic cadence — without that visit's original timeline entry
+being part of THIS drain's window. `buildLeidenCpmTopicRevision` then runs
+against a near-empty (sometimes fully empty) visit list, and
+`assembleTopicRevisionFromGroups` marks every previously-active topic
+`'death'`. The result is written to the active slot UNCONDITIONALLY
+(`putActiveRevision`, no floor) — the served topic count wipes. Because
+`shouldRunTopicRevision` only re-attempts a rebuild when
+`visitSimilarityRevisionId` next changes, a mostly-idle vault (today's log:
+1489 `engagement.interval.observed` + 44 `engagement.session.aggregated` +
+4 `workstream.prototype.generated`, ZERO `browser.timeline.observed`) never
+retries — nothing in ordinary continued engagement (without a genuinely new
+page) re-arms the cadence, so the collapse is inert-forever, not latched.
+The incremental shadow (`SIDETRACK_TOPIC_INCREMENTAL_SHADOW`) does local
+refinement OFF the leiden candidate slot, so once that collapsed to empty
+the shadow had nothing to refine and stayed empty too (the "no-leiden-base"
+path) — confirmed on disk: `current.topic-revision_v4_incremental.shadow
+.json` on the test vault is `{topics: [], lineage: []}`.
+
+**Fix, entirely outside the protected `connectionsMaterializer.ts`** (new
+`connections/topicProductionRevival.ts`, same wrapper/bootstrap posture as
+the F9 idle-gate fix):
+1. `ensureTopicFullTimelineSourceDefault()` flips
+   `SIDETRACK_CONNECTIONS_TOPIC_FULL_TIMELINE`'s DEFAULT to `1` (still a
+   live kill-switch via `=0`) — seeded at process start in `runtime
+   /companion.ts`, `cli.ts`, and BOTH real per-drain writer entrypoints,
+   `connectionsReconcileChild.entry.ts` (the `SIDETRACK_CONNECTIONS_CHILD`
+   fork-per-drain default path) and `connectionsReconcileWorker.entry.ts`
+   — `companion.ts` itself is a read-only parent under the double-buffer
+   model, so the child/worker entrypoints are where this actually has to
+   land, not just the parent.
+2. `wrapTopicRevisionStoreForProduction()` wraps the injectable
+   `topicRevisionStore` dependency (already an optional seam in
+   `createConnectionsMaterializer`) with (a) a stateless collapse guard —
+   refuses to let a leiden-cpm write drop a populated active revision to
+   zero topics; keeps serving the last healthy revision and persists the
+   collapsed build via `putRevision` for audit only (no pointer flip); has
+   no latch to reset, so a subsequent healthy build self-heals on its own
+   — and (b) the parity instrument the task asked for: an audible
+   `[topic.cycle] producer=leiden|incremental topics=N members=M
+   churn=p50:X,p90:Y` mark on every write to the leiden active slot and the
+   incremental candidate-shadow slot, using the existing
+   `buildServedTopicProducerReport` churn math.
+
+**KNOWN LIMITATION, found during verification, not predicted**: the
+full-timeline re-derivation reads `deps.eventLog.readMerged()`, which walks
+`_BAC/log` only. F2 (hot-tail retirement, this same landing-notes section,
+merged the same day) moves retired days to `_BAC/retired/log/...` —
+absent, not erroring, from that read. So post-F2, "full timeline" here
+means "the full CURRENTLY-RETAINED timeline", not true full history; it
+closes the window-starvation bug but cannot resurrect topic membership
+whose only remaining record is the typed event-store mirror or sealed
+Parquet. This is exactly why the collapse guard is not redundant with the
+env default: it protects already-served topic knowledge (which may depend
+on retired history) from being wiped by an incomplete rebuild, independent
+of whether the rebuild's OWN input was complete. Sourcing the full-timeline
+read from the same typed/sealed path F3's migrated hot readers use would
+close this gap, but that edit lives inside the protected file — flagged as
+follow-up, not fixed here.
+
+**Verification — synthetic e2e (`connectionsMaterializer
+.topicProductionRevival.test.ts`)**: three tests against the real
+materializer (not mocks) reproduce the exact bug shape (a healthy 2-member
+leiden topic, then a late gate-crossing engagement requalify with no fresh
+timeline entry in that drain's window) — (1) unguarded + flag off: the
+existing bug reproduces byte-for-byte (topics wipe to 0, lineage all
+`death`); (2) unguarded + the env default applied: no collapse, the
+requalified visit is correctly folded in; (3) guarded + flag off: the
+collapse is attempted but suppressed, the healthy revision keeps serving,
+and a subsequent normal drain self-heals with zero manual reset. All three
+pass.
+
+**Verification — real vault copy** (`~/.sidetrack-vault-test`, full copy to
+a scratch dir, never touching the live/test companions per the task's
+read-only constraint): starting from the REAL broken on-disk state
+(`topics=0, lineage=156`), a 3-cycle incremental drain sequence (2 new
+pages, then a gate-crossing late-requalify of a 3rd, then a 4th brand-new
+page) was run once with the fix off and once with it on.
+- **Without the fix**: cycle 1 heals the broken state to 1 topic (3
+  members) — real activity resuming DOES self-heal when a drain's own
+  window happens to be non-empty — but cycle 2's window-poor requalify
+  collapses it right back to `topics=0, lineage=1`. The live symptom
+  reproduces on the real 19,912-node / 114,242-edge graph.
+- **With the fix**: cycle 1 → `topics=1 members=3`; cycle 2 (the
+  window-poor requalify) → `topics=1 members=4` (the late visit correctly
+  folded in, no collapse); cycle 3 (a brand-new page) → `topics=1
+  members=5`. No collapse across any cycle.
+- **Incremental-shadow parity, honestly reported**: across all 3 cycles on
+  this real-vault run, the incremental shadow stayed at `topics=0` while
+  leiden correctly grew 3→4→5 members. The shadow's own design (local
+  refinement of visits already known to an EXISTING leiden membership, per
+  its own in-file comment) means it structurally cannot independently
+  discover topics for visits that have never yet been a leiden member —
+  it needs leiden to seed structure first, then refines around it on a
+  LATER cycle. Parity does NOT hold in this immediate-post-revival window.
+
+**Flip decision: NOT flipped, for two independent reasons.** (1)
+Structural: `ServedTopicProducer` (`connections/servedTopicProducer.ts`)
+has no `'incremental'` member, and the dispatch that would serve it lives
+entirely inside the protected `connectionsMaterializer.ts` — wiring an
+actual serving flip is out of scope for this task regardless of what
+parity shows. (2) Empirical: the parity run above shows the incremental
+producer is not yet tracking the baseline at all right after a revival
+(0 vs 3-5 members) — even if the flip were wireable, shipping it now would
+regress topic coverage, not improve it. leiden-cpm remains the served
+producer; `SIDETRACK_TOPIC_INCREMENTAL_SHADOW` continues accumulating
+shadow-only churn evidence, now with an audible `[topic.cycle]` mark per
+cycle instead of silence.
+
+**Verification**: `bun test` — see PR for the exact tally (full suite run
+clean modulo one pre-existing, unrelated `recall-v2` sqlite-vec dimension
+flake — confirmed pre-existing via `git status` showing zero changes under
+`src/recall-v2/`). `bun run build` clean.
+
+**Files changed**: `connections/topicProductionRevival.ts` (new — the fix
++ parity instrument), `connections/topicProductionRevival.test.ts` (new —
+13 unit tests), `sync/contract/connectionsMaterializer
+.topicProductionRevival.test.ts` (new — 3 e2e tests against the real
+materializer), `runtime/companion.ts`, `cli.ts`, `sync/contract
+/connectionsReconcileChild.entry.ts`, `sync/contract
+/connectionsReconcileWorker.entry.ts` (wiring only — inject the default +
+the wrapped store at all 4 `createConnectionsMaterializer` call sites).
+`connectionsMaterializer.ts` untouched, per the task's binding constraint.
+
 **2026-08-21 — F2 apply: hot-tail retirement (move-not-delete) + event-store
 vacuum, CLOSES F2 (feat/f2-retire-apply).** The soak window named in the F2
 row ("real-vault run: 185 shards, 178 eligible... APPLY still pending soak

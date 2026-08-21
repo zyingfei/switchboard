@@ -55,6 +55,11 @@ import { createProjectionChangeFeed } from '../sync/projectionChanges.js';
 import { createExtractionMaterializer } from '../sync/contract/extractionMaterializer.js';
 import { createConnectionsMaterializer } from '../sync/contract/connectionsMaterializer.js';
 import { createConnectionsStore, SqliteConnectionsStore } from '../connections/snapshot.js';
+import {
+  ensureTopicFullTimelineSourceDefault,
+  wrapTopicRevisionStoreForProduction,
+} from '../connections/topicProductionRevival.js';
+import { createTopicRevisionStore } from '../producers/topic-revision.js';
 import { createTimelineMaterializer } from '../sync/contract/timelineMaterializer.js';
 import { createTimelineStore } from '../timeline/projection.js';
 import {
@@ -716,11 +721,23 @@ export const startCompanion = async (
       everyMs: sqliteVacuumEveryMs,
     });
     teardown.push(disposeSqliteVacuumGc);
+    // W5 — topic production revival (docs/plans/2026-08-15-foundation-program.md
+    // landing note). Must run
+    // BEFORE the materializer is constructed: connectionsMaterializer.ts
+    // reads SIDETRACK_CONNECTIONS_TOPIC_FULL_TIMELINE at drain time (not
+    // module load), but the reconcile child/worker this process forks per
+    // drain inherits process.env at FORK time, so the default has to be
+    // seeded here, early, once. See topicProductionRevival.ts's header for
+    // the full root-cause writeup.
+    ensureTopicFullTimelineSourceDefault();
     const connectionsMaterializer = createConnectionsMaterializer({
       vaultRoot: options.vaultPath,
       eventLog: baseEventLog,
       timelineStore,
       store: connectionsStore,
+      topicRevisionStore: wrapTopicRevisionStoreForProduction(
+        createTopicRevisionStore(options.vaultPath),
+      ),
       // Drain-time workGraph health artifact. The scheduler is defined
       // below (next to the server wiring — it shares the route's dep
       // set); referencing it through this closure is safe because the

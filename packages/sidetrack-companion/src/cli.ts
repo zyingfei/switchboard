@@ -1820,16 +1820,22 @@ const runConnectionsRebuildSubcommand = async (
     const { createConnectionsStore } = await import('./connections/snapshot.js');
     const { createTimelineStore } = await import('./timeline/projection.js');
     const { createConnectionsMaterializer } = await import('./sync/contract/connectionsMaterializer.js');
+    const { ensureTopicFullTimelineSourceDefault, wrapTopicRevisionStoreForProduction } =
+      await import('./connections/topicProductionRevival.js');
+    const { createTopicRevisionStore } = await import('./producers/topic-revision.js');
 
     const replica = await loadOrCreateReplica(vaultPath);
     const eventLog = createEventLog(vaultPath, replica);
     const timelineStore = createTimelineStore(vaultPath);
     const connectionsStore = createConnectionsStore(vaultPath, { role: 'child-writer' });
+    // W5 — topic production revival (see topicProductionRevival.ts header).
+    ensureTopicFullTimelineSourceDefault();
     const materializer = createConnectionsMaterializer({
       vaultRoot: vaultPath,
       eventLog,
       timelineStore,
       store: connectionsStore,
+      topicRevisionStore: wrapTopicRevisionStoreForProduction(createTopicRevisionStore(vaultPath)),
     });
 
     if (!json) {
