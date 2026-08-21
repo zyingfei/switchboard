@@ -1264,6 +1264,93 @@ extra read cost. Re-verified: the exact failing ordering
 fail, was 29 pass / 1 fail); full `bun test` and `bun run build` re-run
 clean.
 
+**2026-08-21 — task #22 remainder: metadata-robust title churn
+(feat/title-churn-robustness).** Follow-up to the entry directly below.
+That entry's disagreement sampling attributed 96-100% of every
+`item→feed` misfire on github.com/reddit.com/chatgpt.com/claude.ai to ONE
+cause: the per-URL title-churn signal treated volatile IN-TITLE METADATA
+(reddit vote/comment counts, unread/notification counters, chat
+auto-renaming, live tickers) as content churn. Fixed structurally in
+`learnedAggregatorStats.ts` (no domain list):
+
+- **Stable-content normalization** (`isSubstantiveTitleChurn` /
+  `stableContentTokens`). Strips a short bracketed/parenthesized segment
+  carrying a digit ("(123 points)", "(3) Inbox"), a leading bare-or-
+  bracketed numeric counter, and any remaining standalone numeric token
+  (live-ticker values, timestamps), then tokenizes what's left and compares
+  by Jaccard similarity (`STABLE_CONTENT_CHURN_JACCARD_THRESHOLD = 0.5`),
+  not string inequality. CJK-safe by construction: `\d` matches ASCII 0-9
+  only, and the tokenizer treats each Han/Hiragana/Katakana character as its
+  own token (no whitespace to split CJK words on otherwise) — verified by
+  dedicated tests (a Chinese vote-count bracket varying registers as
+  NOT-churn; genuinely different Chinese content still registers as churn).
+- **Settle window** (`TITLE_SETTLE_WINDOW_OBSERVATIONS = 2`). The
+  chat-auto-rename case (title changes once, early, then holds) is title
+  SETTLING, not churn — the first adjacent-capture transition is excluded
+  from churn accounting entirely (neither churn nor "same"), for both the
+  per-URL and per-domain shallow-churn aggregate.
+
+**Re-measured on a fresh read-only copy of the real test vault**
+(`~/.sidetrack-vault-test`, backed up via SQLite's online-backup API into a
+scratch snapshot — never opened directly). Registry-covered agreement
+(`totalClassified=2348`): **66.4% → 67.9%**; overall agreement (4698 URLs):
+**68.8% → 72.0%**. Per-named-domain (registry-covered, agreement % and
+`item→feed`/SAFE vs `feed→item`/DANGEROUS disagreement counts):
+
+| domain | agreement before→after | item→feed (safe) before→after | feed→item (dangerous) before→after |
+|---|---|---|---|
+| github.com | 77.5%→95.2% | 68→12 | 3→3 |
+| chatgpt.com | 24.4%→40.0% | 204→155 | 4→10 |
+| reddit.com | 23.7%→50.0% | 28→15 | 1→4 |
+| claude.ai | 69.2%→76.9% | 4→3 | 0→0 |
+
+The originally-diagnosed SAFE-direction (over-suppression) problem is
+substantially fixed on all four domains. Sampled the residual `item→feed`
+cases: the dominant remaining pattern (chatgpt.com, reddit.com) is a
+DIFFERENT, previously-unnamed metadata shape — a generic loading-placeholder
+title (`"ChatGPT"`, `"Reddit - The heart of the internet"`) that OSCILLATES
+with the real title across multiple captures (tab background/foreground
+re-renders), not a one-time settle — the settle window (designed for a
+single monotonic rename) doesn't cover repeated oscillation. Left as a named
+follow-up, out of this task's explicit scope (vote counts, unread counters,
+one-time chat rename, live tickers).
+
+**Honest finding: this ALSO grew the dangerous direction on some
+registry-covered domains, and that is why the serving flip is NOT extended
+to feed-vs-item.** Removing the false churn signal also removed a
+coincidental safety net for a separate, pre-existing signal — PR #406's
+opener-independent DEEP-path item inference — on domains where that
+heuristic is a poor fit: **x.com 22→65** (registry deliberately marks
+x.com/twitter.com as always-feed regardless of content stability —
+`FEED_ONLY_DOMAINS` in `aggregatorProfiles.ts`; the churn signal was
+fortuitously, not correctly, agreeing with that policy before), chatgpt.com
+**4→10** (checkout/marketing/library pages, not conversations, are
+DEEP-path and low-fanout), reddit.com **1→4** (`/r/<subreddit>` is 2 path
+segments — "deep" by the generic segment-count heuristic even though it's a
+listing page). github.com and claude.ai were unaffected (3→3, 0→0).
+Secondary, non-serving-impacting finding: `facebook.com`/`linkedin.com` (29
+URLs total) lost their learned hub-candidacy entirely (their ONLY
+hub-qualifying evidence was the now-corrected false shallow-churn) —
+harmless today (registry-covered, OR-combine keeps them protected) but moved
+`registryOnlyAggregatorCount` 30→59 in the diagnostic-only shadow metric.
+
+**Decision (per this task's own bar — "IF learned-wrong ≈ 0: extend the
+serve"): NOT extended.** Learned-wrong is not ≈0 — the dangerous-direction
+count grew, concentrated on domains where the registry encodes a POLICY
+(not a content-stability fact) the structural classifier cannot see. Ships
+the title-churn robustness fix on its own merits (it does what it says:
+fixes the named metadata-churn cause, with numbers to prove it); feed-vs-item
+stays registry-only; the deep-path item-inference heuristic's blind spot on
+non-item-shaped URLs is flagged as a follow-up needing its own fix, not
+folded into this one to avoid scope creep into a second unverified change.
+Full unit coverage: `learnedAggregatorTitleChurnRobustness.test.ts` (every
+named metadata pattern + CJK safety + settle-window + Jaccard-threshold
+boundary), plus fixture updates in `learnedAggregatorShallowChurn.test.ts`
+and `learnedAggregatorStats.test.ts` where the settle window changed
+existing synthetic fixtures' correct answer, and a passthrough
+documentation test in `learnedAggregatorStatsEvents.test.ts` (normalization
+is `learnedAggregatorStats.ts`'s job, not the events adapter's).
+
 **2026-08-21 — task #22: opener-independent hub signals, learned aggregator
 to replacement grade on the IS-AGGREGATOR boundary
 (feat/aggregator-shadow-close).** Closes PR #373's named blind spot: three

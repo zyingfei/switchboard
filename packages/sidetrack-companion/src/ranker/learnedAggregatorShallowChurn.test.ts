@@ -30,6 +30,27 @@ const churnObservations = (
 ): AggregatorVisitObservation[] =>
   titles.map((title, index) => ({ canonicalUrl: url, observedAtMs: startAtMs + index, title }));
 
+// Fully disjoint single-word titles (no shared tokens, no digits) — a
+// stand-in for genuinely different content on every capture, distinct from
+// the metadata-noise patterns (vote/unread counters, live tickers) the
+// 2026-08-21 metadata-robustness follow-up strips before comparing. Using a
+// bare numeric SUFFIX here (e.g. "Listing batch 0") would be
+// indistinguishable, by token shape, from a vote-count-style counter and
+// would no longer register as churn — deliberately, see
+// learnedAggregatorStats.ts's isSubstantiveTitleChurn.
+const DISJOINT_WORDS = [
+  'alpha', 'bravo', 'charlie', 'delta', 'echo', 'foxtrot', 'golf', 'hotel',
+  'india', 'juliet', 'kilo', 'lima', 'mike', 'november', 'oscar', 'papa',
+  'quebec', 'romeo', 'sierra', 'tango',
+] as const;
+
+const disjointTitles = (count: number): readonly string[] => {
+  if (count > DISJOINT_WORDS.length) {
+    throw new Error(`disjointTitles: need ${String(count)} distinct words, only ${String(DISJOINT_WORDS.length)} available`);
+  }
+  return DISJOINT_WORDS.slice(0, count);
+};
+
 // MIN_DOMAIN_URLS_FOR_HUB is a universal floor every hub gate shares — not
 // specific to signal (c). These filler URLs clear that floor with
 // single-visit, untitled, SHALLOW pages that contribute to neither the
@@ -41,7 +62,11 @@ const shallowFillerObservations = (domainUrl: (path: string) => string, count: n
 describe('learnedAggregatorStats — signal (c): shallow-path title churn', () => {
   it('a single shallow URL churning above the rate bar, with enough samples, qualifies the domain as a hub — zero fan-out, zero population evidence', () => {
     const state = createEmptyAggregatorStatsState();
-    const titles = Array.from({ length: MIN_SHALLOW_CHURN_SAMPLES_FOR_SIGNAL + 2 }, (_, i) => `Listing batch ${String(i)}`);
+    // +2, not +1: the settle window (TITLE_SETTLE_WINDOW_OBSERVATIONS) makes
+    // the FIRST adjacent-capture transition a non-sample ("settling"), so
+    // this needs one extra title to still land exactly on
+    // MIN_SHALLOW_CHURN_SAMPLES_FOR_SIGNAL counted samples.
+    const titles = disjointTitles(MIN_SHALLOW_CHURN_SAMPLES_FOR_SIGNAL + 2);
     applyAggregatorObservations(state, [
       ...shallowFillerObservations(churnUrl, MIN_DOMAIN_URLS_FOR_HUB),
       ...churnObservations(churnUrl('/feed'), titles, 1_000),
@@ -99,13 +124,18 @@ describe('learnedAggregatorStats — signal (c): shallow-path title churn', () =
 
   it('shallow churn folds across MULTIPLE shallow URLs on the domain, not just one', () => {
     const state = createEmptyAggregatorStatsState();
+    // 3 titles per URL, not 2: the settle window excludes each URL's FIRST
+    // transition as "settling", so a 2-title fixture would land entirely
+    // inside the settle window and contribute zero samples. The 2nd
+    // transition on each URL is a genuine, disjoint-content churn.
     const observations: AggregatorVisitObservation[] = [
-      ...churnObservations(churnUrl('/feed'), ['A', 'B'], 1_000),
-      ...churnObservations(churnUrl('/new'), ['C', 'D'], 2_000),
+      ...churnObservations(churnUrl('/feed'), ['alpha', 'bravo', 'charlie'], 1_000),
+      ...churnObservations(churnUrl('/new'), ['delta', 'echo', 'foxtrot'], 2_000),
     ];
     applyAggregatorObservations(state, observations);
     const stats = state.domainStats(CHURN_DOMAIN);
-    // 2 URLs x 1 adjacent pair each = 2 samples, both churned.
+    // 2 URLs x 1 counted (post-settle-window) adjacent pair each = 2 samples,
+    // both churned.
     expect(stats?.shallowTitleChurnSampleCount).toBe(2);
     expect(stats?.shallowTitleChurnRate).toBe(1);
   });
