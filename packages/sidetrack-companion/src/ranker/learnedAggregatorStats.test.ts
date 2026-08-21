@@ -48,6 +48,10 @@ const seedHubDomain = (state: AggregatorStatsState, leafCount: number): void => 
       canonicalUrl: hubUrl(`/item-leaf-${index}`),
       observedAtMs: 3_000 + index,
       openerCanonicalUrl: hubUrl('/feed-hub-1'),
+      // A genuine hyperlink click on the hub page — the reachedFromHub
+      // edge-quality gate (see learnedAggregatorStats.ts's module header)
+      // only credits transitionType='link' edges.
+      reachedViaLinkClick: true,
     });
   }
   applyAggregatorObservations(state, observations);
@@ -139,6 +143,78 @@ describe('learnedAggregatorStats', () => {
     });
   });
 
+  // 2026-08-21 — root-caused via a fresh real-vault snapshot: google.com's
+  // largest dangerous-direction (feed misclassified item) residual (PR
+  // #373/#406/#410's own measurements — 208 disagreements). The original
+  // reachedFromHub treated ANY same-domain opener/previous edge as "reached
+  // from the hub's displayed link", which structurally can't distinguish a
+  // real listing page (news.ycombinator.com: 95.4% of its inbound item edges
+  // carry Chrome's transitionType='link') from a reused session-root/search
+  // box (www.google.com: 86% typed/generated/form_submit, only 13% link) or
+  // same-shape pagination chaining (a search-results page linking to the
+  // next page of results). See learnedAggregatorStats.ts's module header
+  // "reachedFromHub edge-quality gating" note for the full measurement.
+  describe('reachedFromHub edge-quality gating (google.com dangerous-direction fix)', () => {
+    it('FIX 1: a same-domain edge that is not a genuine link click (typed/generated/form_submit) does not grant item — stays the conservative feed default', () => {
+      const state = createEmptyAggregatorStatsState();
+      seedHubDomain(state, MIN_HUB_FANOUT);
+      applyAggregatorObservations(state, [
+        {
+          canonicalUrl: hubUrl('/typed-destination'),
+          observedAtMs: 10_000,
+          openerCanonicalUrl: hubUrl('/feed-hub-1'),
+          reachedViaLinkClick: false,
+        },
+      ]);
+      expect(classifyLearnedAggregatorUrl(state, hubUrl('/typed-destination'))).toBe('feed');
+    });
+
+    it('FIX 1: an edge that omits reachedViaLinkClick entirely also does not grant item (cold-start-conservative default — absence of evidence is never "link")', () => {
+      const state = createEmptyAggregatorStatsState();
+      seedHubDomain(state, MIN_HUB_FANOUT);
+      applyAggregatorObservations(state, [
+        { canonicalUrl: hubUrl('/unlabeled-destination'), observedAtMs: 10_000, openerCanonicalUrl: hubUrl('/feed-hub-1') },
+      ]);
+      expect(classifyLearnedAggregatorUrl(state, hubUrl('/unlabeled-destination'))).toBe('feed');
+    });
+
+    it('FIX 2: same-shape same-domain chaining (search-pagination pattern) is vetoed even via a genuine link click', () => {
+      const state = createEmptyAggregatorStatsState();
+      const observations: AggregatorVisitObservation[] = [];
+      // The "search root" qualifies as a hub via fan-out to many same-shape
+      // sibling results pages — a search-results page linking to further
+      // searches (pagination, "people also ask", related-search widgets),
+      // exactly the pattern measured on the real vault.
+      observations.push({ canonicalUrl: hubUrl('/search?q=root'), observedAtMs: 1_000, title: 'root results' });
+      observations.push({ canonicalUrl: hubUrl('/search?q=root'), observedAtMs: 2_000, title: 'root results page 2' });
+      for (let index = 0; index < MIN_HUB_FANOUT; index += 1) {
+        observations.push({
+          canonicalUrl: hubUrl(`/search?q=sibling-${index}`),
+          observedAtMs: 3_000 + index,
+          openerCanonicalUrl: hubUrl('/search?q=root'),
+          reachedViaLinkClick: true,
+        });
+      }
+      applyAggregatorObservations(state, observations);
+      expect(isLearnedAggregatorHost(state, HUB_DOMAIN)).toBe(true);
+      // Source (/search) and destination (/search) share the exact same
+      // first-path-segment — same-shape chaining, never a hub launching a
+      // distinct item (verified safe against the HN case: a front page's
+      // first-path-segment ('') never equals its items' ('item')).
+      expect(classifyLearnedAggregatorUrl(state, hubUrl('/search?q=sibling-0'))).toBe('feed');
+    });
+
+    it('FIX 2 does not veto a genuine hub-to-item edge whose source and destination shapes differ (the HN case — root vs. /item)', () => {
+      const state = createEmptyAggregatorStatsState();
+      seedHubDomain(state, MIN_HUB_FANOUT);
+      // seedHubDomain's hub lives at /feed-hub-1 (first-path-segment
+      // 'feed-hub-1'); its leaves live at /item-leaf-N (first-path-segment
+      // 'item-leaf-N') — different shapes, so the veto never fires and the
+      // pre-existing positive-evidence path still holds.
+      expect(classifyLearnedAggregatorUrl(state, hubUrl('/item-leaf-0'))).toBe('item');
+    });
+  });
+
   describe('malformed input', () => {
     it('an unparseable URL classifies as not-aggregator', () => {
       const state = createEmptyAggregatorStatsState();
@@ -157,6 +233,7 @@ describe('learnedAggregatorStats', () => {
           canonicalUrl: hubUrl(`/item-leaf-${index}`),
           observedAtMs: 3_000 + index,
           openerCanonicalUrl: hubUrl('/feed-hub-1'),
+          reachedViaLinkClick: true,
         });
       }
       applyAggregatorObservations(oneShot, observations);
