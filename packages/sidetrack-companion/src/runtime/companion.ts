@@ -88,10 +88,12 @@ import {
 } from '../system/resolveCanary.js';
 import { resolveUrlAttribution } from '../tabsession/resolver.js';
 import { resolveUrlAttributionArmed } from '../attribution-v1/armedResolve.js';
-import type { TimelineProvider } from '../timeline/events.js';
+import { BROWSER_TIMELINE_OBSERVED, type TimelineProvider } from '../timeline/events.js';
+import { ENGAGEMENT_INTERVAL_OBSERVED } from '../engagement/events.js';
 import { createProjectionMaterializer } from '../sync/contract/projectionMaterializer.js';
 import { createRecallMaterializer } from '../sync/contract/recallMaterializer.js';
 import { createSyncContractRunner } from '../sync/contract/runner.js';
+import { createDrainIdleGate, type DrainIdleGate } from './drainIdleGate.js';
 import { createExtractionStore } from '../recall/extraction/store.js';
 import { createEmbeddingCache } from '../recall/embeddingCache.js';
 import { reprojectOnVersionMismatch } from '../sync/reproject.js';
@@ -739,7 +741,37 @@ export const startCompanion = async (
     teardown.push(() => {
       connectionsMaterializer.dispose();
     });
-    syncContractRunner.register(connectionsMaterializer);
+    // F9 — idle I/O floor (docs/plans/2026-08-15-foundation-program.md).
+    // BROWSER_TIMELINE_OBSERVED is a `HANDLES`-classified, `urgent: true`
+    // event inside connectionsMaterializer.ts (off limits for edits): every
+    // occurrence forks a full reconcile child, bypassing the drain's own
+    // 30s minimum-interval floor, even when the observation is a repeat
+    // dwell ping on an already-known open tab carrying zero new graph
+    // content. ENGAGEMENT_INTERVAL_OBSERVED is already routed through that
+    // file's cheap content-lane-only path (never forks), but is deferred
+    // here too since batching it also reduces its own progress-write
+    // frequency. The gate sits OUTSIDE the protected file, at the runner
+    // registration boundary: it withholds these two "trickle" types from
+    // connectionsMaterializer.onAccepted (never dropping — see
+    // drainIdleGate.ts's header) until either a real content-bearing event
+    // arrives or SIDETRACK_DRAIN_IDLE_INTERVAL_MS elapses. The FIRST
+    // BROWSER_TIMELINE_OBSERVED for a given canonicalUrl is exempted (see
+    // drainIdleGate.ts's "NOVELTY EXCEPTION") so a genuinely new page still
+    // surfaces promptly — only repeat pings on an already-observed URL are
+    // batched.
+    const connectionsDrainIdleGate: DrainIdleGate = createDrainIdleGate(connectionsMaterializer, {
+      trickleTypes: new Set([BROWSER_TIMELINE_OBSERVED, ENGAGEMENT_INTERVAL_OBSERVED]),
+      noveltyKeyForEvent: (event) => {
+        if (event.type !== BROWSER_TIMELINE_OBSERVED) return undefined;
+        const payload = event.payload as Record<string, unknown> | null;
+        const canonicalUrl = payload?.['canonicalUrl'];
+        if (typeof canonicalUrl === 'string' && canonicalUrl.length > 0) return canonicalUrl;
+        const url = payload?.['url'];
+        return typeof url === 'string' && url.length > 0 ? url : undefined;
+      },
+    });
+    teardown.push(connectionsDrainIdleGate.teardown);
+    syncContractRunner.register(connectionsDrainIdleGate.materializer);
 
     // Prototype-lane offline generation (SIDETRACK_PROTOTYPE_GENERATION,
     // default ON — docs/plans/2026-08-16-category-flexibility-hyde.md §3).

@@ -18,6 +18,7 @@ import { loadOrCreateReplica } from '../replicaId.js';
 import { createTimelineStore } from '../../timeline/projection.js';
 import { createConnectionsMaterializer } from './connectionsMaterializer.js';
 import type { ReconcileWorkerResult } from './connectionsReconcileWorker.js';
+import { readOwnDiskIoRusage } from '../../process/procRusage.js';
 
 // Guard: this script is only meaningful when launched via `fork` —
 // IPC channel must be present. If somebody runs the .js directly this
@@ -67,10 +68,7 @@ try {
     const ffi = require('bun:ffi') as {
       dlopen: (
         lib: string,
-        symbols: Record<
-          string,
-          { readonly args: readonly number[]; readonly returns: number }
-        >,
+        symbols: Record<string, { readonly args: readonly number[]; readonly returns: number }>,
       ) => { symbols: Record<string, (...args: number[]) => number> };
       FFIType: { readonly i32: number };
     };
@@ -117,6 +115,22 @@ const postHeartbeat = (): void => {
   }
 };
 
+// F9 — idle I/O floor. A dead pid can no longer be queried via
+// proc_pid_rusage, so the ONLY place this child's own kernel disk-IO bytes
+// can be read is from inside the child, right before it exits. One syscall
+// (readOwnDiskIoRusage is Darwin-only + best-effort — see procRusage.ts);
+// the parent's stdout/stderr relay
+// (connectionsReconcileChildClient.ts) already prefixes every line from
+// this process with "[reconcile.child] ", so this line does not repeat
+// that tag itself.
+const emitSelfRusage = (): void => {
+  const sample = readOwnDiskIoRusage();
+  if (sample === null) return;
+  console.warn(
+    `ioRead=${String(sample.diskioBytesRead)} ioWrite=${String(sample.diskioBytesWritten)}`,
+  );
+};
+
 const run = async (msg: ReconcileMessage): Promise<void> => {
   if (typeof msg.vaultRoot !== 'string' || typeof msg.seq !== 'number') {
     post({ seq: -1, ok: false, error: 'invalid reconcile job payload' });
@@ -146,13 +160,6 @@ const run = async (msg: ReconcileMessage): Promise<void> => {
       store instanceof SqliteConnectionsStore
         ? await store.readSnapshotMetadata()
         : await store.readCurrent();
-    post({
-      seq: msg.seq,
-      ok: true,
-      ...(metadata?.snapshotRevision === undefined
-        ? {}
-        : { snapshotRevision: metadata.snapshotRevision }),
-    });
     // Close the store explicitly BEFORE process.exit — exit runs no cleanup, so
     // relying on abrupt OS teardown of the writer handle is fragile. The
     // child's writer handle is already closed at publish (pre-flip), so this is
@@ -162,9 +169,23 @@ const run = async (msg: ReconcileMessage): Promise<void> => {
     } catch {
       /* best-effort */
     }
+    // Emit the self-rusage line BEFORE the IPC result: the parent's
+    // settle() SIGTERMs this process the instant it receives the message
+    // below, racing this process's own stdout/stderr flush. Posting the
+    // result last (not first) gives the stderr write the best chance of
+    // reaching the parent's relay before teardown.
+    emitSelfRusage();
+    post({
+      seq: msg.seq,
+      ok: true,
+      ...(metadata?.snapshotRevision === undefined
+        ? {}
+        : { snapshotRevision: metadata.snapshotRevision }),
+    });
     process.exit(0);
   } catch (err) {
     clearInterval(heartbeat);
+    emitSelfRusage();
     post({
       seq: msg.seq,
       ok: false,
