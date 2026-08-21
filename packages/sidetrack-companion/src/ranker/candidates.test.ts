@@ -634,6 +634,134 @@ describe('ranker candidate generation', () => {
     ).toEqual([]);
   });
 
+  describe('learned aggregator serving flip (SIDETRACK_LEARNED_AGGREGATOR_SERVE, task #22)', () => {
+    const withLearnedServe = (value: string | undefined, run: () => void): void => {
+      const previous = process.env['SIDETRACK_LEARNED_AGGREGATOR_SERVE'];
+      if (value === undefined) delete process.env['SIDETRACK_LEARNED_AGGREGATOR_SERVE'];
+      else process.env['SIDETRACK_LEARNED_AGGREGATOR_SERVE'] = value;
+      try {
+        run();
+      } finally {
+        if (previous === undefined) delete process.env['SIDETRACK_LEARNED_AGGREGATOR_SERVE'];
+        else process.env['SIDETRACK_LEARNED_AGGREGATOR_SERVE'] = previous;
+      }
+    };
+
+    // A synthetic domain the REGISTRY has never heard of, with URL-population-
+    // shape hub evidence ONLY (no opener/previous edges at all — every visit
+    // arrives "cold", the same shape a real bookmark/external-link visit to
+    // github.com/reddit.com/chatgpt.com/claude.ai takes; see
+    // learnedAggregatorStats.ts's signal (a)). This is exactly the blind spot
+    // task #22 closes: a domain the registry can't protect and the OLD
+    // opener-chain-only learned classifier couldn't see either.
+    const POP_HUB_DOMAIN = 'population-hub.test';
+    const popHubUrl = (path: string): string => `https://${POP_HUB_DOMAIN}${path}`;
+
+    const popHubEvents = (): AcceptedEvent[] => {
+      const events: AcceptedEvent[] = [];
+      let seq = 1;
+      // >= MIN_DEEP_SINGLE_VISIT_URLS_FOR_HUB (8) distinct deep (2-segment)
+      // paths, each visited exactly once, no opener/previous edge.
+      for (let index = 0; index < 8; index += 1) {
+        events.push(
+          event({
+            seq,
+            type: BROWSER_TIMELINE_OBSERVED,
+            payload: timelinePayload({ url: popHubUrl(`/posts/item-${String(index)}`) }),
+          }),
+        );
+        seq += 1;
+      }
+      // >= MIN_SHALLOW_REVISITED_URLS_FOR_HUB (1) shallow (<=1-segment) path,
+      // revisited MIN_HUB_CANDIDATE_REVISITS (2) times.
+      events.push(
+        event({ seq, type: BROWSER_TIMELINE_OBSERVED, payload: timelinePayload({ url: popHubUrl('/home') }) }),
+      );
+      seq += 1;
+      events.push(
+        event({ seq, type: BROWSER_TIMELINE_OBSERVED, payload: timelinePayload({ url: popHubUrl('/home') }) }),
+      );
+      return events;
+    };
+
+    it('default ON: quarantines same_repo_or_domain + same_title_path_tokens for a population-shaped hub the registry has no profile for', () => {
+      const ctx = context(popHubEvents());
+      expect(isCoarseMultiTopicDomain(POP_HUB_DOMAIN)).toBe(false); // registry alone: unknown
+      expect(generateSameRepoOrDomainCandidates(popHubUrl('/posts/item-0'), ctx)).toEqual([]);
+      expect(generateSameTitlePathTokensCandidates(popHubUrl('/posts/item-0'), ctx)).toEqual([]);
+      // The shallow listing-shaped page is quarantined too — the flip
+      // consults the boolean is-aggregator (hub) signal only, not the
+      // feed/item sub-decision (see learnedAggregatorStats.ts's SERVING
+      // STATUS header note — that sub-decision stays registry-only).
+      expect(generateSameRepoOrDomainCandidates(popHubUrl('/home'), ctx)).toEqual([]);
+    });
+
+    it('kill switch (=0): restores bare-domain grouping for the same population-shaped hub — byte-identical to pre-task-#22 behavior', () => {
+      withLearnedServe('0', () => {
+        const ctx = context(popHubEvents());
+        // With the guard off, every URL on the domain groups by the bare
+        // `domain:` key — item-0 groups with the other 7 deep items plus
+        // /home (9 URLs on the domain, 8 other members).
+        const candidates = generateSameRepoOrDomainCandidates(popHubUrl('/posts/item-0'), ctx);
+        expect(candidates).toHaveLength(8);
+        expect(candidates.every((candidate) => candidate.sources.length === 1 && candidate.sources[0] === 'same_repo_or_domain')).toBe(true);
+        expect(candidates.some((candidate) => candidate.toVisitId === popHubUrl('/home'))).toBe(true);
+      });
+    });
+
+    it('a domain with too little population evidence (below MIN_DEEP_SINGLE_VISIT_URLS_FOR_HUB) still groups by bare domain — the gate is not over-eager', () => {
+      // Only 2 distinct deep-path visits, well under the 8-URL population
+      // bar and with no shallow-revisit page at all — personal-notes shaped,
+      // not hub-shaped. Must NOT be quarantined by either classifier.
+      const ctx = context([
+        event({
+          seq: 1,
+          type: BROWSER_TIMELINE_OBSERVED,
+          payload: timelinePayload({ url: 'https://personal-notes.test/posts/one' }),
+        }),
+        event({
+          seq: 3,
+          type: BROWSER_TIMELINE_OBSERVED,
+          payload: timelinePayload({ url: 'https://personal-notes.test/posts/two' }),
+        }),
+      ]);
+      expectSingleSourceCandidate(
+        generateSameRepoOrDomainCandidates,
+        'same_repo_or_domain',
+        'https://personal-notes.test/posts/one',
+        'https://personal-notes.test/posts/two',
+        ctx,
+      );
+    });
+
+    it('ADDITIVE ONLY: a registry-covered domain (Hacker News) is suppressed identically whether the flag is on or off', () => {
+      const ctx = context([
+        event({
+          seq: 1,
+          type: NAVIGATION_COMMITTED,
+          payload: navigationPayload({
+            visitId: 'visit-a',
+            canonicalUrl: 'https://news.ycombinator.com/item?id=48856904',
+          }),
+        }),
+        event({
+          seq: 3,
+          type: NAVIGATION_COMMITTED,
+          payload: navigationPayload({
+            visitId: 'visit-b',
+            canonicalUrl: 'https://news.ycombinator.com/item?id=48173708',
+          }),
+        }),
+      ]);
+      withLearnedServe(undefined, () => {
+        expect(generateSameRepoOrDomainCandidates('visit-a', context(ctx.merged))).toEqual([]);
+      });
+      withLearnedServe('0', () => {
+        expect(generateSameRepoOrDomainCandidates('visit-a', context(ctx.merged))).toEqual([]);
+      });
+    });
+  });
+
   describe('aggregator item-signals narrowing (SIDETRACK_AGGREGATOR_ITEM_SIGNALS)', () => {
     const withItemSignals = (value: string | undefined, run: () => void): void => {
       const previous = process.env['SIDETRACK_AGGREGATOR_ITEM_SIGNALS'];

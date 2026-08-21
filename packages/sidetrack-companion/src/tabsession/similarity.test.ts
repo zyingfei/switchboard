@@ -6,6 +6,8 @@ import type {
   ConnectionNode,
   ConnectionsSnapshot,
 } from '../connections/types.js';
+import type { AcceptedEvent } from '../sync/causal.js';
+import { BROWSER_TIMELINE_OBSERVED } from '../timeline/events.js';
 import { fuseCandidates, type CandidateEvidence } from './fusion.js';
 import { decideAttribution } from './policy.js';
 import { buildSimilarityEvidence } from './similarity.js';
@@ -295,5 +297,110 @@ describe('aggregator resolver — acceptance (reads the served decision)', () =>
       // corroborationCount 1 (lone), no PPR/cluster → not auto-apply.
       expect(decisionFor(snap, GENUINE_LINUX_ITEM).action).not.toBe('auto-apply');
     });
+  });
+});
+
+// Task #22 — the learned classifier's is-aggregator signal, consulted
+// alongside the registry (see learnedAggregatorStats.ts's SERVING STATUS
+// header and candidates.ts's isAggregatorHostFor for the OR-combine
+// contract this module mirrors). Uses the SAME 2026-07-10 false-friend
+// SHAPE as the REGRESSION tests above (a chrome-only resemblance edge
+// between two same-domain pages), but on a domain the REGISTRY has never
+// heard of — proving the flip closes the blind spot for exactly the class
+// of bug this file's other tests guard against, not merely a diagnostic
+// number.
+describe('learned aggregator serving flip (SIDETRACK_LEARNED_AGGREGATOR_SERVE, task #22)', () => {
+  const withLearnedServe = (value: string | undefined, run: () => void): void => {
+    const previous = process.env['SIDETRACK_LEARNED_AGGREGATOR_SERVE'];
+    if (value === undefined) delete process.env['SIDETRACK_LEARNED_AGGREGATOR_SERVE'];
+    else process.env['SIDETRACK_LEARNED_AGGREGATOR_SERVE'] = value;
+    try {
+      run();
+    } finally {
+      if (previous === undefined) delete process.env['SIDETRACK_LEARNED_AGGREGATOR_SERVE'];
+      else process.env['SIDETRACK_LEARNED_AGGREGATOR_SERVE'] = previous;
+    }
+  };
+
+  const POP_HUB_DOMAIN = 'population-hub.test';
+  const popHubUrl = (path: string): string => `https://${POP_HUB_DOMAIN}${path}`;
+  const POP_ITEM_A = popHubUrl('/posts/item-a');
+  const POP_ITEM_B = popHubUrl('/posts/item-b');
+  const POP_WS = 'pop-hub-workstream';
+
+  // Simple timeline-only observation payload — no navigation/opener chain at
+  // all (the same "arrived via external link/bookmark" shape as a real
+  // github.com/reddit.com/chatgpt.com/claude.ai visit).
+  const timelineObserved = (url: string, seq: number): AcceptedEvent => ({
+    clientEventId: `evt-${String(seq)}`,
+    dot: { replicaId: 'replica-a', seq },
+    deps: {},
+    aggregateId: `agg-${String(seq)}`,
+    type: BROWSER_TIMELINE_OBSERVED,
+    acceptedAtMs: Date.parse('2026-05-07T10:00:00.000Z') + seq * 1_000,
+    payload: {
+      eventId: `timeline-${url}-${String(seq)}`,
+      observedAt: '2026-05-07T10:00:03.000Z',
+      url,
+      canonicalUrl: url,
+      provider: 'generic',
+      transition: 'activated',
+      payloadVersion: 1,
+    },
+  });
+
+  // Population-shape hub evidence (signal a): 8 distinct deep single-visit
+  // paths + 1 shallow path revisited twice — no opener/previous edges.
+  const popHubEvents = (): readonly AcceptedEvent[] => {
+    const events: AcceptedEvent[] = [];
+    let seq = 1;
+    for (let index = 0; index < 8; index += 1) {
+      events.push(timelineObserved(popHubUrl(`/posts/item-${String(index)}`), seq));
+      seq += 1;
+    }
+    events.push(timelineObserved(popHubUrl('/home'), seq));
+    seq += 1;
+    events.push(timelineObserved(popHubUrl('/home'), seq));
+    return events;
+  };
+
+  it('default ON: drops a chrome-only edge between two items on a population-shaped hub the registry has no profile for', () => {
+    const snap = snapshot(
+      [node(`${VISIT_PREFIX}${POP_ITEM_A}`), node(`${VISIT_PREFIX}${POP_ITEM_B}`)],
+      [chromeOnlyResemble(POP_ITEM_A, POP_ITEM_B), wsEdge(POP_ITEM_B, POP_WS)],
+    );
+    const evidence = buildSimilarityEvidence({
+      snapshot: snap,
+      targetVisitNodeIds: new Set([`${VISIT_PREFIX}${POP_ITEM_A}`]),
+      events: popHubEvents(),
+    });
+    expect(evidence.find((ev) => ev.workstreamId === POP_WS)).toBeUndefined();
+  });
+
+  it('kill switch (=0): the same chrome-only edge survives — registry has no profile, and consultation is off', () => {
+    withLearnedServe('0', () => {
+      const snap = snapshot(
+        [node(`${VISIT_PREFIX}${POP_ITEM_A}`), node(`${VISIT_PREFIX}${POP_ITEM_B}`)],
+        [chromeOnlyResemble(POP_ITEM_A, POP_ITEM_B), wsEdge(POP_ITEM_B, POP_WS)],
+      );
+      const evidence = buildSimilarityEvidence({
+        snapshot: snap,
+        targetVisitNodeIds: new Set([`${VISIT_PREFIX}${POP_ITEM_A}`]),
+        events: popHubEvents(),
+      });
+      expect(evidence.find((ev) => ev.workstreamId === POP_WS)).toBeDefined();
+    });
+  });
+
+  it('ADDITIVE ONLY: the registry-covered 2026-07-10 REGRESSION case is unaffected by the flag either way', () => {
+    const snap = snapshot(
+      [node(`${VISIT_PREFIX}${AI_VIDEO_ITEM}`), node(`${VISIT_PREFIX}${LINUX_SEC_ITEM}`)],
+      [chromeOnlyResemble(AI_VIDEO_ITEM, LINUX_SEC_ITEM), wsEdge(LINUX_SEC_ITEM, LINUX_WS)],
+    );
+    for (const flag of [undefined, '0'] as const) {
+      withLearnedServe(flag, () => {
+        expect(decisionFor(snap, AI_VIDEO_ITEM).action).toBe('inbox');
+      });
+    }
   });
 });

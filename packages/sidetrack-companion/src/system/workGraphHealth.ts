@@ -78,6 +78,12 @@ import {
 } from '../ranker/learnedAggregatorStats.js';
 import type { AggregatorPageType } from '../ranker/aggregatorProfiles.js';
 import { aggregatorObservationsFromEvents } from '../ranker/learnedAggregatorStatsEvents.js';
+// Keyword-concept-entropy join (task #22, signal b) — same "lightweight,
+// no recall/embedder graph" family as every other store this file opens
+// fresh per poll (e.g. createTopicRevisionStore below); best-effort per its
+// own header (a vault predating the gist-keywords feature simply yields no
+// enrichment, never an error).
+import { createAggregatorKeywordConceptLookup, withKeywordConceptIds } from '../ranker/learnedAggregatorKeywordJoin.js';
 import { NAVIGATION_COMMITTED } from '../navigation/events.js';
 import { BROWSER_TIMELINE_OBSERVED } from '../timeline/events.js';
 import type { AcceptedEvent } from '../sync/causal.js';
@@ -1702,19 +1708,41 @@ export const collectWorkGraphHealth = async ({
     WORKSTREAM_MEMBERSHIP_SET,
     WORKSTREAM_MEMBERSHIP_REMOVED,
   ]);
-  // Learned aggregator-stats SHADOW (observe-only; default ON via
+  // Learned aggregator-stats SHADOW diagnostic (default ON via
   // SIDETRACK_LEARNED_AGGREGATOR). Recomputed fresh from a BOUNDED typed
   // read every health poll (learnedAggregatorObservationEvents,
   // SIDETRACK_LEARNED_AGGREGATOR_WINDOW default 20,000/type) — no persisted
   // cross-poll cursor (that would live in connectionsMaterializer.ts's
   // drain, out of scope for a shadow this PR keeps out of the serving path;
-  // see docs/plans/2026-08-15-foundation-program.md's design note). Changes
-  // ZERO serving decisions: the registry (ranker/aggregatorProfiles.ts)
-  // keeps deciding both guards; this only measures agreement.
+  // see docs/plans/2026-08-15-foundation-program.md's design note). As of
+  // task #22 (2026-08-21) the IS-AGGREGATOR (hub) boundary this measures IS
+  // consulted at serving time too (candidates.ts / tabsession/similarity.ts,
+  // OR-combined with the registry, default ON via
+  // SIDETRACK_LEARNED_AGGREGATOR_SERVE) — this row stays the diagnostic that
+  // measures agreement, not a duplicate of the serving decision itself; the
+  // FEED-VS-ITEM sub-classification this row also reports stays
+  // registry-only at serving time (see learnedAggregatorStats.ts's SERVING
+  // STATUS header for why).
   let aggregatorShadowAgreement: AggregatorShadowAgreement | null = null;
   if (learnedAggregatorShadowEnabled()) {
     const aggregatorEvents = await learnedAggregatorObservationEvents(vaultRoot, eventLog);
-    const observations = aggregatorObservationsFromEvents(aggregatorEvents);
+    let observations = aggregatorObservationsFromEvents(aggregatorEvents);
+    // Best-effort keyword-concept-entropy join (signal b) — never lets a
+    // missing/errored keyword store fail this diagnostic; see
+    // learnedAggregatorKeywordJoin.ts's own "best-effort, never a hard
+    // dependency" note.
+    try {
+      const keywordLookup = await createAggregatorKeywordConceptLookup(vaultRoot);
+      try {
+        observations = withKeywordConceptIds(observations, keywordLookup);
+      } finally {
+        keywordLookup.close();
+      }
+    } catch {
+      // No keyword-index.db/keyword-concepts.db yet (vault predates the
+      // gist-keywords feature) or a transient open failure — proceed
+      // without the join, same as before this join existed.
+    }
     const aggregatorState = applyAggregatorObservations(
       createEmptyAggregatorStatsState(),
       observations,

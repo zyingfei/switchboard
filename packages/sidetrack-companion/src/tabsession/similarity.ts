@@ -3,6 +3,14 @@ import type { ClosestVisitRanker } from '../connections/snapshot.js';
 import { generateCandidates } from '../ranker/candidates.js';
 import { classifyAggregatorPage } from '../ranker/aggregatorProfiles.js';
 import { extractFeatures } from '../ranker/features.js';
+import {
+  applyAggregatorObservations,
+  createEmptyAggregatorStatsState,
+  isLearnedAggregatorHost,
+  learnedAggregatorServeEnabled,
+  type AggregatorStatsState,
+} from '../ranker/learnedAggregatorStats.js';
+import { aggregatorObservationsFromEvents } from '../ranker/learnedAggregatorStatsEvents.js';
 import type { Candidate } from '../ranker/types.js';
 import type { AcceptedEvent } from '../sync/causal.js';
 
@@ -56,10 +64,11 @@ const urlWithinNodeId = (nodeIdOrUrl: string): string | null => {
   return match ? match[0] : null;
 };
 
-// True when the visit is ANY aggregator page (feed OR item), ignoring the
-// item-narrowing. Both chrome-only drops (the freshly-generated
-// embedding_neighborhood candidate drop AND the persisted-edge drop) key off
-// this predicate, NOT a guarded/narrowed one:
+// True when the visit is ANY aggregator page (feed OR item) per the
+// REGISTRY, ignoring the item-narrowing. Both chrome-only drops (the
+// freshly-generated embedding_neighborhood candidate drop AND the
+// persisted-edge drop) key off the combined predicate built below, NOT a
+// guarded/narrowed one:
 //
 //   - `embedding_neighborhood` candidates are generated DIRECTLY from persisted
 //     `visit_resembles_visit` edges (candidates.ts embeddingNeighborhoodGenerator),
@@ -75,10 +84,37 @@ const urlWithinNodeId = (nodeIdOrUrl: string): string | null => {
 // of these drops buys nothing legitimate while it would resurrect the
 // 2026-07-10 false-friend at scale (a narrowed item target is unguarded, so a
 // guarded-predicate gate short-circuits and lets every raw neighbor through).
-const isAnyAggregatorVisit = (nodeIdOrUrl: string): boolean => {
+const isRegistryAggregatorVisit = (nodeIdOrUrl: string): boolean => {
   const url = urlWithinNodeId(nodeIdOrUrl);
   if (url === null) return false;
   return classifyAggregatorPage(url) !== 'not-aggregator';
+};
+
+// Combined (registry OR learned) any-aggregator predicate — task #22's
+// serving flip, mirrors candidates.ts's isAggregatorHostFor. ADDITIVE ONLY:
+// a hostname is an aggregator if EITHER classifier says so, so this can
+// only gain chrome-only-edge suppression the registry didn't have, never
+// lose suppression the registry already provides. Built once per
+// buildSimilarityEvidence call (not per node — see its call site) from the
+// SAME `events` array `context` below is already built from, so this adds
+// one more O(events) fold alongside the one generateCandidates already
+// pays per call, not a new order of magnitude. Falls back to the pure
+// registry predicate when the kill switch (SIDETRACK_LEARNED_AGGREGATOR_
+// SERVE=0) is off — byte-identical to pre-task-#22 behavior.
+const isAnyAggregatorVisitFor = (
+  learnedState: AggregatorStatsState | null,
+): ((nodeIdOrUrl: string) => boolean) => {
+  if (learnedState === null) return isRegistryAggregatorVisit;
+  return (nodeIdOrUrl: string): boolean => {
+    if (isRegistryAggregatorVisit(nodeIdOrUrl)) return true;
+    const url = urlWithinNodeId(nodeIdOrUrl);
+    if (url === null) return false;
+    try {
+      return isLearnedAggregatorHost(learnedState, new URL(url).hostname);
+    } catch {
+      return false;
+    }
+  };
 };
 
 // A persisted similarity edge whose signal is chrome only: a
@@ -182,13 +218,23 @@ export const buildSimilarityEvidence = ({
       canonicalVisitForNode(snapshot, targetVisitNodeId),
     ),
   );
+  // Task #22 serving flip — build the learned classifier's state ONCE per
+  // call (not per node checked below) from the same `events` this call
+  // already has, OR-combined with the registry (see isAnyAggregatorVisitFor).
+  const learnedAggregatorState = learnedAggregatorServeEnabled()
+    ? applyAggregatorObservations(
+        createEmptyAggregatorStatsState(),
+        aggregatorObservationsFromEvents(events),
+      )
+    : null;
+  const isAnyAggregatorVisit = isAnyAggregatorVisitFor(learnedAggregatorState);
   // Any-aggregator (feed OR item) target: BOTH chrome-only drops below stay in
   // force between two aggregator pages regardless of item-narrowing. An item
   // page is a content object, but its chrome-derived signals (raw embedding
   // neighborhood, title-only resemblance) are still site-skeleton false-friends
   // — its legitimate similarity flows through the content channels, which are
-  // never dropped. See isAnyAggregatorVisit for why this is not gated on the
-  // narrowed predicate.
+  // never dropped. See isAnyAggregatorVisitFor for why this is not gated on
+  // the narrowed predicate.
   const targetIsAnyAggregator = [...canonicalTargetVisitNodeIds].some(isAnyAggregatorVisit);
   const visitWorkstream = new Map<string, string>();
   for (const edge of snapshot.edges) {
