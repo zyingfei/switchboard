@@ -179,15 +179,21 @@
 // See docs/plans/2026-08-15-foundation-program.md's 2026-08-21 "FEED-VS-ITEM
 // v2 (task #23)" landing note for the full before/after table.
 //
-// 2026-08-21 FOLLOW-UP (this task) — reachedFromHub edge-quality gating (see
-// that section below for the full diagnosis/fix). Closed google.com's
-// dangerous-direction reachedFromHub residual 160->2 (98.75%) with zero
-// regression on the four named domains above. Still NOT enough to flip the
-// decision: google.com's SEPARATE, untouched deep-path residual (53, PR
-// #406/#410's signal) plus openai.com/x.com's own large, unrelated dangerous
-// counts keep the net dangerous-direction total well above ≈0 (overall
-// feed->item 355->187 on this task's own re-measurement — a large
-// improvement, not a close of the gap) — feed-vs-item stays registry-only.
+// 2026-08-21 FOLLOW-UP (this task, fix/reached-from-hub, composed on top of
+// PR #410 above) — reachedFromHub edge-quality gating (see that section
+// below for the full diagnosis/fix). Measured against PR #410's own merged
+// baseline (google.com feed->item 208, matching #410's own reported number):
+// closed google.com's dangerous-direction reachedFromHub-caused residual
+// 160->2 (98.75%), google.com's overall dangerous count 208->50 (76.0%),
+// with ZERO regression on the four named domains above (github.com/
+// chatgpt.com/reddit.com/claude.ai unchanged or slightly improved) and a
+// bonus improvement on ycombinator.com (21->12). Still NOT enough to flip the
+// decision: google.com's SEPARATE, untouched deep-path residual (48, PR
+// #406/#410's signal, itself unaffected by this task) plus openai.com/x.com's
+// own large, unrelated dangerous counts keep the net dangerous-direction
+// total well above ≈0 (overall feed->item 376->208 on this task's own
+// re-measurement — a large improvement, not a close of the gap) —
+// feed-vs-item stays registry-only.
 //
 // COLD-START RULE (binding). Any URL or domain this module has not seen
 // enough evidence for defaults to the CONSERVATIVE / quarantining answer —
@@ -484,13 +490,15 @@ export const LOW_KEYWORD_ENTROPY_VETO_BITS = 0.5;
 // multi-purpose-app-shell shape as www.google.com (many heterogeneous
 // same-domain destinations, not one coherent listing), a named follow-up
 // FIX 2's single-segment-match veto does not yet generalize to. google.com's
-// DEEP-PATH-caused dangerous cases (accounts.google.com OAuth flow pages, 53
-// on this snapshot, unchanged before/after) are a SEPARATE signal (task
-// #22/#23, PR #406/#410) this task does not touch — google.com's overall
-// dangerous-direction count is 213 -> 55 (74.2%) net. See the landing note for
-// the full before/after table and the SIDETRACK_LEARNED_AGGREGATOR_SERVE
-// decision this residual drives (not extended to feed-vs-item: the deep-path
-// residual alone keeps the net dangerous-direction count well above ≈0).
+// DEEP-PATH-caused dangerous cases (accounts.google.com OAuth flow pages, 48
+// on this snapshot, unaffected by this task — PR #410's own vote/veto
+// machinery already narrowed it from 53) are a SEPARATE signal (task #22/#23,
+// PR #406/#410) this task does not touch — google.com's overall
+// dangerous-direction count is 208 -> 50 (76.0%) net, measured against PR
+// #410's own merged baseline. See the landing note for the full before/after
+// table and the SIDETRACK_LEARNED_AGGREGATOR_SERVE decision this residual
+// drives (not extended to feed-vs-item: the deep-path residual alone keeps
+// the net dangerous-direction count well above ≈0).
 
 export interface UrlAggregatorCounters {
   /** Distinct BROWSER_TIMELINE_OBSERVED captures that carried a title. */

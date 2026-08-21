@@ -56,6 +56,11 @@ const seedHubViaFanout = (state: AggregatorStatsState): void => {
       canonicalUrl: url(`/hub-leaf-${String(index)}`),
       observedAtMs: 3_000 + index,
       openerCanonicalUrl: url('/feed-hub-1'),
+      // A genuine hyperlink click on the hub page — reachedFromHub's
+      // edge-quality gate (2026-08-21, fix/reached-from-hub) only credits
+      // transitionType='link' edges. See learnedAggregatorStats.ts's module
+      // header "reachedFromHub edge-quality gating" note.
+      reachedViaLinkClick: true,
     });
   }
   applyAggregatorObservations(state, observations);

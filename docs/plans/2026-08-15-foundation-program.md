@@ -1124,39 +1124,46 @@ header's "reachedFromHub edge-quality gating" note for full detail):**
    already survives redirect qualifiers unchanged (verified via a dedicated
    test), so no separate redirect handling was needed.
 
-**Before/after (same snapshot, real classifier code, `bun run scripts/
-measure-learned-aggregator-stats.ts`; dangerous = registry `feed` -> learned
-`item`, safe = registry `item` -> learned `feed`):**
+**Before/after, measured against PR #410's own MERGED baseline** (this branch
+was rebased onto `main` after #410 landed mid-task, per the task's own
+instruction; numbers below isolate this task's contribution on top of #410's
+already-shipped work, real classifier code, `bun run scripts/measure-
+learned-aggregator-stats.ts`, same fresh snapshot; dangerous = registry
+`feed` -> learned `item`, safe = registry `item` -> learned `feed`).
+google.com's before-column (208) matches PR #410's own reported number
+exactly, confirming this is the correct baseline:
 
 | domain | agreement before→after | dangerous before→after | safe before→after |
 |---|---|---|---|
-| **google.com** | 73.2%→92.1% | **213→55** (−74.2%) | 11→11 (unchanged) |
-| github.com (#410) | 95.2%→95.2% | 3→3 (unchanged) | 12→12 (unchanged) |
-| chatgpt.com (#410) | 40.0%→40.4% | 10→9 (slight improvement) | 155→155 (unchanged) |
-| reddit.com (#410) | 50.0%→50.0% | 4→4 (unchanged) | 15→15 (unchanged) |
-| claude.ai (#410) | 76.9%→76.9% | 0→0 (unchanged) | 3→3 (unchanged) |
-| x.com | 36.9%→36.9% | 65→65 (unchanged — policy-driven, out of scope) | 0→0 |
-| ycombinator.com | 79.1%→80.1% | 21→12 (improved) | 106→109 (+3, acceptable per cold-start rule) |
-| openai.com | 27.5%→27.5% | 37→37 (unchanged — separate signal, out of scope) | 0→0 |
+| **google.com** | 74.8%→93.7% | **208→50** (−76.0%) | 3→3 (unchanged) |
+| github.com (#410) | 97.8%→97.8% | 3→3 (unchanged) | 4→4 (unchanged) |
+| chatgpt.com (#410) | 86.9%→86.9% | 12→11 (slight improvement) | 24→25 (+1, negligible) |
+| reddit.com (#410) | 86.8%→86.8% | 4→4 (unchanged) | 1→1 (unchanged) |
+| claude.ai (#410) | 84.6%→84.6% | 2→2 (unchanged) | 0→0 (unchanged) |
+| x.com | 19.4%→19.4% | 83→83 (unchanged — policy-driven, out of scope) | 0→0 |
+| ycombinator.com | 79.3%→80.3% | 21→12 (improved) | 105→108 (+3, acceptable per cold-start rule) |
+| openai.com | 19.6%→19.6% | 41→41 (unchanged — separate signal, out of scope) | 0→0 |
 | youtube.com | 20.4%→20.4% | 2→2 (unchanged) | 37→37 (unchanged) |
-| **overall (all domains)** | 72.0%→75.5% | 355→187 (−47.3%) | 339→342 |
+| **overall (all domains)** | 75.1%→78.5% | 376→208 (−44.7%) | 174→178 |
 
 Isolating `reachedFromHub`'s own contribution to google.com's dangerous
 count (vs. the untouched deep-path signal): **160→2 (−98.75%)**; google.com's
-DEEP-PATH-caused dangerous cases (accounts.google.com OAuth flow pages, 53)
-are a separate signal (PR #406/#410) this task does not touch, confirmed
-unchanged before/after. The four PR #410-named domains show zero regression
-(one shows a small improvement). The 2 residual `reachedFromHub` cases (a
-bare `gemini.google.com/app` landing with no conversation id, registry-
-non-item by design; and one search-pagination URL also reachable via
-mail.google.com — itself a second "multi-purpose app-shell" source the
-same-segment veto doesn't yet generalize to) are named, honest residuals.
+DEEP-PATH-caused dangerous cases (accounts.google.com OAuth flow pages, 48 on
+this snapshot — already narrowed from 53 by PR #410's own vote/veto
+machinery) are a separate signal (PR #406/#410) this task does not touch,
+confirmed unchanged before/after this task's own commit. The four PR
+#410-named domains show zero regression (one shows a small improvement). The
+2 residual `reachedFromHub` cases (a bare `gemini.google.com/app` landing
+with no conversation id, registry-non-item by design; and one
+search-pagination URL also reachable via mail.google.com — itself a second
+"multi-purpose app-shell" source the same-segment veto doesn't yet generalize
+to) are named, honest residuals.
 
 **Serve decision: NOT extended.** Per the task's own bar ("IF dangerous-
 direction learned-wrong ≈ 0 net: extend `SIDETRACK_LEARNED_AGGREGATOR_SERVE`
 to feed-vs-item with the OR-combined-conservative rule"): overall dangerous-
-direction fell sharply (355→187) but is not ≈0 — google.com's own untouched
-deep-path residual (53) plus openai.com (37) and x.com (65, a deliberate
+direction fell sharply (376→208) but is not ≈0 — google.com's own untouched
+deep-path residual (48) plus openai.com (41) and x.com (83, a deliberate
 registry POLICY override, not a content-stability fact — verified, not
 assumed) keep the net well above zero. `aggregatorProfiles.ts` is untouched;
 `SIDETRACK_LEARNED_AGGREGATOR_SERVE`'s existing IS-AGGREGATOR (hub) serving
@@ -1168,10 +1175,16 @@ gating positive/negative, cold-start-conservative omitted-field default,
 same-shape hub-to-hub veto with an HN-shaped non-regression case) and
 `learnedAggregatorStatsEvents.test.ts` (`reachedViaLinkClick` derivation from
 `transitionType`, all non-link transition types, a redirect-qualified link
-transition, and the no-edge omission case). No regression fixtures needed for
-PR #410's shipped behaviors (not yet merged onto this branch at task start;
-rebased before opening). Full `bun test`: 3991 pass / 0 fail / 8 skip (427
-files). `npm run build`: clean.
+transition, and the no-edge omission case). No new regression fixtures
+written for PR #410's own shipped behaviors — #410 merged mid-task (not yet
+merged onto this branch when the fix was developed); rebasing onto its merged
+`main` tip surfaced exactly one pre-existing #410 fixture
+(`learnedAggregatorDeepPathEvidence.test.ts`'s `seedHubViaFanout` helper) that
+needed the same `reachedViaLinkClick: true` field added to its own
+opener-chain fixture (its own comment already said "unaffected by this
+task" — restoring that intent, not weakening its coverage). Full `bun test`
+on the final rebased branch: 4012 pass / 0 fail / 8 skip (429 files).
+`npm run build`: clean.
 
 Does not touch `src/sync/contract/connectionsMaterializer.ts`. No live
 companion restarted (SQLite-backup snapshot of `~/.sidetrack-vault-test`
