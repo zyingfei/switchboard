@@ -1,8 +1,8 @@
-import { mkdtemp, readFile, rename, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, readFile, rename, rm, stat, unlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { createSimilarityHnswStore } from './visitSimilarityHnsw.js';
 
@@ -223,5 +223,230 @@ describe('SimilarityHnswStore', () => {
 
     expect(results).toHaveLength(4);
     expect(results.map((row) => row.neighborVisitId)).not.toContain('vid-2');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Delta-gate (2026-08-21, F9 follow-up): persist() used to rewrite the whole
+// 89.43MB artifact on every graph-touching drain because `dirty` is set
+// unconditionally by insertOrUpdate/delete, even when the caller
+// (connectionsMaterializer.ts's buildHnswVisitSimilarity) redundantly
+// re-inserts already-unchanged embeddings for every carried-forward visit.
+// These tests exercise the content-signature gate added to persist() that
+// catches exactly that no-op case.
+// ---------------------------------------------------------------------------
+describe('persist() delta-gate (2026-08-21 F9 follow-up)', () => {
+  let vaultRoot: string;
+  let basePath: string;
+
+  beforeEach(async () => {
+    vaultRoot = await mkdtemp(join(tmpdir(), 'sidetrack-hnsw-gate-'));
+    basePath = join(vaultRoot, '_BAC', 'connections', 'visit-similarity-hnsw');
+  });
+
+  afterEach(async () => {
+    await rm(vaultRoot, { recursive: true, force: true });
+  });
+
+  const pointerVersion = async (): Promise<string> =>
+    (await readFile(`${basePath}.current`, 'utf8')).trim();
+
+  const pathExists = async (path: string): Promise<boolean> => {
+    try {
+      await stat(path);
+      return true;
+    } catch {
+      return false;
+    }
+  };
+
+  it('skips the rewrite when a redundant mutation reproduces already-published content', async () => {
+    const store = await createSimilarityHnswStore().ensureLoaded(vaultRoot, 8);
+    const vectors = randomUnitVectors(30, 8);
+    for (let i = 0; i < vectors.length; i += 1) {
+      await store.insertOrUpdate(`vid-${String(i)}`, vectors[i]!);
+    }
+    await store.persist();
+    expect(await pointerVersion()).toBe('v1');
+    expect(await pathExists(`${basePath}.v2.bin`)).toBe(false);
+
+    // Simulate the real-world root cause: the materializer's
+    // carryForwardSimilarity re-inserts every carried-forward visit's
+    // ALREADY-PUBLISHED embedding unconditionally, which sets `dirty` but
+    // changes nothing publishable.
+    for (let i = 0; i < vectors.length; i += 1) {
+      await store.insertOrUpdate(`vid-${String(i)}`, vectors[i]!);
+    }
+
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    await store.persist();
+
+    // Assert on the spy BEFORE mockRestore() -- restoring clears recorded
+    // call history (same semantics as Jest/vitest mockReset), so checking
+    // afterward would always report "not called" regardless of behavior.
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining('[hnsw.write] skipped'));
+    expect(warn).not.toHaveBeenCalledWith(expect.stringContaining('[hnsw.write] written'));
+    warn.mockRestore();
+
+    // No new version was minted -- the pointer, and every versioned file,
+    // stay exactly where the first persist() left them.
+    expect(await pointerVersion()).toBe('v1');
+    expect(await pathExists(`${basePath}.v2.bin`)).toBe(false);
+    expect(await pathExists(`${basePath}.v2.json`)).toBe(false);
+  });
+
+  it('writes a new version and correct content when an existing embedding actually changes', async () => {
+    const store = await createSimilarityHnswStore().ensureLoaded(vaultRoot, 4);
+    await store.insertOrUpdate('x', [1, 0, 0, 0]);
+    await store.insertOrUpdate('near-a', [0.99, 0.01, 0, 0]);
+    await store.insertOrUpdate('near-b', [0, 0.99, 0.01, 0]);
+    await store.persist();
+    expect(await pointerVersion()).toBe('v1');
+
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    // Re-embed 'x' with a genuinely different vector -- same visitId, same
+    // label, different content. The signature must NOT treat this as a
+    // no-op (an id/label-only signature would miss it).
+    await store.insertOrUpdate('x', [0, 1, 0, 0]);
+    await store.persist();
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining('[hnsw.write] written'));
+    warn.mockRestore();
+
+    expect(await pointerVersion()).toBe('v2');
+    expect(await pathExists(`${basePath}.v2.bin`)).toBe(true);
+
+    // Correctness: reopening reflects the new embedding and new neighbor
+    // ranking, not the stale one.
+    const reopened = await createSimilarityHnswStore().ensureLoaded(vaultRoot, 4);
+    expect(await reopened.embedding('x')).toEqual([0, 1, 0, 0]);
+    expect((await reopened.queryTopK('x', 1))[0]?.neighborVisitId).toBe('near-b');
+  });
+
+  it('writes a new version when a visit is added, even if all prior visits are unchanged', async () => {
+    const store = await createSimilarityHnswStore().ensureLoaded(vaultRoot, 4);
+    await store.insertOrUpdate('a', [1, 0, 0, 0]);
+    await store.insertOrUpdate('b', [0, 1, 0, 0]);
+    await store.persist();
+    expect(await pointerVersion()).toBe('v1');
+
+    // Redundant re-insert of the unchanged pair PLUS one genuinely new visit
+    // -- the shape of a real graph-touching drain that adds one visit.
+    await store.insertOrUpdate('a', [1, 0, 0, 0]);
+    await store.insertOrUpdate('b', [0, 1, 0, 0]);
+    await store.insertOrUpdate('c', [0, 0, 1, 0]);
+
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    await store.persist();
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining('[hnsw.write] written'));
+    warn.mockRestore();
+
+    expect(await pointerVersion()).toBe('v2');
+
+    const reopened = await createSimilarityHnswStore().ensureLoaded(vaultRoot, 4);
+    expect(await reopened.embedding('c')).toEqual([0, 0, 1, 0]);
+  });
+
+  it('writes a new version when a visit is deleted, even if remaining visits are unchanged', async () => {
+    const store = await createSimilarityHnswStore().ensureLoaded(vaultRoot, 4);
+    await store.insertOrUpdate('a', [1, 0, 0, 0]);
+    await store.insertOrUpdate('b', [0, 1, 0, 0]);
+    await store.persist();
+    expect(await pointerVersion()).toBe('v1');
+
+    await store.delete('b');
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    await store.persist();
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining('[hnsw.write] written'));
+    warn.mockRestore();
+
+    expect(await pointerVersion()).toBe('v2');
+
+    const reopened = await createSimilarityHnswStore().ensureLoaded(vaultRoot, 4);
+    expect(await reopened.embedding('b')).toBeNull();
+  });
+
+  it('crash-safety: a missing signature file forces a rewrite even when content is unchanged', async () => {
+    const store = await createSimilarityHnswStore().ensureLoaded(vaultRoot, 4);
+    await store.insertOrUpdate('a', [1, 0, 0, 0]);
+    await store.persist();
+    expect(await pointerVersion()).toBe('v1');
+    expect(await pathExists(`${basePath}.sig`)).toBe(true);
+
+    // Simulate a crash between "artifact fully published" and "signature
+    // written" (persist()'s own doc comment: the sig write is strictly the
+    // LAST step) by deleting the sig file that should have recorded v1's
+    // content.
+    await unlink(`${basePath}.sig`);
+
+    // A redundant, logically no-op mutation -- if the gate trusted a
+    // missing signature as "still matches", this would wrongly skip.
+    await store.insertOrUpdate('a', [1, 0, 0, 0]);
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    await store.persist();
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining('[hnsw.write] written'));
+    warn.mockRestore();
+
+    expect(await pointerVersion()).toBe('v2');
+    expect(await pathExists(`${basePath}.sig`)).toBe(true);
+  });
+
+  it('crash-safety: a stale/corrupt signature file forces a rewrite even when content is unchanged', async () => {
+    const store = await createSimilarityHnswStore().ensureLoaded(vaultRoot, 4);
+    await store.insertOrUpdate('a', [1, 0, 0, 0]);
+    await store.persist();
+    expect(await pointerVersion()).toBe('v1');
+
+    // Simulate a torn/partial write leaving garbage behind instead of a
+    // clean 64-hex-char sha256 digest.
+    await writeFile(`${basePath}.sig`, 'not-a-real-signature', 'utf8');
+
+    await store.insertOrUpdate('a', [1, 0, 0, 0]);
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    await store.persist();
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining('[hnsw.write] written'));
+    warn.mockRestore();
+
+    expect(await pointerVersion()).toBe('v2');
+  });
+
+  it('measured: skip rate for a realistic carry-forward drain on a mid-size corpus', async () => {
+    const CORPUS_SIZE = 500;
+    const store = await createSimilarityHnswStore().ensureLoaded(vaultRoot, 32);
+    const vectors = randomUnitVectors(CORPUS_SIZE, 32);
+    for (let i = 0; i < vectors.length; i += 1) {
+      await store.insertOrUpdate(`vid-${String(i)}`, vectors[i]!);
+    }
+    await store.persist();
+    const bytesOnDisk = (await stat(`${basePath}.v1.bin`)).size;
+
+    // Ten consecutive graph-touching drains, each re-inserting the FULL
+    // unchanged corpus (the real carryForwardSimilarity shape) plus zero net
+    // new content -- the exact steady-state pattern the F9 investigation
+    // measured as an unconditional 89.43MB rewrite per drain.
+    let skipped = 0;
+    let written = 0;
+    for (let round = 0; round < 10; round += 1) {
+      for (let i = 0; i < vectors.length; i += 1) {
+        await store.insertOrUpdate(`vid-${String(i)}`, vectors[i]!);
+      }
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+      await store.persist();
+      const calls = warn.mock.calls.map((call) => String(call[0]));
+      warn.mockRestore();
+      if (calls.some((line) => line.includes('[hnsw.write] skipped'))) skipped += 1;
+      if (calls.some((line) => line.includes('[hnsw.write] written'))) written += 1;
+    }
+
+    expect(skipped).toBe(10);
+    expect(written).toBe(0);
+    expect(await pointerVersion()).toBe('v1');
+    // Documents the measured saving for the landing note: 10 drains x the
+    // on-disk artifact size that would otherwise have been rewritten every
+    // single time.
+    // eslint-disable-next-line no-console
+    console.info(
+      `[measured] ${String(CORPUS_SIZE)}-vector corpus, 10 redundant carry-forward drains: ` +
+        `${String(skipped)}/10 skipped, 0 rewrites, ${String(bytesOnDisk)} bytes/rewrite avoided x10`,
+    );
   });
 });

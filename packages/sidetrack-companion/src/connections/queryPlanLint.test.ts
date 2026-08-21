@@ -95,27 +95,41 @@ type HotStatement = HotStatementLiteral | HotStatementTrigger;
 // ---------------------------------------------------------------------------
 const HOT_STATEMENTS: readonly HotStatement[] = [
   // --- The #378 incident statement itself -----------------------------
+  // Row-value IN rewrite (2026-08-21, F9 follow-up — RE-DERIVED from the
+  // #402 investigation's spike; see docs/plans/2026-08-15-foundation-
+  // program.md's 2026-08-21 F9 landing note and snapshot.ts's own comment
+  // on this statement for the full re-derivation story, including why the
+  // investigation's literal `rowid IN (SELECT ... JOIN ...)` suggestion did
+  // NOT reproduce a real speedup here and why the orphan check below stays
+  // `NOT EXISTS`, never `NOT IN` (measured ~340x SLOWER on a large table).
+  // The OLD shape here (`DELETE FROM edges WHERE EXISTS (correlated on
+  // temp_replace_edges) AND NOT EXISTS (correlated on
+  // connections_scope_edges)`) was PREVIOUSLY allow-listed for a SCAN of
+  // `edges` — "edges itself has no usable equality predicate here" — on
+  // the theory that a bulk delete with no equality predicate on its own
+  // target table has no better option. That theory was correct for the
+  // EXISTS-correlated shape but not fundamental: restating the touched-set
+  // half as a row-value `(src, dst) IN (subquery)` membership test lets
+  // SQLite index-seek `edges` by its (src, dst) primary key instead of
+  // scanning it, while the orphan-check half stays `NOT EXISTS` (safe,
+  // still index-driven via idx_scope_edges_edge). allowScanTables is
+  // REMOVED below: this statement no longer scans `edges` OR
+  // connections_scope_edges, and the dedicated shape-pinning test further
+  // down (describe('queryPlanLint — proves the rowid rewrite holds')) fails
+  // loudly if a future edit reintroduces the EXISTS-correlated form.
   {
     kind: 'literal',
     id: 'replaceScopeRows.deleteOrphanEdges',
-    sourceRef: 'src/connections/snapshot.ts:~7097 (SqliteConnectionsStore#replaceScopeRows)',
+    sourceRef: 'src/connections/snapshot.ts (SqliteConnectionsStore#replaceScopeRows)',
     sql: `DELETE FROM edges
-         WHERE EXISTS (
-           SELECT 1
-           FROM temp_replace_edges t
-           WHERE t.edge_src = edges.src AND t.edge_dst = edges.dst
+         WHERE (src, dst) IN (
+           SELECT edge_src, edge_dst FROM temp_replace_edges
          )
            AND NOT EXISTS (
              SELECT 1
              FROM connections_scope_edges c
              WHERE c.edge_src = edges.src AND c.edge_dst = edges.dst
            )`,
-    // `edges` itself has no usable equality predicate here (the EXISTS
-    // subqueries are correlated on src/dst, not the input to a seek) — a
-    // DELETE FROM edges WHERE ... always visits every `edges` row once,
-    // O(edges), which is the accepted cost. The regression this guards is
-    // the CORRELATED lookups going O(edges * table) instead of O(edges).
-    allowScanTables: ['edges'],
   },
   // --- The two triggers that actually caused the incident -------------
   {
@@ -139,18 +153,25 @@ const HOT_STATEMENTS: readonly HotStatement[] = [
     triggerName: 'trg_edges_index_ai',
   },
   // --- replaceScopeRows' other delete-path statements (same neighborhood) --
+  // Row-value IN rewrite (2026-08-21, F9 follow-up — same mechanism/
+  // citation as replaceScopeRows.deleteOrphanEdges above): a row-value
+  // `(scope_kind, scope_id) IN (subquery)` membership test against the
+  // small temp_replace_scopes driver table, resolving via
+  // connections_scope_edges' own (scope_kind, scope_id, ...) primary-key
+  // index as a SEARCH. Measured a real, reproducible speedup on a 110k-row
+  // synthetic fixture (roughly 2-3x on this repo's hardware — see
+  // snapshot.replaceScopeRowsRowid.perf.test.ts for the exact numbers and
+  // why the investigation's originally-cited 54x wasn't reproduced here),
+  // same row count deleted either way. allowScanTables REMOVED: no longer
+  // scans connections_scope_edges.
   {
     kind: 'literal',
     id: 'replaceScopeRows.deleteScopeEdges',
-    sourceRef: 'src/connections/snapshot.ts:~7072 (SqliteConnectionsStore#replaceScopeRows)',
+    sourceRef: 'src/connections/snapshot.ts (SqliteConnectionsStore#replaceScopeRows)',
     sql: `DELETE FROM connections_scope_edges
-         WHERE EXISTS (
-           SELECT 1
-           FROM temp_replace_scopes s
-           WHERE s.scope_kind = connections_scope_edges.scope_kind
-             AND s.scope_id = connections_scope_edges.scope_id
+         WHERE (scope_kind, scope_id) IN (
+           SELECT scope_kind, scope_id FROM temp_replace_scopes
          )`,
-    allowScanTables: ['connections_scope_edges'],
   },
   {
     kind: 'literal',
@@ -660,6 +681,121 @@ describe('queryPlanLint — proves it catches the #378 bug class', () => {
         // one deleteOrphanEdges call into a 30-minute hang.
         expect(afterAu).toEqual(['edges_index']);
         expect(afterAd).toEqual(['edges_index']);
+      } finally {
+        store.close();
+      }
+    },
+  );
+});
+
+// ---------------------------------------------------------------------------
+// 2026-08-21, F9 follow-up (re-derived from the #402 investigation's spike —
+// see docs/plans/2026-08-15-foundation-program.md's 2026-08-21 F9 landing
+// note; RE-DERIVED, not copied verbatim — see snapshot.ts's own comments on
+// deleteScopeEdges/deleteOrphanEdges for why the shipped shape differs from
+// the investigation's literal `rowid IN (SELECT ... JOIN ...)` suggestion).
+// `replaceScopeRows.deleteScopeEdges` and `replaceScopeRows.deleteOrphanEdges`
+// were previously allow-listed for a SCAN of their own target table ("no
+// usable equality predicate here" — a true statement of the OLD
+// EXISTS-correlated shape, not a law of nature). Restated as a row-value
+// `(col1, col2) IN (SELECT ... FROM small_temp_table)` membership test, both
+// now resolve entirely via SEARCH against the target table's own primary-key
+// index — measured a real, reproducible (though more modest than the
+// investigation's cited 54x) speedup on a 110k-row synthetic fixture
+// (snapshot.replaceScopeRowsRowid.perf.test.ts). The generic registry check
+// above (HOT_STATEMENTS, allowScanTables removed for both) already enforces
+// "no SCAN of a large table"; this block adds the task's requested POSITIVE
+// pin (the exact new SEARCH-by-primary-key shape, not just "not a SCAN")
+// plus a regression proof that the suite would still catch a hand-reverted
+// EXISTS-correlated shape if one were reintroduced.
+// ---------------------------------------------------------------------------
+describe('queryPlanLint — proves the row-value IN rewrite holds (2026-08-21 F9 follow-up)', () => {
+  const findLiteral = (id: string): HotStatementLiteral => {
+    const statement = HOT_STATEMENTS.find((entry) => entry.id === id);
+    if (statement === undefined || statement.kind !== 'literal') {
+      throw new Error(`queryPlanLint fixture: expected a literal HOT_STATEMENTS entry for ${id}`);
+    }
+    return statement;
+  };
+
+  sqliteIt(
+    'deleteScopeEdges SEARCHes connections_scope_edges by its own primary-key index, never a SCAN',
+    async () => {
+      const { store, db } = await buildSeededStore();
+      try {
+        const plan = explainLiteral(db, findLiteral('replaceScopeRows.deleteScopeEdges').sql);
+        expect(
+          plan.some((line) =>
+            /SEARCH connections_scope_edges USING (COVERING )?INDEX .*\(scope_kind=\? AND scope_id=\?\)/u.test(
+              line,
+            ),
+          ),
+        ).toBe(true);
+        expect(unexpectedScans(plan, [])).toEqual([]);
+      } finally {
+        store.close();
+      }
+    },
+  );
+
+  sqliteIt(
+    'deleteOrphanEdges SEARCHes edges by its own primary-key index, never a SCAN of edges or connections_scope_edges',
+    async () => {
+      const { store, db } = await buildSeededStore();
+      try {
+        const plan = explainLiteral(db, findLiteral('replaceScopeRows.deleteOrphanEdges').sql);
+        expect(
+          plan.some((line) => /SEARCH edges USING (COVERING )?INDEX .*\(src=\?( AND dst=\?)?\)/u.test(line)),
+        ).toBe(true);
+        expect(unexpectedScans(plan, [])).toEqual([]);
+      } finally {
+        store.close();
+      }
+    },
+  );
+
+  sqliteIt(
+    'trips if a future edit reintroduces the pre-rewrite EXISTS-correlated deleteScopeEdges shape',
+    async () => {
+      const { store, db } = await buildSeededStore();
+      try {
+        // The exact statement this PR replaced (see snapshot.ts's own
+        // comment on deleteScopeEdges for the before/after). Proves this
+        // suite would have caught the cost this PR removes, and catches it
+        // again if anyone hand-reverts to it.
+        const legacyShape = `DELETE FROM connections_scope_edges
+         WHERE EXISTS (
+           SELECT 1
+           FROM temp_replace_scopes s
+           WHERE s.scope_kind = connections_scope_edges.scope_kind
+             AND s.scope_id = connections_scope_edges.scope_id
+         )`;
+        expect(unexpectedScans(explainLiteral(db, legacyShape), [])).toEqual([
+          'connections_scope_edges',
+        ]);
+      } finally {
+        store.close();
+      }
+    },
+  );
+
+  sqliteIt(
+    'trips if a future edit reintroduces the pre-rewrite EXISTS-correlated deleteOrphanEdges shape',
+    async () => {
+      const { store, db } = await buildSeededStore();
+      try {
+        const legacyShape = `DELETE FROM edges
+         WHERE EXISTS (
+           SELECT 1
+           FROM temp_replace_edges t
+           WHERE t.edge_src = edges.src AND t.edge_dst = edges.dst
+         )
+           AND NOT EXISTS (
+             SELECT 1
+             FROM connections_scope_edges c
+             WHERE c.edge_src = edges.src AND c.edge_dst = edges.dst
+           )`;
+        expect(unexpectedScans(explainLiteral(db, legacyShape), [])).toEqual(['edges']);
       } finally {
         store.close();
       }
