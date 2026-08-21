@@ -179,6 +179,16 @@
 // See docs/plans/2026-08-15-foundation-program.md's 2026-08-21 "FEED-VS-ITEM
 // v2 (task #23)" landing note for the full before/after table.
 //
+// 2026-08-21 FOLLOW-UP (this task) — reachedFromHub edge-quality gating (see
+// that section below for the full diagnosis/fix). Closed google.com's
+// dangerous-direction reachedFromHub residual 160->2 (98.75%) with zero
+// regression on the four named domains above. Still NOT enough to flip the
+// decision: google.com's SEPARATE, untouched deep-path residual (53, PR
+// #406/#410's signal) plus openai.com/x.com's own large, unrelated dangerous
+// counts keep the net dangerous-direction total well above ≈0 (overall
+// feed->item 355->187 on this task's own re-measurement — a large
+// improvement, not a close of the gap) — feed-vs-item stays registry-only.
+//
 // COLD-START RULE (binding). Any URL or domain this module has not seen
 // enough evidence for defaults to the CONSERVATIVE / quarantining answer —
 // 'feed' for an unknown URL on a known hub domain, and 'not-aggregator' for
@@ -396,6 +406,92 @@ export const MIN_KEYWORD_CONCEPT_SAMPLES_FOR_VETO = 4;
 // whose few tagged pages share 1-2 concepts (near-total agreement).
 export const LOW_KEYWORD_ENTROPY_VETO_BITS = 0.5;
 
+// ---------------------------------------------------------------------------
+// reachedFromHub edge-quality gating (2026-08-21 — structural fix for the
+// google.com dangerous-direction blind spot named in PR #373/#406/#410's own
+// measurements: 208 feed->item disagreements attributed to this signal, the
+// largest single residual keeping feed-vs-item from replacement grade).
+//
+// ROOT CAUSE (diagnosed on a fresh real-vault snapshot, not assumed). The
+// original reachedFromHub check (below) treats ANY same-domain
+// opener/previous edge into a URL as "this page was launched from a hub's
+// displayed link" — PR #373's stated intent ("a same-domain page observed
+// launching many distinct items"). That assumption holds for
+// news.ycombinator.com (a front page whose story links a user clicks: 706/740
+// = 95.4% of its item-page-inbound edges carry Chrome's own
+// transitionType='link'), but NOT for www.google.com / mail.google.com /
+// similar "session-root" pages: they accumulate same-domain fan-out mostly
+// because they are the reused ENTRY POINT for hundreds of independent
+// browsing sessions (the search box, the inbox shell), each of which
+// launches exactly one new same-domain URL via a TYPED or GENERATED
+// navigation (an omnibox search / form submit), never a click on a link the
+// root page displayed. Measured: www.google.com/search's inbound edges are
+// 86% 'generated'+'form_submit' and only 13% 'link'; www.google.com itself
+// still clears MIN_HUB_FANOUT on raw edge count, so every search-results
+// page it "launched" (source outlinkTargets >= MIN_HUB_FANOUT, destination's
+// own outlinkTargets <= ITEM_MAX_OUTLINK_FANOUT) fell through to 'item' —
+// dangerous-direction, since a search-results page is exactly the
+// shared-chrome-links-two-unrelated-things false-friend this module's
+// cold-start rule exists to prevent.
+//
+// FIX 1 — LINK-TRANSITION GATING. reachedFromHub now only credits an edge
+// where the navigation's own transitionType was a genuine 'link' click (see
+// navigation/events.ts's NavigationTransitionType) — typed/generated/
+// form_submit/keyword/reload/auto_bookmark/etc. edges are same-domain
+// navigations, but not evidence the SOURCE PAGE displayed a link the user
+// clicked, which is what "reached from a hub" is supposed to mean. This is a
+// generic Chrome-navigation-taxonomy signal already captured on every
+// NAVIGATION_COMMITTED event (see AggregatorVisitObservation.
+// reachedViaLinkClick / learnedAggregatorStatsEvents.ts) — no domain list, no
+// per-site pattern. Measured on the real vault: cuts google.com's
+// reachedFromHub-caused dangerous-direction count from 160 to 6 (96.3%),
+// while leaving news.ycombinator.com's genuine reachedFromHub-item evidence
+// untouched (95.4% of its qualifying edges already carry transitionType
+// 'link', so the filter costs it almost nothing).
+//
+// FIX 2 — SAME-SHAPE HUB-TO-HUB VETO. Of the 6 residual cases after FIX 1,
+// most were search PAGINATION links (`&start=10`, `&start=20` — an actual
+// <a> tag Google renders, so FIX 1 alone can't catch them): a search-results
+// page (source) linking to ANOTHER search-results page (destination) of the
+// exact same shape. Reached-from-hub is vetoed when the qualifying source and
+// the destination share the exact same first-path-segment (firstPathSegmentOf
+// — the same generic URL-structure primitive signal (a) uses) — that is
+// same-domain, same-shape chaining (a listing page paginating into another
+// listing page), never a hub launching a distinct item. Verified safe against
+// the motivating HN case: a front page's first-path-segment ('' — the root)
+// never equals its items' ('item'), so this veto never fires there. A blanket
+// "destination is SHALLOW" veto was considered and REJECTED — HN's own items
+// live at `/item` (1 segment, SHALLOW by this module's own
+// SHALLOW_PATH_MAX_SEGMENTS bar), so a plain shallow-destination veto would
+// have deleted the exact signal PR #373 was built to capture. "Same
+// first-path-segment as the qualifying source" is the narrower, measurement-
+// verified structural discriminator that catches the pagination case without
+// that regression. Combined, FIX 1 + FIX 2 cut google.com's reachedFromHub-
+// caused dangerous count from 160 to 2 (98.75%) on the real vault.
+//
+// RESIDUAL (named, not fixed here — out of this task's scope, honest
+// accounting per the module's own decision bar). The 2 remaining google.com
+// reachedFromHub cases after both fixes are genuine 'link' clicks this
+// module's other signals can't yet distinguish from a real item: a bare
+// gemini.google.com/app landing without a conversation id (registry-covered
+// as non-item precisely because a bare /app has no id, see
+// aggregatorProfiles.ts), and one search-pagination link reachable from TWO
+// qualifying sources at once — a same-segment search page FIX 2 correctly
+// vetoes, AND separately mail.google.com/mail/u/0 (a Gmail-embedded search
+// link with a DIFFERENT first-path-segment, so FIX 2's same-segment check
+// doesn't apply to that edge) — reachedFromHub's `.some()` credits whichever
+// qualifying edge it finds first. mail.google.com is itself the SAME
+// multi-purpose-app-shell shape as www.google.com (many heterogeneous
+// same-domain destinations, not one coherent listing), a named follow-up
+// FIX 2's single-segment-match veto does not yet generalize to. google.com's
+// DEEP-PATH-caused dangerous cases (accounts.google.com OAuth flow pages, 53
+// on this snapshot, unchanged before/after) are a SEPARATE signal (task
+// #22/#23, PR #406/#410) this task does not touch — google.com's overall
+// dangerous-direction count is 213 -> 55 (74.2%) net. See the landing note for
+// the full before/after table and the SIDETRACK_LEARNED_AGGREGATOR_SERVE
+// decision this residual drives (not extended to feed-vs-item: the deep-path
+// residual alone keeps the net dangerous-direction count well above ≈0).
+
 export interface UrlAggregatorCounters {
   /** Distinct BROWSER_TIMELINE_OBSERVED captures that carried a title. */
   readonly captureCount: number;
@@ -409,6 +505,16 @@ export interface UrlAggregatorCounters {
   readonly outlinkObservationCount: number;
   /** Distinct URLs that opened/chained into this one (bounded). */
   readonly inboundSources: ReadonlySet<string>;
+  /** Subset of inboundSources whose edge into this URL carried Chrome's own
+   *  transitionType='link' (a genuine hyperlink click on the source page —
+   *  see navigation/events.ts's NavigationTransitionType) rather than a
+   *  typed/generated/form_submit/keyword/reload/etc. same-domain navigation.
+   *  Bounded, same cap as inboundSources (MAX_TRACKED_INBOUND_SOURCES). This
+   *  is the set reachedFromHub consults, not the full inboundSources — see
+   *  the module header's "reachedFromHub edge-quality gating" note (FIX 1)
+   *  for why: a same-domain edge alone is not evidence the source page
+   *  DISPLAYED a link the user clicked. */
+  readonly linkInboundSources: ReadonlySet<string>;
   readonly firstObservedAtMs: number;
   readonly lastObservedAtMs: number;
   /** Total observations of ANY kind folded for this URL (title-bearing or
@@ -537,6 +643,8 @@ interface MutableUrlCounters {
   outlinkTargets: Set<string>;
   outlinkObservationCount: number;
   inboundSources: Set<string>;
+  /** See UrlAggregatorCounters.linkInboundSources. */
+  linkInboundSources: Set<string>;
   firstObservedAtMs: number;
   lastObservedAtMs: number;
   /** Cached qualification result so domain aggregates can be updated on the
@@ -608,6 +716,7 @@ const freezeUrlCounters = (mutable: MutableUrlCounters): UrlAggregatorCounters =
   outlinkTargets: mutable.outlinkTargets,
   outlinkObservationCount: mutable.outlinkObservationCount,
   inboundSources: mutable.inboundSources,
+  linkInboundSources: mutable.linkInboundSources,
   firstObservedAtMs: mutable.firstObservedAtMs,
   lastObservedAtMs: mutable.lastObservedAtMs,
   observationCount: mutable.observationCount,
@@ -868,6 +977,7 @@ export class AggregatorStatsState {
       outlinkTargets: new Set(),
       outlinkObservationCount: 0,
       inboundSources: new Set(),
+      linkInboundSources: new Set(),
       firstObservedAtMs: observedAtMs,
       lastObservedAtMs: observedAtMs,
       countedAsHubCandidate: false,
@@ -974,7 +1084,12 @@ export class AggregatorStatsState {
     }
   }
 
-  private recordOutlink(sourceCanonicalUrl: string, targetCanonicalUrl: string, observedAtMs: number): void {
+  private recordOutlink(
+    sourceCanonicalUrl: string,
+    targetCanonicalUrl: string,
+    observedAtMs: number,
+    reachedViaLinkClick: boolean,
+  ): void {
     if (sourceCanonicalUrl === targetCanonicalUrl) return;
     const sourceHost = hostnameOf(sourceCanonicalUrl);
     const targetHost = hostnameOf(targetCanonicalUrl);
@@ -992,6 +1107,16 @@ export class AggregatorStatsState {
     }
     if (target.inboundSources.size < MAX_TRACKED_INBOUND_SOURCES) {
       target.inboundSources.add(sourceCanonicalUrl);
+    }
+    // See UrlAggregatorCounters.linkInboundSources / the module header's
+    // "reachedFromHub edge-quality gating" note (FIX 1) — only a genuine
+    // link-click edge counts toward the subset reachedFromHub consults.
+    // outlinkTargets/inboundSources (above) are left UNCHANGED by this —
+    // domain-level hub qualification (fanoutShaped, population shape) still
+    // sees every same-domain edge, matching this module's existing,
+    // separately-verified behavior for that signal.
+    if (reachedViaLinkClick && target.linkInboundSources.size < MAX_TRACKED_INBOUND_SOURCES) {
+      target.linkInboundSources.add(sourceCanonicalUrl);
     }
     this.refreshHubCandidacy(sourceCanonicalUrl, source);
   }
@@ -1127,11 +1252,26 @@ export class AggregatorStatsState {
       }
     }
 
+    // Cold-start-conservative: an observation that doesn't say how the
+    // navigation happened (reachedViaLinkClick omitted) is treated as NOT a
+    // link click — absence of evidence must never grant reachedFromHub
+    // credit (see the module header's FIX 1 note).
+    const reachedViaLinkClick = observation.reachedViaLinkClick === true;
     if (observation.openerCanonicalUrl !== undefined) {
-      this.recordOutlink(observation.openerCanonicalUrl, observation.canonicalUrl, observation.observedAtMs);
+      this.recordOutlink(
+        observation.openerCanonicalUrl,
+        observation.canonicalUrl,
+        observation.observedAtMs,
+        reachedViaLinkClick,
+      );
     }
     if (observation.previousCanonicalUrl !== undefined) {
-      this.recordOutlink(observation.previousCanonicalUrl, observation.canonicalUrl, observation.observedAtMs);
+      this.recordOutlink(
+        observation.previousCanonicalUrl,
+        observation.canonicalUrl,
+        observation.observedAtMs,
+        reachedViaLinkClick,
+      );
     }
 
     // See DomainAggregatorCounters.keywordConceptEntropyBits /
@@ -1171,6 +1311,16 @@ export interface AggregatorVisitObservation {
   readonly title?: string;
   readonly openerCanonicalUrl?: string;
   readonly previousCanonicalUrl?: string;
+  /** Was this navigation (whichever of openerCanonicalUrl/previousCanonicalUrl
+   *  is present) Chrome's own transitionType='link' — a genuine hyperlink
+   *  click on the source page — rather than typed/generated/form_submit/
+   *  keyword/reload/auto_bookmark/etc.? See the module header's
+   *  "reachedFromHub edge-quality gating" note (FIX 1) and
+   *  learnedAggregatorStatsEvents.ts for how this is derived from
+   *  NavigationCommittedPayload.transitionType. Omitted (or false) is the
+   *  conservative default — an observation that doesn't say how the
+   *  navigation happened never counts as a link click. */
+  readonly reachedViaLinkClick?: boolean;
   /** Concept ids (keywordConcepts.ts) for this page's gist keywords, when
    *  the keyword layer has processed it. Additive shadow input (2026-08-16,
    *  "gist keywords as sparse-data clustering features") — see
@@ -1304,13 +1454,24 @@ export const classifyLearnedAggregatorPage = (
 
   // Positive item evidence: reached from a same-domain hub page, and this
   // URL doesn't itself fan out much. Deliberately does not require a
-  // revisit — most real items are visited once.
+  // revisit — most real items are visited once. See the module header's
+  // "reachedFromHub edge-quality gating" note for the two structural fixes
+  // below (FIX 1: only a genuine link-click edge qualifies; FIX 2: same-shape
+  // same-domain chaining is vetoed) and the measurements behind them.
   const domain = registrableDomainOf(hostname);
-  const reachedFromHub = [...urlCounters.inboundSources].some((source) => {
+  const destinationFirstSegment = firstPathSegmentOf(canonicalUrl);
+  const reachedFromHub = [...urlCounters.linkInboundSources].some((source) => {
     const sourceHost = hostnameOf(source);
     if (sourceHost === null || registrableDomainOf(sourceHost) !== domain) return false;
     const sourceCounters = state.urlStats(source);
-    return sourceCounters !== undefined && sourceCounters.outlinkTargets.size >= MIN_HUB_FANOUT;
+    if (sourceCounters === undefined || sourceCounters.outlinkTargets.size < MIN_HUB_FANOUT) return false;
+    // FIX 2 — same-shape hub-to-hub veto: a qualifying source that shares
+    // this destination's exact first-path-segment is chaining into another
+    // page of the SAME shape (search-results pagination, listing-to-listing)
+    // — never a hub launching a distinct item. Never fires for the
+    // motivating HN case (root '' vs. item 'item' always differ).
+    if (firstPathSegmentOf(source) === destinationFirstSegment) return false;
+    return true;
   });
   if (reachedFromHub && urlCounters.outlinkTargets.size <= ITEM_MAX_OUTLINK_FANOUT) {
     return 'item';

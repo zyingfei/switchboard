@@ -48,11 +48,22 @@ export const aggregatorObservationsFromEvents = (
         event.payload.previousVisitId === null
           ? undefined
           : visitIdToCanonicalUrl.get(event.payload.previousVisitId);
+      // See learnedAggregatorStats.ts's "reachedFromHub edge-quality gating"
+      // module-header note (FIX 1) — Chrome's own transitionType='link' is
+      // the generic signal that this navigation was a genuine hyperlink
+      // click on the source page, as opposed to typed/generated/form_submit/
+      // keyword/reload/auto_bookmark/etc (a same-domain navigation with no
+      // relationship to a link the source page displayed). Only meaningful
+      // when an opener/previous edge is actually present above.
+      const reachedViaLinkClick = event.payload.transitionType === 'link';
       observations.push({
         canonicalUrl,
         observedAtMs: event.payload.commitTimestamp,
         ...(openerCanonicalUrl === undefined ? {} : { openerCanonicalUrl }),
         ...(previousCanonicalUrl === undefined ? {} : { previousCanonicalUrl }),
+        ...(openerCanonicalUrl === undefined && previousCanonicalUrl === undefined
+          ? {}
+          : { reachedViaLinkClick }),
       });
       continue;
     }

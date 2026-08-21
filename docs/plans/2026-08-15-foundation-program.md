@@ -1069,6 +1069,114 @@ none qualified in this task's `deps`/`target`/`hlc` audit).
 
 ## Landing notes (current state, dated)
 
+**2026-08-21 — reachedFromHub structural gating — dangerous-direction
+closure (fix/reached-from-hub).** Task: the pre-existing `reachedFromHub`
+signal in `ranker/learnedAggregatorStats.ts` (PR #373's original opener-chain
+fan-out heuristic, later joined by PR #406's opener-independent deep-path
+signal and PR #408/#410's title-churn/vote-machinery work) was named across
+three PRs as attributing 208-213 DANGEROUS-direction (feed classified item —
+the under-quarantine direction the module's binding COLD-START RULE forbids)
+disagreements to google.com alone, the largest single residual keeping
+feed-vs-item from replacement grade. PR #410 (concurrent, `feat/feed-item-
+signals-v2`) explicitly named this as out of its own scope and flagged it as
+a follow-up.
+
+**Root cause (diagnosed on a fresh SQLite-backup snapshot of the real test
+vault, `~/.sidetrack-vault-test`, 28,000 events / 4,698 distinct URLs — never
+opened live).** `reachedFromHub` treated ANY same-domain opener/previous
+navigation edge as "this page was launched from a hub's displayed link." That
+holds for news.ycombinator.com (95.4% of its real item-page inbound edges
+carry Chrome's own `transitionType='link'`), but not for www.google.com /
+mail.google.com: they accumulate same-domain fan-out mostly because they are
+reused ENTRY POINTS (the search box, the inbox shell) for hundreds of
+independent sessions, each launching one new same-domain URL via a TYPED or
+GENERATED navigation (86% of www.google.com/search's inbound edges are
+`generated`+`form_submit`, only 13% `link`) — never a click on a link the
+root page displayed. A smaller secondary pattern: a search-results page
+itself accumulates enough same-domain fan-out (via pagination / related-
+search links) to independently qualify as a "hub," so search-to-search
+pagination chaining (`&start=10`, `&start=20`) also fell through to 'item'.
+
+**Fix — two structural, no-domain-list gates on `reachedFromHub`, both
+measurement-verified, in `ranker/learnedAggregatorStats.ts` (see its module
+header's "reachedFromHub edge-quality gating" note for full detail):**
+1. **Link-transition gating.** `reachedFromHub` now only credits an edge
+   whose navigation carried Chrome's own `transitionType='link'` (a genuine
+   hyperlink click) — typed/generated/form_submit/keyword/reload/
+   auto_bookmark edges no longer qualify. Plumbed through as
+   `AggregatorVisitObservation.reachedViaLinkClick`, derived in
+   `learnedAggregatorStatsEvents.ts` from `NavigationCommittedPayload.
+   transitionType`; tracked as a new bounded `linkInboundSources` subset of
+   `inboundSources` (the existing fan-out/hub-qualification signal is
+   UNCHANGED — this only narrows what `reachedFromHub` itself consults).
+   Cold-start-conservative: an observation that omits the field is treated
+   as NOT a link click.
+2. **Same-shape hub-to-hub veto.** `reachedFromHub` is vetoed when the
+   qualifying source and the destination share the exact same
+   first-path-segment (`firstPathSegmentOf`, the same primitive signal (a)
+   uses) — same-domain, same-shape chaining (search-results page to another
+   search-results page), never a hub launching a distinct item. A blanket
+   "destination is SHALLOW" veto was considered and REJECTED with evidence:
+   HN's own items live at `/item` (1 segment, SHALLOW by this module's own
+   bar), so it would have deleted PR #373's original signal entirely.
+   Redirect-chain / opener-resolution mis-attribution (a third candidate
+   direction) was checked and ruled out as a distinct cause — `transitionType`
+   already survives redirect qualifiers unchanged (verified via a dedicated
+   test), so no separate redirect handling was needed.
+
+**Before/after (same snapshot, real classifier code, `bun run scripts/
+measure-learned-aggregator-stats.ts`; dangerous = registry `feed` -> learned
+`item`, safe = registry `item` -> learned `feed`):**
+
+| domain | agreement before→after | dangerous before→after | safe before→after |
+|---|---|---|---|
+| **google.com** | 73.2%→92.1% | **213→55** (−74.2%) | 11→11 (unchanged) |
+| github.com (#410) | 95.2%→95.2% | 3→3 (unchanged) | 12→12 (unchanged) |
+| chatgpt.com (#410) | 40.0%→40.4% | 10→9 (slight improvement) | 155→155 (unchanged) |
+| reddit.com (#410) | 50.0%→50.0% | 4→4 (unchanged) | 15→15 (unchanged) |
+| claude.ai (#410) | 76.9%→76.9% | 0→0 (unchanged) | 3→3 (unchanged) |
+| x.com | 36.9%→36.9% | 65→65 (unchanged — policy-driven, out of scope) | 0→0 |
+| ycombinator.com | 79.1%→80.1% | 21→12 (improved) | 106→109 (+3, acceptable per cold-start rule) |
+| openai.com | 27.5%→27.5% | 37→37 (unchanged — separate signal, out of scope) | 0→0 |
+| youtube.com | 20.4%→20.4% | 2→2 (unchanged) | 37→37 (unchanged) |
+| **overall (all domains)** | 72.0%→75.5% | 355→187 (−47.3%) | 339→342 |
+
+Isolating `reachedFromHub`'s own contribution to google.com's dangerous
+count (vs. the untouched deep-path signal): **160→2 (−98.75%)**; google.com's
+DEEP-PATH-caused dangerous cases (accounts.google.com OAuth flow pages, 53)
+are a separate signal (PR #406/#410) this task does not touch, confirmed
+unchanged before/after. The four PR #410-named domains show zero regression
+(one shows a small improvement). The 2 residual `reachedFromHub` cases (a
+bare `gemini.google.com/app` landing with no conversation id, registry-
+non-item by design; and one search-pagination URL also reachable via
+mail.google.com — itself a second "multi-purpose app-shell" source the
+same-segment veto doesn't yet generalize to) are named, honest residuals.
+
+**Serve decision: NOT extended.** Per the task's own bar ("IF dangerous-
+direction learned-wrong ≈ 0 net: extend `SIDETRACK_LEARNED_AGGREGATOR_SERVE`
+to feed-vs-item with the OR-combined-conservative rule"): overall dangerous-
+direction fell sharply (355→187) but is not ≈0 — google.com's own untouched
+deep-path residual (53) plus openai.com (37) and x.com (65, a deliberate
+registry POLICY override, not a content-stability fact — verified, not
+assumed) keep the net well above zero. `aggregatorProfiles.ts` is untouched;
+`SIDETRACK_LEARNED_AGGREGATOR_SERVE`'s existing IS-AGGREGATOR (hub) serving
+flip from task #22 is unaffected (this PR does not touch serving at all).
+Feed-vs-item stays registry-only, closer to replacement grade than before.
+
+**Tests.** New fixtures in `learnedAggregatorStats.test.ts` (link-transition
+gating positive/negative, cold-start-conservative omitted-field default,
+same-shape hub-to-hub veto with an HN-shaped non-regression case) and
+`learnedAggregatorStatsEvents.test.ts` (`reachedViaLinkClick` derivation from
+`transitionType`, all non-link transition types, a redirect-qualified link
+transition, and the no-edge omission case). No regression fixtures needed for
+PR #410's shipped behaviors (not yet merged onto this branch at task start;
+rebased before opening). Full `bun test`: 3991 pass / 0 fail / 8 skip (427
+files). `npm run build`: clean.
+
+Does not touch `src/sync/contract/connectionsMaterializer.ts`. No live
+companion restarted (SQLite-backup snapshot of `~/.sidetrack-vault-test`
+only, taken via `.backup`, never opened live).
+
 **2026-08-21 — F2 addendum: zero-row day re-discovery (empty-day seals with
 compaction provenance) (fix/seal-zero-day-rediscovery).** PR #407's
 verification found a gap in F2's own sealer: `runEventSealPass`

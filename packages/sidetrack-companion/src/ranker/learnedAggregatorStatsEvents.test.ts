@@ -28,6 +28,8 @@ const navigationPayload = (input: {
   readonly openerVisitId?: string | null;
   readonly previousVisitId?: string | null;
   readonly commitTimestamp?: number;
+  readonly transitionType?: string;
+  readonly transitionQualifiers?: readonly string[];
 }): unknown => ({
   payloadVersion: 1,
   visitId: input.visitId,
@@ -40,8 +42,8 @@ const navigationPayload = (input: {
   openerVisitId: input.openerVisitId ?? null,
   previousVisitId: input.previousVisitId ?? null,
   navigationSequence: 1,
-  transitionType: 'link',
-  transitionQualifiers: [],
+  transitionType: input.transitionType ?? 'link',
+  transitionQualifiers: input.transitionQualifiers ?? [],
   commitTimestamp: input.commitTimestamp ?? BASE_TIME + 3_000,
 });
 
@@ -125,6 +127,91 @@ describe('aggregatorObservationsFromEvents', () => {
       canonicalUrl: 'https://hub.test/b',
       previousCanonicalUrl: 'https://hub.test/a',
     });
+  });
+
+  it('derives reachedViaLinkClick=true from transitionType=link (reachedFromHub edge-quality gating, FIX 1)', () => {
+    const events: AcceptedEvent[] = [
+      event({
+        seq: 1,
+        type: NAVIGATION_COMMITTED,
+        payload: navigationPayload({ visitId: 'visit-hub', canonicalUrl: 'https://hub.test/feed-hub-1', commitTimestamp: BASE_TIME }),
+      }),
+      event({
+        seq: 2,
+        type: NAVIGATION_COMMITTED,
+        payload: navigationPayload({
+          visitId: 'visit-leaf',
+          canonicalUrl: 'https://hub.test/item-leaf-0',
+          openerVisitId: 'visit-hub',
+          transitionType: 'link',
+          commitTimestamp: BASE_TIME + 1_000,
+        }),
+      }),
+    ];
+    const observations = aggregatorObservationsFromEvents(events);
+    expect(observations[1]).toMatchObject({ reachedViaLinkClick: true });
+  });
+
+  it.each(['typed', 'generated', 'form_submit', 'keyword', 'keyword_generated', 'reload', 'auto_bookmark'])(
+    'derives reachedViaLinkClick=false from transitionType=%s (a same-domain navigation with no relationship to a link the source page displayed)',
+    (transitionType) => {
+      const events: AcceptedEvent[] = [
+        event({
+          seq: 1,
+          type: NAVIGATION_COMMITTED,
+          payload: navigationPayload({ visitId: 'visit-hub', canonicalUrl: 'https://hub.test/search', commitTimestamp: BASE_TIME }),
+        }),
+        event({
+          seq: 2,
+          type: NAVIGATION_COMMITTED,
+          payload: navigationPayload({
+            visitId: 'visit-leaf',
+            canonicalUrl: 'https://hub.test/search?q=x',
+            openerVisitId: 'visit-hub',
+            transitionType,
+            commitTimestamp: BASE_TIME + 1_000,
+          }),
+        }),
+      ];
+      const observations = aggregatorObservationsFromEvents(events);
+      expect(observations[1]).toMatchObject({ reachedViaLinkClick: false });
+    },
+  );
+
+  it('a redirect-qualified link transition still derives reachedViaLinkClick=true (transitionQualifiers do not affect the derivation, only transitionType)', () => {
+    const events: AcceptedEvent[] = [
+      event({
+        seq: 1,
+        type: NAVIGATION_COMMITTED,
+        payload: navigationPayload({ visitId: 'visit-hub', canonicalUrl: 'https://hub.test/feed-hub-1', commitTimestamp: BASE_TIME }),
+      }),
+      event({
+        seq: 2,
+        type: NAVIGATION_COMMITTED,
+        payload: navigationPayload({
+          visitId: 'visit-leaf',
+          canonicalUrl: 'https://hub.test/item-leaf-0',
+          openerVisitId: 'visit-hub',
+          transitionType: 'link',
+          transitionQualifiers: ['server_redirect'],
+          commitTimestamp: BASE_TIME + 1_000,
+        }),
+      }),
+    ];
+    const observations = aggregatorObservationsFromEvents(events);
+    expect(observations[1]).toMatchObject({ reachedViaLinkClick: true });
+  });
+
+  it('omits reachedViaLinkClick entirely when there is no opener/previous edge (BROWSER_TIMELINE_OBSERVED, or an edge-less NAVIGATION_COMMITTED)', () => {
+    const events: AcceptedEvent[] = [
+      event({
+        seq: 1,
+        type: NAVIGATION_COMMITTED,
+        payload: navigationPayload({ visitId: 'visit-root', canonicalUrl: 'https://hub.test/root', commitTimestamp: BASE_TIME }),
+      }),
+    ];
+    const observations = aggregatorObservationsFromEvents(events);
+    expect(observations[0]).not.toHaveProperty('reachedViaLinkClick');
   });
 
   it('yields an edge-less observation (safe under-count, never a false hub signal) when the opener commit is missing from the batch', () => {
