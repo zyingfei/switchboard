@@ -1069,6 +1069,201 @@ none qualified in this task's `deps`/`target`/`hlc` audit).
 
 ## Landing notes (current state, dated)
 
+**2026-08-21 — W5: topic production revival + parity instrumentation
+(fix/topic-production-revival).** Task #20 (W5) reported topics stuck at
+zero on both the live and test companions (`workGraphHealth.topicProducer
+.topicCount=0`, `activeRevision leiden-cpm`, `lineageCount=156`/`96`) since
+the banner-era topic-cadence freeze was removed. The task's working
+hypothesis was a latched drift breaker. That hypothesis was WRONG — the
+drift monitor (`connections/drift/driftMonitor.ts`) is purely observational
+(its own header: "never rebuilds topics or similarity; only reads the
+diagnostic numbers the materializer already computed") and holds no
+persisted state that gates production. `driftTripped=topicCount` is a
+correct SYMPTOM report, not a cause.
+
+**Actual root cause, confirmed against both real vaults' on-disk state**:
+`~/.sidetrack-vault/_BAC/connections/topics/current.json` and
+`~/.sidetrack-vault-test/_BAC/connections/topics/current.json` both hold a
+zero-topic active revision whose ENTIRE lineage is `kind: 'death'` entries
+(156 / 96 of them), all dated to a SINGLE timestamp — a one-shot collapse,
+not ongoing churn. `connectionsMaterializer.ts`'s served leiden-cpm build
+(`servedProducer === 'leiden-cpm'` branch) sources its visit list from
+`topicVisitsForBuild`, which — unless the pre-existing (default-OFF)
+`SIDETRACK_CONNECTIONS_TOPIC_FULL_TIMELINE` flag is set — is the CURRENT
+DRAIN'S OWN delta window only (`readMergedSince(appliedFrontier)` →
+`buildTimelineDays`), not the full corpus. `visitSimilarity` itself is
+already window-independent (the W1/M3 full-corpus lane), so a late signal
+(e.g. an `ENGAGEMENT_SESSION_AGGREGATED` that requalifies an old,
+previously-sub-gate visit) can change `visitSimilarity.revisionId` —
+tripping the topic cadence — without that visit's original timeline entry
+being part of THIS drain's window. `buildLeidenCpmTopicRevision` then runs
+against a near-empty (sometimes fully empty) visit list, and
+`assembleTopicRevisionFromGroups` marks every previously-active topic
+`'death'`. The result is written to the active slot UNCONDITIONALLY
+(`putActiveRevision`, no floor) — the served topic count wipes. Because
+`shouldRunTopicRevision` only re-attempts a rebuild when
+`visitSimilarityRevisionId` next changes, a mostly-idle vault (today's log:
+1489 `engagement.interval.observed` + 44 `engagement.session.aggregated` +
+4 `workstream.prototype.generated`, ZERO `browser.timeline.observed`) never
+retries — nothing in ordinary continued engagement (without a genuinely new
+page) re-arms the cadence, so the collapse is inert-forever, not latched.
+The incremental shadow (`SIDETRACK_TOPIC_INCREMENTAL_SHADOW`) does local
+refinement OFF the leiden candidate slot, so once that collapsed to empty
+the shadow had nothing to refine and stayed empty too (the "no-leiden-base"
+path) — confirmed on disk: `current.topic-revision_v4_incremental.shadow
+.json` on the test vault is `{topics: [], lineage: []}`.
+
+**Fix, entirely outside the protected `connectionsMaterializer.ts`** (new
+`connections/topicProductionRevival.ts`, same wrapper/bootstrap posture as
+the F9 idle-gate fix):
+1. `ensureTopicFullTimelineSourceDefault()` flips
+   `SIDETRACK_CONNECTIONS_TOPIC_FULL_TIMELINE`'s DEFAULT to `1` (still a
+   live kill-switch via `=0`) — seeded at process start in `runtime
+   /companion.ts`, `cli.ts`, and BOTH real per-drain writer entrypoints,
+   `connectionsReconcileChild.entry.ts` (the `SIDETRACK_CONNECTIONS_CHILD`
+   fork-per-drain default path) and `connectionsReconcileWorker.entry.ts`
+   — `companion.ts` itself is a read-only parent under the double-buffer
+   model, so the child/worker entrypoints are where this actually has to
+   land, not just the parent.
+2. `wrapTopicRevisionStoreForProduction()` wraps the injectable
+   `topicRevisionStore` dependency (already an optional seam in
+   `createConnectionsMaterializer`) with (a) a stateless collapse guard —
+   refuses to let a leiden-cpm write drop a populated active revision to
+   zero topics; keeps serving the last healthy revision and persists the
+   collapsed build via `putRevision` for audit only (no pointer flip); has
+   no latch to reset, so a subsequent healthy build self-heals on its own
+   — and (b) the parity instrument the task asked for: an audible
+   `[topic.cycle] producer=leiden|incremental topics=N members=M
+   churn=p50:X,p90:Y` mark on every write to the leiden active slot and the
+   incremental candidate-shadow slot, using the existing
+   `buildServedTopicProducerReport` churn math.
+
+**KNOWN LIMITATION, found during verification, not predicted**: the
+full-timeline re-derivation reads `deps.eventLog.readMerged()`, which walks
+`_BAC/log` only. F2 (hot-tail retirement, this same landing-notes section,
+merged the same day) moves retired days to `_BAC/retired/log/...` —
+absent, not erroring, from that read. So post-F2, "full timeline" here
+means "the full CURRENTLY-RETAINED timeline", not true full history; it
+closes the window-starvation bug but cannot resurrect topic membership
+whose only remaining record is the typed event-store mirror or sealed
+Parquet. This is exactly why the collapse guard is not redundant with the
+env default: it protects already-served topic knowledge (which may depend
+on retired history) from being wiped by an incomplete rebuild, independent
+of whether the rebuild's OWN input was complete. Sourcing the full-timeline
+read from the same typed/sealed path F3's migrated hot readers use would
+close this gap, but that edit lives inside the protected file — flagged as
+follow-up, not fixed here.
+
+**Verification — synthetic e2e (`connectionsMaterializer
+.topicProductionRevival.test.ts`)**: three tests against the real
+materializer (not mocks) reproduce the exact bug shape (a healthy 2-member
+leiden topic, then a late gate-crossing engagement requalify with no fresh
+timeline entry in that drain's window) — (1) unguarded + flag off: the
+existing bug reproduces byte-for-byte (topics wipe to 0, lineage all
+`death`); (2) unguarded + the env default applied: no collapse, the
+requalified visit is correctly folded in; (3) guarded + flag off: the
+collapse is attempted but suppressed, the healthy revision keeps serving,
+and a subsequent normal drain self-heals with zero manual reset. All three
+pass.
+
+**Verification — real vault copy** (`~/.sidetrack-vault-test`, full copy to
+a scratch dir, never touching the live/test companions per the task's
+read-only constraint): starting from the REAL broken on-disk state
+(`topics=0, lineage=156`), a 3-cycle incremental drain sequence (2 new
+pages, then a gate-crossing late-requalify of a 3rd, then a 4th brand-new
+page) was run once with the fix off and once with it on.
+- **Without the fix**: cycle 1 heals the broken state to 1 topic (3
+  members) — real activity resuming DOES self-heal when a drain's own
+  window happens to be non-empty — but cycle 2's window-poor requalify
+  collapses it right back to `topics=0, lineage=1`. The live symptom
+  reproduces on the real 19,912-node / 114,242-edge graph.
+- **With the fix**: cycle 1 → `topics=1 members=3`; cycle 2 (the
+  window-poor requalify) → `topics=1 members=4` (the late visit correctly
+  folded in, no collapse); cycle 3 (a brand-new page) → `topics=1
+  members=5`. No collapse across any cycle.
+- **Incremental-shadow parity, honestly reported**: across all 3 cycles on
+  this real-vault run, the incremental shadow stayed at `topics=0` while
+  leiden correctly grew 3→4→5 members. The shadow's own design (local
+  refinement of visits already known to an EXISTING leiden membership, per
+  its own in-file comment) means it structurally cannot independently
+  discover topics for visits that have never yet been a leiden member —
+  it needs leiden to seed structure first, then refines around it on a
+  LATER cycle. Parity does NOT hold in this immediate-post-revival window.
+
+**Flip decision: NOT flipped, for two independent reasons.** (1)
+Structural: `ServedTopicProducer` (`connections/servedTopicProducer.ts`)
+has no `'incremental'` member, and the dispatch that would serve it lives
+entirely inside the protected `connectionsMaterializer.ts` — wiring an
+actual serving flip is out of scope for this task regardless of what
+parity shows. (2) Empirical: the parity run above shows the incremental
+producer is not yet tracking the baseline at all right after a revival
+(0 vs 3-5 members) — even if the flip were wireable, shipping it now would
+regress topic coverage, not improve it. leiden-cpm remains the served
+producer; `SIDETRACK_TOPIC_INCREMENTAL_SHADOW` continues accumulating
+shadow-only churn evidence, now with an audible `[topic.cycle]` mark per
+cycle instead of silence.
+
+**Verification**: `bun test` — see PR for the exact tally (full suite run
+clean modulo one pre-existing, unrelated `recall-v2` sqlite-vec dimension
+flake — confirmed pre-existing via `git status` showing zero changes under
+`src/recall-v2/`). `bun run build` clean.
+
+**Files changed**: `connections/topicProductionRevival.ts` (new — the fix
++ parity instrument), `connections/topicProductionRevival.test.ts` (new —
+unit tests), `sync/contract/connectionsMaterializer
+.topicProductionRevival.test.ts` (new — e2e tests against the real
+materializer), `runtime/companion.ts`, `cli.ts`, `sync/contract
+/connectionsReconcileChild.entry.ts`, `sync/contract
+/connectionsReconcileWorker.entry.ts` (wiring only — inject the wrapped
+store at all 4 `createConnectionsMaterializer` call sites).
+`connectionsMaterializer.ts` untouched, per the task's binding constraint.
+**Superseded by the CI-caught addendum immediately below** — the version
+above described flipping `SIDETRACK_CONNECTIONS_TOPIC_FULL_TIMELINE`'s
+default via `ensureTopicFullTimelineSourceDefault()`; that half was
+reverted before merge. The collapse guard + parity marks (unaffected)
+remain the shipped fix.
+
+**2026-08-21 — W5 addendum: CI caught a real regression in the
+full-timeline default flip, reverted before merge (same PR,
+fix/topic-production-revival).** CI failed
+`connectionsMaterializer.contentLane.test.ts`'s "defers content-lane
+progress accepted during a graph drain without a backlog scan" (Stage 5.2
+W7 dirty-source-queue design: a content-lane-only drain must do zero extra
+full-log reads). The coordinator asked, correctly, whether this was
+flakiness or a real consequence of the default flip rather than accepting
+the first "passes in isolation" read as proof of flake. It was real,
+reproduced deterministically: `bun test src/runtime/companion.test.ts
+src/sync/contract/connectionsMaterializer.contentLane.test.ts` (in that
+order) fails every time; the content-lane file alone passes every time.
+Root cause, two compounding factors: (1)
+`ensureTopicFullTimelineSourceDefault()` mutated global `process.env` with
+no scoping/cleanup — any test that calls `startCompanion()` (many do)
+leaked the flag on for every subsequently-run test file sharing the same
+`bun test` process; (2) more fundamentally, `topicRecomputeImminent` inside
+the protected file is unconditionally true whenever `previousTopicRevision
+=== null` — i.e. on EVERY fresh materializer's first-ever drain, not only
+cadence-triggered topic rebuilds — so the flag being on adds a redundant
+`deps.eventLog.readMerged()` full-log read to every cold boot, exactly the
+class of read the W7 design forbids on a content-lane-only drain. There is
+no lever exposed from outside the protected file to scope the flag's
+effect to "cadence-triggered only" — the OR-with-null-previous-revision
+condition is internal to `topicRecomputeImminent`, so "scope the flag's
+effect" (the coordinator's suggested remedy) was not achievable without
+editing `connectionsMaterializer.ts`. **Fix: dropped the default flip
+entirely** (`ensureTopicFullTimelineSourceDefault` and its call sites at
+all 4 entrypoints removed) rather than attempting a narrower scope. The
+collapse guard alone already met the task's acceptance bar without it —
+proven by the e2e suite's own "backstop" test (guard on, flag off,
+default config: self-heals with no collapse) and the real-vault-copy
+validation above, neither of which depended on the flag. The flag remains
+available as a pre-existing, always-was-there manual escape hatch
+(`SIDETRACK_CONNECTIONS_TOPIC_FULL_TIMELINE=1`, unmanaged by this module)
+for an operator who consciously wants full-timeline recompute despite the
+extra read cost. Re-verified: the exact failing ordering
+(`companion.test.ts` then `contentLane.test.ts`) now passes (30 pass / 0
+fail, was 29 pass / 1 fail); full `bun test` and `bun run build` re-run
+clean.
+
 **2026-08-21 — task #22: opener-independent hub signals, learned aggregator
 to replacement grade on the IS-AGGREGATOR boundary
 (feat/aggregator-shadow-close).** Closes PR #373's named blind spot: three
