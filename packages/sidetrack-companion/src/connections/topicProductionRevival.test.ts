@@ -8,11 +8,7 @@ import {
   type TopicRevision,
   type TopicRevisionStore,
 } from '../producers/topic-revision.js';
-import {
-  TOPIC_FULL_TIMELINE_ENV,
-  ensureTopicFullTimelineSourceDefault,
-  wrapTopicRevisionStoreForProduction,
-} from './topicProductionRevival.js';
+import { wrapTopicRevisionStoreForProduction } from './topicProductionRevival.js';
 
 const revision = (
   revisionId: string,
@@ -82,33 +78,6 @@ const createMemoryStore = (initial?: {
     listRevisionIds: async () => [...revisions.keys()],
   };
 };
-
-describe('ensureTopicFullTimelineSourceDefault', () => {
-  it('seeds the env default to 1 when unset', () => {
-    const env: NodeJS.ProcessEnv = {};
-    ensureTopicFullTimelineSourceDefault(env);
-    expect(env[TOPIC_FULL_TIMELINE_ENV]).toBe('1');
-  });
-
-  it('never clobbers an explicit operator override, including the kill-switch 0', () => {
-    const env: NodeJS.ProcessEnv = { [TOPIC_FULL_TIMELINE_ENV]: '0' };
-    ensureTopicFullTimelineSourceDefault(env);
-    expect(env[TOPIC_FULL_TIMELINE_ENV]).toBe('0');
-  });
-
-  it('leaves an explicit 1 as-is (idempotent)', () => {
-    const env: NodeJS.ProcessEnv = { [TOPIC_FULL_TIMELINE_ENV]: '1' };
-    ensureTopicFullTimelineSourceDefault(env);
-    expect(env[TOPIC_FULL_TIMELINE_ENV]).toBe('1');
-  });
-
-  it('is idempotent across repeated calls on the same env object', () => {
-    const env: NodeJS.ProcessEnv = {};
-    ensureTopicFullTimelineSourceDefault(env);
-    ensureTopicFullTimelineSourceDefault(env);
-    expect(env[TOPIC_FULL_TIMELINE_ENV]).toBe('1');
-  });
-});
 
 describe('wrapTopicRevisionStoreForProduction — collapse guard', () => {
   it('suppresses a leiden-cpm write that wipes a populated active revision to zero topics', async () => {

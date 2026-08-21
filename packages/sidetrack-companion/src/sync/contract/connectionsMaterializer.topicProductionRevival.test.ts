@@ -9,14 +9,27 @@
 // this drain's window) drives `buildLeidenCpmTopicRevision` with an empty
 // visits list, wiping every existing topic to 'death'.
 //
-// Two things are exercised:
+// Three things are exercised:
 //   1. `SIDETRACK_CONNECTIONS_TOPIC_FULL_TIMELINE` (the pre-existing,
-//      previously-default-off remedy inside connectionsMaterializer.ts)
-//      genuinely prevents the collapse when set — proving the root-cause
+//      default-off remedy inside connectionsMaterializer.ts, set here by
+//      hand — NOT via a default flip, see below) genuinely prevents the
+//      collapse when an operator sets it — proving the root-cause
 //      diagnosis, not just patching a symptom.
-//   2. The collapse-guard wrapper (topicProductionRevival.ts) is an
-//      effective backstop even when that flag is left off — the served
-//      topic revision never regresses to zero once it was healthy.
+//   2. That flag's default is deliberately NOT flipped by
+//      topicProductionRevival.ts. An earlier version of this fix did flip
+//      it and CI caught a real regression before merge: `previousTopicRevision
+//      === null` (every fresh materializer's first drain, not just
+//      cadence-triggered topic rebuilds) also satisfies
+//      `topicRecomputeImminent` inside the protected file, so flipping the
+//      default added a redundant full `eventLog.readMerged()` call to
+//      EVERY cold boot — exactly the "backlog scan" W7's dirty-source-queue
+//      design (`connectionsMaterializer.contentLane.test.ts`) asserts never
+//      happens on a content-lane-only drain. See topicProductionRevival.ts's
+//      header for the full writeup.
+//   3. The collapse-guard wrapper (topicProductionRevival.ts) is an
+//      effective backstop even when that flag is left off (its shipped
+//      default) — the served topic revision never regresses to zero once
+//      it was healthy, and self-heals with no manual reset.
 
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -25,10 +38,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import { createConnectionsStore } from '../../connections/snapshot.js';
 import type { VisitSimilarityEmbedder } from '../../connections/visitSimilarity.js';
-import {
-  ensureTopicFullTimelineSourceDefault,
-  wrapTopicRevisionStoreForProduction,
-} from '../../connections/topicProductionRevival.js';
+import { wrapTopicRevisionStoreForProduction } from '../../connections/topicProductionRevival.js';
 import { RECALL_MODEL } from '../../recall/modelManifest.js';
 import { ENGAGEMENT_SESSION_AGGREGATED } from '../../engagement/events.js';
 import { BROWSER_TIMELINE_OBSERVED } from '../../timeline/events.js';
@@ -205,8 +215,9 @@ describe('connections materializer — W5 topic production revival (e2e)', () =>
     return { eventLog, m };
   };
 
-  it('WITHOUT the full-timeline fix, a window-poor cadence-due drain collapses the served topic to zero (reproduces the diagnosed bug)', async () => {
-    process.env['SIDETRACK_CONNECTIONS_TOPIC_FULL_TIMELINE'] = '0';
+  it('under DEFAULT config (unguarded store, full-timeline flag unset), a window-poor cadence-due drain collapses the served topic to zero (reproduces the diagnosed bug)', async () => {
+    // beforeEach already deletes SIDETRACK_CONNECTIONS_TOPIC_FULL_TIMELINE —
+    // this is the true shipped default, not an explicit override.
     const { eventLog, m } = await seedHealthyTopic({ guarded: false });
 
     // Drain 2 — a LATE engagement aggregate for charlie (already known from
@@ -229,9 +240,8 @@ describe('connections materializer — W5 topic production revival (e2e)', () =>
     expect(after!.lineage.every((l) => l.kind === 'death')).toBe(true);
   });
 
-  it('WITH the full-timeline default applied, the same window-poor cadence-due drain does NOT collapse — topics stay populated and pick up the requalified visit', async () => {
-    ensureTopicFullTimelineSourceDefault();
-    expect(process.env['SIDETRACK_CONNECTIONS_TOPIC_FULL_TIMELINE']).toBe('1');
+  it('WITH the full-timeline flag manually set by an operator, the same window-poor cadence-due drain does NOT collapse — topics stay populated and pick up the requalified visit (the flag is NOT defaulted on; this proves the escape hatch works, not that it ships enabled)', async () => {
+    process.env['SIDETRACK_CONNECTIONS_TOPIC_FULL_TIMELINE'] = '1';
     const { eventLog, m } = await seedHealthyTopic({ guarded: false });
 
     await eventLog.importPeerEvent(engagementAggregated({ seq: 10, key: 'charlie', focusedWindowMs: 8_000 }));
@@ -248,8 +258,9 @@ describe('connections materializer — W5 topic production revival (e2e)', () =>
     expect(m.health().status).toBe('healthy');
   });
 
-  it('with the flag left off but the collapse-guard store injected, the served topic revision never regresses to zero (backstop)', async () => {
-    process.env['SIDETRACK_CONNECTIONS_TOPIC_FULL_TIMELINE'] = '0';
+  it('under DEFAULT config (full-timeline flag unset) with the collapse-guard store injected — the shipped fix — the served topic revision never regresses to zero', async () => {
+    // beforeEach already deletes SIDETRACK_CONNECTIONS_TOPIC_FULL_TIMELINE —
+    // this is the true shipped default: guard on, full-timeline flag off.
     const { eventLog, m } = await seedHealthyTopic({ guarded: true });
 
     await eventLog.importPeerEvent(engagementAggregated({ seq: 10, key: 'charlie', focusedWindowMs: 8_000 }));

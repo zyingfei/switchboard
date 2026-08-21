@@ -29,37 +29,46 @@
 // revision with nothing to refine).
 //
 // `SIDETRACK_CONNECTIONS_TOPIC_FULL_TIMELINE` already exists inside the
-// protected file (connectionsMaterializer.ts) as the documented remedy — a
+// protected file (connectionsMaterializer.ts) as a documented remedy — a
 // cadence-due recompute re-derives the visit set from the FULL event log
-// instead of the drain-local window — but it defaults OFF, unlike its
+// instead of the drain-local window — and it defaults OFF, unlike its
 // similarity-layer sibling (`SIDETRACK_SIMILARITY_FULL_CORPUS`, default ON).
-// connectionsMaterializer.ts is off-limits for this task, so this module
-// flips the DEFAULT from outside it (same posture as drainIdleGate.ts's F9
-// fix: a wrapper/bootstrap seam, not an edit to the protected file). The
-// flag itself remains a live kill-switch — an operator can still force it
-// back off with `=0`.
 //
-// KNOWN LIMITATION (F2 interaction, docs/plans/2026-08-15-foundation-program.md
-// "F2 apply" landing note, merged 2026-08-21 — the same day this was
-// diagnosed): the full-timeline recompute reads `deps.eventLog.readMerged()`,
-// which walks `_BAC/log` only. A day retired by F2's hot-tail retirement
-// (`_BAC/log/<replica>/<day>.jsonl` moved to `_BAC/retired/log/...`) is
-// silently ABSENT from that read (eventLog.ts already tolerates a missing
-// day file — that's what makes F2 safe for every OTHER reader), not an
-// error. So on a vault with retired days, "full timeline" here means "the
-// full CURRENTLY-RETAINED timeline", not true full history — it fixes the
-// window-starvation bug (a drain's own delta being narrower than what's
-// still retained) but cannot resurrect topic membership for visits whose
-// only remaining record is the typed event-store mirror or the sealed
-// Parquet segment. This is exactly why the collapse guard below matters
-// independently: it protects ALREADY-SERVED topic knowledge (which may
-// depend on retired history no longer replayable through this path) from
-// being wiped by an incomplete rebuild, rather than trying to reconstruct
-// it. A real fix for the retired-day gap would source this read from the
-// same typed/sealed path F3's migrated hot readers use — that edit lives
-// inside the protected file and is out of scope here.
+// TRIED AND REVERTED, not shipped here: an earlier version of this module
+// flipped that flag's DEFAULT to on from outside the protected file (a
+// bootstrap seam, same posture as drainIdleGate.ts's F9 fix). CI caught a
+// real regression before merge, reproduced deterministically (NOT flaky —
+// `bun test src/runtime/companion.test.ts src/sync/contract
+// /connectionsMaterializer.contentLane.test.ts` fails every time in that
+// order, passes every time with the content-lane file alone):
+// `topicRecomputeImminent` inside the protected file is unconditionally
+// true whenever `previousTopicRevision === null` — i.e. on EVERY fresh
+// materializer's first-ever drain, not only cadence-triggered topic
+// rebuilds — so flipping the flag added a redundant, extra
+// `deps.eventLog.readMerged()` full-log read to every cold boot / every
+// freshly-constructed materializer instance. That is exactly the "backlog
+// scan" the W7 dirty-source-queue design (`connectionsMaterializer
+// .contentLane.test.ts`, "defers content-lane progress accepted during a
+// graph drain without a backlog scan") asserts never happens on a
+// content-lane-only drain. There is no lever available from outside the
+// protected file to scope the flag's effect to "cadence-triggered only,
+// not first-drain" — the OR-with-null-previous-revision condition is
+// internal to `topicRecomputeImminent`. Since the collapse guard below
+// (proven sufficient on its own — see the e2e suite's "backstop" test and
+// the real-vault-copy validation in the landing note) already meets the
+// task's acceptance bar without touching this flag's default at all, the
+// safer choice is to leave it at its pre-existing default and rely solely
+// on the guard. An operator who wants the full-timeline behavior can still
+// set `SIDETRACK_CONNECTIONS_TOPIC_FULL_TIMELINE=1` by hand, consciously
+// accepting the extra read cost on every drain that recomputes. One more
+// reason not to lean on it as the primary fix: it reads
+// `deps.eventLog.readMerged()`, which walks `_BAC/log` only — a day
+// retired by F2's hot-tail retirement (moved to `_BAC/retired/log/...`,
+// docs/plans/2026-08-15-foundation-program.md) is silently absent from
+// that read, so "full timeline" would mean "the full CURRENTLY-RETAINED
+// timeline" post-F2, not true full history.
 //
-// This module also wraps the injectable `TopicRevisionStore` dependency
+// This module wraps the injectable `TopicRevisionStore` dependency
 // (`deps.topicRevisionStore` — already an optional seam in
 // createConnectionsMaterializer) with two behaviors, both OUTSIDE the
 // protected file:
@@ -94,24 +103,11 @@ import {
 } from '../producers/topic-revision.js';
 import { buildServedTopicProducerReport } from './servedTopicProducer.js';
 
+// Referenced only in the collapse-suppressed log line below (an
+// informational pointer to the manual escape hatch) — see the module
+// header's "TRIED AND REVERTED" note for why this module does not flip
+// the flag's default itself.
 export const TOPIC_FULL_TIMELINE_ENV = 'SIDETRACK_CONNECTIONS_TOPIC_FULL_TIMELINE';
-
-/**
- * Seed `SIDETRACK_CONNECTIONS_TOPIC_FULL_TIMELINE` to '1' unless the
- * operator already set it explicitly (any value, including '0' — the kill
- * switch stays a kill switch). Call once, as early as possible, in every
- * process that constructs a `ConnectionsMaterializer` — the flag is read at
- * CALL time inside connectionsMaterializer.ts, not at module load, so this
- * only needs to run before the first drain, not before that module is
- * imported. Idempotent; safe to call more than once.
- */
-export const ensureTopicFullTimelineSourceDefault = (
-  env: NodeJS.ProcessEnv = process.env,
-): void => {
-  if (env[TOPIC_FULL_TIMELINE_ENV] === undefined) {
-    env[TOPIC_FULL_TIMELINE_ENV] = '1';
-  }
-};
 
 const memberCount = (revision: TopicRevision): number =>
   revision.topics.reduce((sum, topic) => sum + topic.memberCanonicalUrls.length, 0);
@@ -174,7 +170,9 @@ export const wrapTopicRevisionStoreForProduction = (
         `[topic.collapse-suppressed] producer=leiden previousTopics=${String(previous.topics.length)} ` +
           `keepingActive=${previous.revisionId} suppressedRevision=${revision.revisionId} ` +
           `visitSimilarityRevisionId=${revision.visitSimilarityRevisionId} ` +
-          `(set ${TOPIC_FULL_TIMELINE_ENV}=1 if this persists — see topicProductionRevival.ts)`,
+          `(recovers on the next non-window-poor cadence; manual escape hatch ` +
+          `${TOPIC_FULL_TIMELINE_ENV}=1 trades extra full-log reads for immediacy ` +
+          `— see topicProductionRevival.ts)`,
       );
       // Persist the built (empty) revision for audit/lineage continuity —
       // just don't move the active pointer. Stateless: the very next

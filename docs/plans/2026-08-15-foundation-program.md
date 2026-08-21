@@ -1106,13 +1106,59 @@ flake — confirmed pre-existing via `git status` showing zero changes under
 
 **Files changed**: `connections/topicProductionRevival.ts` (new — the fix
 + parity instrument), `connections/topicProductionRevival.test.ts` (new —
-13 unit tests), `sync/contract/connectionsMaterializer
-.topicProductionRevival.test.ts` (new — 3 e2e tests against the real
+unit tests), `sync/contract/connectionsMaterializer
+.topicProductionRevival.test.ts` (new — e2e tests against the real
 materializer), `runtime/companion.ts`, `cli.ts`, `sync/contract
 /connectionsReconcileChild.entry.ts`, `sync/contract
-/connectionsReconcileWorker.entry.ts` (wiring only — inject the default +
-the wrapped store at all 4 `createConnectionsMaterializer` call sites).
+/connectionsReconcileWorker.entry.ts` (wiring only — inject the wrapped
+store at all 4 `createConnectionsMaterializer` call sites).
 `connectionsMaterializer.ts` untouched, per the task's binding constraint.
+**Superseded by the CI-caught addendum immediately below** — the version
+above described flipping `SIDETRACK_CONNECTIONS_TOPIC_FULL_TIMELINE`'s
+default via `ensureTopicFullTimelineSourceDefault()`; that half was
+reverted before merge. The collapse guard + parity marks (unaffected)
+remain the shipped fix.
+
+**2026-08-21 — W5 addendum: CI caught a real regression in the
+full-timeline default flip, reverted before merge (same PR,
+fix/topic-production-revival).** CI failed
+`connectionsMaterializer.contentLane.test.ts`'s "defers content-lane
+progress accepted during a graph drain without a backlog scan" (Stage 5.2
+W7 dirty-source-queue design: a content-lane-only drain must do zero extra
+full-log reads). The coordinator asked, correctly, whether this was
+flakiness or a real consequence of the default flip rather than accepting
+the first "passes in isolation" read as proof of flake. It was real,
+reproduced deterministically: `bun test src/runtime/companion.test.ts
+src/sync/contract/connectionsMaterializer.contentLane.test.ts` (in that
+order) fails every time; the content-lane file alone passes every time.
+Root cause, two compounding factors: (1)
+`ensureTopicFullTimelineSourceDefault()` mutated global `process.env` with
+no scoping/cleanup — any test that calls `startCompanion()` (many do)
+leaked the flag on for every subsequently-run test file sharing the same
+`bun test` process; (2) more fundamentally, `topicRecomputeImminent` inside
+the protected file is unconditionally true whenever `previousTopicRevision
+=== null` — i.e. on EVERY fresh materializer's first-ever drain, not only
+cadence-triggered topic rebuilds — so the flag being on adds a redundant
+`deps.eventLog.readMerged()` full-log read to every cold boot, exactly the
+class of read the W7 design forbids on a content-lane-only drain. There is
+no lever exposed from outside the protected file to scope the flag's
+effect to "cadence-triggered only" — the OR-with-null-previous-revision
+condition is internal to `topicRecomputeImminent`, so "scope the flag's
+effect" (the coordinator's suggested remedy) was not achievable without
+editing `connectionsMaterializer.ts`. **Fix: dropped the default flip
+entirely** (`ensureTopicFullTimelineSourceDefault` and its call sites at
+all 4 entrypoints removed) rather than attempting a narrower scope. The
+collapse guard alone already met the task's acceptance bar without it —
+proven by the e2e suite's own "backstop" test (guard on, flag off,
+default config: self-heals with no collapse) and the real-vault-copy
+validation above, neither of which depended on the flag. The flag remains
+available as a pre-existing, always-was-there manual escape hatch
+(`SIDETRACK_CONNECTIONS_TOPIC_FULL_TIMELINE=1`, unmanaged by this module)
+for an operator who consciously wants full-timeline recompute despite the
+extra read cost. Re-verified: the exact failing ordering
+(`companion.test.ts` then `contentLane.test.ts`) now passes (30 pass / 0
+fail, was 29 pass / 1 fail); full `bun test` and `bun run build` re-run
+clean.
 
 **2026-08-21 — F2 apply: hot-tail retirement (move-not-delete) + event-store
 vacuum, CLOSES F2 (feat/f2-retire-apply).** The soak window named in the F2

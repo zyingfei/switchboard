@@ -19,20 +19,16 @@ import { createTimelineStore } from '../../timeline/projection.js';
 import { createConnectionsMaterializer } from './connectionsMaterializer.js';
 import type { ReconcileWorkerResult } from './connectionsReconcileWorker.js';
 import { readOwnDiskIoRusage } from '../../process/procRusage.js';
-import {
-  ensureTopicFullTimelineSourceDefault,
-  wrapTopicRevisionStoreForProduction,
-} from '../../connections/topicProductionRevival.js';
+import { wrapTopicRevisionStoreForProduction } from '../../connections/topicProductionRevival.js';
 import { createTopicRevisionStore } from '../../producers/topic-revision.js';
 
 // W5 — topic production revival. This child is the actual WRITER for the
 // production drain path (SIDETRACK_CONNECTIONS_CHILD default '1' forks one
 // of these per drain) — see topicProductionRevival.ts's header for the
 // full root-cause writeup (a window-scoped topic recompute wiping the
-// served revision to zero). Seeded here too (not just in the parent that
-// forks this process) so a standalone invocation of this entry script
-// still gets the safe default.
-ensureTopicFullTimelineSourceDefault();
+// served revision to zero) and for why the fix is store-wrapping only, not
+// an env default flip (that was tried, caught a real W7 regression in CI,
+// reverted).
 
 // Guard: this script is only meaningful when launched via `fork` —
 // IPC channel must be present. If somebody runs the .js directly this
