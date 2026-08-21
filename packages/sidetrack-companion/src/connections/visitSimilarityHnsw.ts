@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { mkdir, readdir, readFile, rename, stat, unlink, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 
@@ -98,6 +99,17 @@ const versionedIndexPath = (basePath: string, version: number): string =>
 const versionedSidecarPath = (basePath: string, version: number): string =>
   `${basePath}.v${String(version)}.json`;
 
+// Delta-gate (2026-08-21, F9 follow-up — see the 2026-08-21 F9 landing note
+// in docs/plans/2026-08-15-foundation-program.md): unversioned, always
+// describes the content currently named by `.current`. Deliberately a
+// SEPARATE small file from the (potentially large, O(corpus)) sidecar JSON
+// rather than a field inside it, so the skip-check below never has to parse
+// a multi-thousand-entry visitIdToLabel/labelToVisitId map just to decide
+// whether a rewrite is needed, and so it can be written strictly AFTER the
+// artifact publishes (see persist()'s doc comment for why that ordering is
+// the crash-safety property this whole mechanism rests on).
+const signaturePathFor = (basePath: string): string => `${basePath}.sig`;
+
 const parsePointer = (raw: string): number => {
   const trimmed = raw.trim();
   const match = /^v(\d+)$/u.exec(trimmed);
@@ -113,6 +125,95 @@ const pathExists = async (path: string): Promise<boolean> => {
     if (error instanceof Error && 'code' in error && error.code === 'ENOENT') return false;
     throw error;
   }
+};
+
+const statSizeOrZero = async (path: string | null): Promise<number> => {
+  if (path === null) return 0;
+  try {
+    const info = await stat(path);
+    return info.size;
+  } catch (error) {
+    if (error instanceof Error && 'code' in error && error.code === 'ENOENT') return 0;
+    throw error;
+  }
+};
+
+const SHA256_HEX_PATTERN = /^[0-9a-f]{64}$/u;
+
+/** Reads the delta-gate's persisted signature. Any failure mode — missing
+ *  file, truncated write, garbage content — returns null (never throws),
+ *  which the caller treats identically to "no match, must rewrite". This is
+ *  the crash-safety contract: a signature file is only ever TRUSTED when it
+ *  parses cleanly AND its value matches a freshly-computed signature; a
+ *  torn/partial write from a crash mid-write looks the same as "absent" to
+ *  every caller. */
+const readPersistedSignature = async (path: string): Promise<string | null> => {
+  try {
+    const raw = (await readFile(path, 'utf8')).trim();
+    return SHA256_HEX_PATTERN.test(raw) ? raw : null;
+  } catch (error) {
+    if (error instanceof Error && 'code' in error && error.code === 'ENOENT') return null;
+    throw error;
+  }
+};
+
+/**
+ * Delta-gate content signature (2026-08-21, F9 follow-up) — deterministic
+ * digest over everything that determines the PUBLISHED shape of the HNSW
+ * artifact: schema/identity, which visitIds are present, which label each
+ * one maps to, and each one's current embedding. Two persist() calls whose
+ * live state hashes identically are guaranteed to publish byte-for-byte
+ * equivalent served content, so the second one's 89 MB writeIndex() (see the
+ * 2026-08-21 F9 landing note's measured baseline: v767.bin -> v768.bin, both
+ * 89.43MB, for a single new visit) is pure waste and can be skipped.
+ *
+ * Root cause this targets: `insertOrUpdate`/`delete` set `dirty = true`
+ * unconditionally on every call (see their doc comments) — the CALLER
+ * (connectionsMaterializer.ts's buildHnswVisitSimilarity, out of bounds for
+ * this change) redundantly re-inserts every carried-forward visit's already-
+ * unchanged embedding on graph-touching drains, so `dirty` is true on
+ * essentially every drain even when nothing publishable actually changed.
+ * This signature is the precise, cheap-to-compute proxy for "did anything
+ * publishable actually change" that the existing boolean `dirty` flag can't
+ * express.
+ *
+ * Deliberately hashes embedding VALUES, not just the (visitId, label) set —
+ * an id/label set unchanged since the last publish does not prove the
+ * vectors themselves are unchanged (a re-embed of already-known content,
+ * same visitId, same label, different vector, is a real content change a
+ * hash-of-ids-only signature would silently miss, which is why this goes
+ * further than the "count + hash over sorted ids" starting point: see this
+ * file's PR description for the full tradeoff). The extra `getPoint()` reads
+ * are in-memory native-binding calls over already-loaded vectors — vastly
+ * cheaper than the 89 MB `writeIndex()` they exist to gate (see
+ * visitSimilarityHnsw.test.ts's skip-rate assertions for the measured
+ * ratio).
+ */
+const computeContentSignature = (loaded: LoadedState): { signature: string; count: number } => {
+  const entries = [...loaded.visitIdToLabel.entries()].sort(([a], [b]) => a.localeCompare(b));
+  const hasher = createHash('sha256');
+  const addString = (label: string, value: string): void => {
+    hasher.update(label);
+    hasher.update(' ');
+    hasher.update(value);
+    hasher.update(' ');
+  };
+  addString('schemaVersion', String(SCHEMA_VERSION));
+  addString('dimension', String(loaded.dimension));
+  addString('modelId', loaded.vectorIdentity.modelId);
+  addString('modelRevision', loaded.vectorIdentity.modelRevision);
+  addString('vectorCorpusRevision', loaded.vectorIdentity.vectorCorpusRevision);
+  addString('count', String(entries.length));
+  for (const [visitId, label] of entries) {
+    addString('visitId', visitId);
+    addString('label', String(label));
+    const point = loaded.index.getPoint(label);
+    hasher.update('embedding');
+    hasher.update(' ');
+    hasher.update(Buffer.from(Float64Array.from(point).buffer));
+    hasher.update(' ');
+  }
+  return { signature: hasher.digest('hex'), count: entries.length };
 };
 
 const parseSidecar = (raw: string): SimilarityHnswSidecar => {
@@ -417,6 +518,27 @@ export const createSimilarityHnswStore = (
       // (50 MB on the dogfood vault) to produce a byte-identical successor.
       // Nothing observable depends on the version advancing, so skip it.
       if (!loaded.dirty) return;
+      const sigPath = signaturePathFor(loaded.basePath);
+      const { signature, count } = computeContentSignature(loaded);
+      const previousSignature = await readPersistedSignature(sigPath);
+      if (previousSignature === signature) {
+        // Delta-gate (2026-08-21, F9 follow-up): `dirty` was set by some
+        // mutation call this drain, but the resulting PUBLISHABLE content is
+        // byte-for-byte what's already on disk (the common case: a drain
+        // that carries the previous revision's vectors forward re-inserts
+        // each one unconditionally — see insertOrUpdate's doc comment).
+        // Skip the 89 MB writeIndex()/sidecar/pointer rewrite entirely;
+        // nothing publishable is pending, so this is exactly the no-op the
+        // existing `dirty` check above was trying (and failing) to catch.
+        loaded.dirty = false;
+        const skippedBytes = await statSizeOrZero(
+          loaded.version > 0 ? versionedIndexPath(loaded.basePath, loaded.version) : null,
+        );
+        console.warn(
+          `[hnsw.write] skipped signature=${signature} count=${String(count)} bytes=${String(skippedBytes)}`,
+        );
+        return;
+      }
       await mkdir(dirname(loaded.basePath), { recursive: true });
       const nextVersion = loaded.version + 1;
       const nextIndexPath = versionedIndexPath(loaded.basePath, nextVersion);
@@ -433,6 +555,24 @@ export const createSimilarityHnswStore = (
       loaded.version = nextVersion;
       loaded.dirty = false;
       await gcOldVersions(loaded.basePath, nextVersion);
+      // Signature written LAST, strictly after the artifact is fully
+      // published (index + sidecar + pointer already renamed above). A
+      // crash between the pointer rename and this write leaves the sig file
+      // missing or stale (still naming the PREVIOUS version's content); the
+      // next persist() call's mismatch check above treats that identically
+      // to "no signature on record" and safely redoes the write — one wasted
+      // but harmless rewrite, never a silently-skipped real change. Writing
+      // the sig BEFORE the artifact would invert that guarantee (a crash
+      // between sig-write and artifact-write could mask a real, unpublished
+      // content change as already-published), so the order here is load-
+      // bearing, not incidental.
+      const sigTmpPath = `${sigPath}.tmp`;
+      await writeFile(sigTmpPath, signature, 'utf8');
+      await renameFile(sigTmpPath, sigPath);
+      const writtenBytes = await statSizeOrZero(nextIndexPath);
+      console.warn(
+        `[hnsw.write] written signature=${signature} count=${String(count)} bytes=${String(writtenBytes)}`,
+      );
     },
 
     async close(): Promise<void> {
