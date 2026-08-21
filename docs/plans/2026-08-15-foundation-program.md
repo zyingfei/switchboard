@@ -41,6 +41,7 @@ from reality without being updated in the same PR that changes reality.
 | F5 | Small-file stores → SQLite | page-content (703 files) + page-evidence (3,741 files) each one SQLite; one transaction per capture; #356/#357 manifest upserts deleted as obsolete; migration + rollback documented | Pending |
 | F6 | Leftover bugs | Evidence-manifest staleness on lane writes fixed (done, verified 60/60); AttributionProvenance fallback honesty (done, verified 56/56) | Merged-pending (PR #361) |
 | F7 | Top-K similarity flake dead | Root cause with deterministic repro; fix; 200 consecutive green runs | Agent running |
+| F9 | Idle I/O floor | Root cause instrumented (not guessed): a real forked child's own rusage, measured against a real vault; idle-pattern fixture (10 trickle events) → at most 1 child spawn; single-trivial-event drain write volume reported | DONE — perf/idle-drain-overhead; see landing note below |
 
 F3 survey highlights (full table in the session transcript; key durable facts):
 - Dogfood launchers run SIDETRACK_EVENT_STORE=1 — typed paths are live
@@ -963,6 +964,185 @@ none qualified in this task's `deps`/`target`/`hlc` audit).
 4. Kick a fresh acceptance-sampler window; record numbers here.
 
 ## Landing notes (current state, dated)
+
+**2026-08-21 — F9 idle I/O floor: drain gating + child self-rusage
+(perf/idle-drain-overhead, closes F9).** Task framing named
+`engagement.interval.observed` as the idle-trickle culprit; instrumented
+root-cause (not guessed) found a DIFFERENT, more precise offender.
+
+**Root cause, code-verified in `src/sync/contract/connectionsMaterializer.ts`
+(read-only — off limits for edits per this task).** `BROWSER_TIMELINE_OBSERVED`
+(`src/timeline/events.ts`) is in the materializer's `HANDLES` set (graph-
+affecting) AND is stamped `urgent: true` in `onAccepted`'s
+`requestDrain({urgent: event.type === NAVIGATION_COMMITTED || event.type ===
+BROWSER_TIMELINE_OBSERVED})`. Urgent bypasses `DEFAULT_DRAIN_MIN_INTERVAL_MS`
+(30s) entirely (`startDrainWhenIntervalElapsed`'s urgent branch calls
+`startDrain()` unconditionally) and forces `progressOnlyDirty = false`, which
+rules out the cheap in-process `tryAdvanceNoGraphBacklog` path — so `drain()`
+falls to `shouldUseWorker()` → `drainViaWorker()` and forks a full reconcile
+child (`SIDETRACK_CONNECTIONS_CHILD` defaults `'1'`). At idle, an open tab
+emits one `BROWSER_TIMELINE_OBSERVED` per ~30s dwell window even when nothing
+about the page changed since the last observation — each one independently
+forks a child. `ENGAGEMENT_INTERVAL_OBSERVED` (`src/engagement/events.ts`) is
+already correctly routed through `CONTENT_LANE_ONLY_HANDLES` in that same
+file — a cheap in-process progress advance, never a fork — so it was never
+the dominant cost; it is still included in the fix below (batching it also
+cuts its own small progress-write frequency) since the task named it
+explicitly.
+
+**Instrumented measurement (real forked child, real vault copy — the
+`connectionsInPlaceChildDrainIntegration.test.ts` harness pattern, driven by
+a throwaway spike script, not committed).** A COPY (`cp -Rc`, APFS clonefile)
+of the live test companion's vault (`~/.sidetrack-vault-test`, 2.7GB,
+read-only source, companion never contacted/restarted) with ONE new trivial
+`BROWSER_TIMELINE_OBSERVED` event appended, then one real
+`runReconcileInChild` pass, measured two independent ways that agreed: the
+child's own `proc_pid_rusage` self-read at exit (new — see below) and an
+outside poller (`createProcessTreeRusageTracker`) rooted at the test
+process. **Result: 78.75s wall time, ~4.6GB read, ~663MB written, for ONE
+event.** Per-file deltas identify WHERE: the connections generation db's WAL
+grew **+328.76MB** (`[publish.in-place] channel=child bytes=328759520`), and
+the visit-similarity HNSW index was rewritten **WHOLESALE** —
+`visit-similarity-hnsw.v767.bin` (89.43MB) deleted, `v768.bin` (89.43MB)
+written — for a single new visit, i.e. that derived artifact is NOT
+delta-scoped. Two SQL statements in `replaceScopeRows`
+(`connections/snapshot.ts`) also showed up as slow:
+`deleteScopeEdges` 6.664s, `deleteOrphanEdges` 8.834s — both are
+`DELETE FROM <116k/114k-row table> WHERE EXISTS (correlated on a
+2-3-row temp table)`, which forces SQLite to `SCAN` the LARGE table (verified
+via `EXPLAIN QUERY PLAN` against the same real generation-db copy). This is
+NOT the historical #378 incident (that was the O(n×m) trigger bug, already
+fixed by `idx_edges_index_src_dst`, confirmed present here) — it is a
+SEPARATE, smaller, and — per `queryPlanLint.test.ts`'s own
+`allowScanTables: ['connections_scope_edges' | 'edges']` entries for these
+exact statements — an EXPLICITLY, DELIBERATELY accepted cost ("`edges`
+itself has no usable equality predicate here … the accepted cost", that
+test's own comment). A spike (`EXPLAIN QUERY PLAN` + timing against the same
+real generation-db copy, `sqlite3` CLI, not committed) found a rowid-driven
+rewrite (`DELETE FROM t WHERE rowid IN (SELECT c.rowid FROM small_temp s JOIN
+t c ON …)`) cuts `deleteScopeEdges` from 0.701s to 0.013s — **54× faster**,
+same row count deleted (SQLite's Bloom-filter join optimization lets it skip
+non-matching big-table rows instead of visiting every one) — verified correct
+on real data, NOT applied in this PR: changing it means revising a pinned,
+incident-scarred regression test's stated policy
+(`queryPlanLint.test.ts`'s `allowScanTables`), which deserves its own
+reviewed PR, not a drive-by change bundled into a scheduling-gate PR. Filed
+here as a concrete, ready-to-implement follow-up with the exact rewrite
+pattern and measured number. `temp_store` tuning (suspect (a) in the task
+brief) was audited and ruled out: every TEMP table in this hot path
+(`temp_replace_scopes` etc.) holds a handful of rows per single-event drain,
+far below where `temp_store` would matter; the ~330MB WAL growth and the 89MB
+HNSW rewrite are the real, structural, measured causes. WAL-checkpoint-on-open
+of OTHER writers' dbs (suspect (b)) was not confirmed as a factor — the read
+volume is plausibly explained by the HNSW similarity corpus scan +
+`replaceScopeRows`'s two big-table scans without invoking a separate
+checkpoint-on-open mechanism.
+
+**Fix layer 1 (primary, shipped): the idle drain gate,
+`src/runtime/drainIdleGate.ts`.** Sits at the sync-contract-runner
+registration boundary in `src/runtime/companion.ts` (NOT inside the protected
+file — the only place reachable): wraps `connectionsMaterializer` before
+`syncContractRunner.register(...)`, intercepting `onAccepted`. Trickle types
+(`BROWSER_TIMELINE_OBSERVED`, `ENGAGEMENT_INTERVAL_OBSERVED`) are buffered —
+never dropped — and replayed to the inner materializer's real `onAccepted`,
+in original order, the moment EITHER a non-trickle event arrives OR
+`SIDETRACK_DRAIN_IDLE_INTERVAL_MS` (default 15 min) elapses since the first
+buffered event. This satisfies `materializer.ts`'s own contract rule #8
+("a missed in-memory notification is always recoverable via `catchUp`'s
+durable-state scan") — withholding the wake-up signal is not a drop, since
+the durable event log already has the event the moment `EventLog.appendClient*`
+accepted it. **Regression found and fixed mid-task:** a blanket type-based
+defer broke `companion.test.ts`'s resolve-canary boot test, which seeds
+exactly ONE `BROWSER_TIMELINE_OBSERVED` and expects a graph node within
+seconds — a real, load-bearing freshness requirement, not incidental. Fix: a
+**novelty-key exception** — the FIRST observation of a given `canonicalUrl`
+is always forwarded immediately (exactly like today), regardless of type;
+only REPEATS of an already-seen key are deferred. This is the behavior that
+actually matches the root cause (a REPEAT dwell-ping on an already-open tab
+carries zero new graph content; the first sighting of a genuinely new page
+does). Bounded novelty-key cache (`DEFAULT_MAX_NOVELTY_KEYS = 20_000`,
+FIFO-evicted) keeps this from becoming a second memory ratchet. Kill switch
+`SIDETRACK_DRAIN_IDLE_GATE` (absent/non-`0` = ON, `=0` reverts to today's
+behavior byte-for-byte — every event forwards immediately, same as no gate).
+
+**Fix layer 2 (audible mark, shipped): child self-rusage report.** The
+child's own `proc_pid_rusage` counters can only be read from INSIDE the
+child, right before it exits — a dead pid can no longer be queried.
+`src/process/procRusage.ts` (new; Darwin-only, best-effort, mirrors
+`scripts/lib/procRusage.ts`'s proven offsets but lives under `src/` since
+`tsconfig.build.json`'s `rootDir` excludes `scripts/`, and the child entry
+script IS shipped in `dist/`) adds `readOwnDiskIoRusage()`.
+`connectionsReconcileChild.entry.ts` calls it right before both its
+success and failure exit points and `console.warn`s
+`ioRead=<bytes> ioWrite=<bytes>` — the parent's existing stdout/stderr relay
+(`connectionsReconcileChildClient.ts`) already prefixes every child line with
+`[reconcile.child] `, so the combined line reads
+`[reconcile.child] ioRead=… ioWrite=…`, matching the task's ask, with zero
+double-tagging. `procRusage.ts`'s `createProcessTreeRusageTracker` (also new,
+reused by the acceptance fixture below) had a real bug found while writing
+that fixture: it originally reported a tracked root pid's RAW CUMULATIVE
+rusage, which is correct for a freshly-spawned root (the harness's own usage)
+but wildly wrong for a long-lived shared root (e.g. `bun test`'s own runner
+process after hundreds of prior tests) — fixed by baselining the root's
+counters at tracker-creation time and reporting a delta, covered by a new
+regression test that inflates the process's own cumulative write count
+before creating the tracker and asserts the tracker doesn't see it.
+
+**Fix layer 3 (NOT attempted, per findings): the two structural per-cycle
+costs found above (HNSW full rewrite, `replaceScopeRows`'s accepted-cost O(n)
+scans) are NOT delta-gated in this PR.** The HNSW persist-on-every-graph-
+touching-drain decision lives inside the protected materializer file — not
+reachable. The `replaceScopeRows` rewrite is reachable (not protected) and
+verified 54× faster, but changing `queryPlanLint.test.ts`'s explicit
+`allowScanTables` policy is a deliberate, separate decision this task did not
+have the mandate or review bandwidth to make safely — filed as a concrete
+follow-up with the exact fix and measured number, not silently skipped.
+
+**Acceptance fixture, committed (`src/sync/contract/
+connectionsIdleDrainRusage.test.ts`).** Runs against a SYNTHETIC (small,
+fast, CI-portable) vault, not a copy of a real developer vault, so it is a
+permanent, reproducible regression guard — the real-vault numbers above are
+the one-time investigation this fixture does not attempt to reproduce (a
+synthetic vault's tiny tables make the same code paths cheap by
+construction). Drives the REAL forked `connectionsReconcileChild.entry.js`
+(same harness pattern as `connectionsInPlaceChildDrainIntegration.test.ts`,
+requires a built `dist/`) through one real single-trivial-event drain,
+asserts the child's self-report and the outside tracker agree, and asserts
+total generation-db file growth for that one event stays **<5MB** (measured:
+**0.054MB**). `drainIdleGate.test.ts` (new, 14 cases, fake timers) proves the
+gate mechanism directly: 10 trickle events fired in quick succession
+coalesce into **at most 1 flush** to the inner materializer — the unit-level
+proof of the task's "10 trickle events → at most 1 child spawn" acceptance
+criterion (a real end-to-end fork-counting test was considered and NOT built
+— see Deviations).
+
+**Full verification.** `bun test`: 3855 pass / 8 skip / 0 fail across 418
+files (was 3833/8/0/415 files pre-PR — +3 new files, +22 new tests, zero
+regressions; the new idle-drain fixture flaked once under full-suite load
+before the tracker baseline fix above, reproduced and fixed, then reran
+green both in isolation ×3 and inside the full suite). Root `bun run build`
+clean across companion/extension/mcp. `tsc --noEmit` unchanged at 152
+pre-existing errors before and after (verified via `git stash`), none in any
+touched file. `eslint` clean (0 errors, 0 warnings) on every touched/new
+file.
+
+**Deviations from the task brief, stated plainly.** (1) The root cause is
+`BROWSER_TIMELINE_OBSERVED`, not `ENGAGEMENT_INTERVAL_OBSERVED` as named in
+the brief — reported honestly per "evidence before conclusions"; both are
+included in the gate's trickle-type set regardless. (2) Fix layer 2's
+per-cycle overhead fix (temp_store/checkpoint tuning) was audited and found
+NOT to be the dominant cause here — the real structural cause (HNSW
+full-rewrite, protected-file-only) and a real-but-deliberately-unshipped fix
+(replaceScopeRows rowid rewrite) are reported instead, per "retract premises
+when data disagrees." (3) The novelty-key exception was not in the original
+design — found by a real regression (companion.test.ts), fixed, and is now
+load-bearing; without it the gate would silently break "a genuinely new page
+shows up promptly." (4) No real end-to-end fork-counting test was built
+(would require spying on `child_process.fork` across an ESM module boundary
+under `bun test`, or a slow real-companion-boot harness); the acceptance
+criterion is instead proven at the mechanism level (drainIdleGate.test.ts,
+deterministic, fast) plus one real single-event fork (connectionsIdleDrainRusage.test.ts)
+— reported as a scope choice, not hidden.
 
 **2026-08-18 — columnar scan routing (perf/columnar-scan-routing, task #35,
 follow-up to read-amplification below).** New `src/analytics/sealedScan.ts`
