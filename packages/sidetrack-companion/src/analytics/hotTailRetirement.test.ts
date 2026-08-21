@@ -371,6 +371,110 @@ describe('hot-tail retirement report', () => {
       });
       expect(healedShard?.jsonlBytes).toBeLessThan(bytesBeforeCompaction);
     });
+
+    // PR #407 verification: F1 compaction can legitimately empty a WHOLE
+    // day, not just shrink it (a day whose events are all
+    // engagement.interval, all covered by an aggregate elsewhere). The
+    // resulting 0-byte JSONL shard must still retire cleanly once
+    // eventSeal.ts heals the day into an empty-day seal (see
+    // eventSeal.test.ts's "zero-row day re-discovery" suite for the sealer
+    // side of this fix) — this test covers the retirement report + apply
+    // side: report classifies it sealed-verified/eligible with
+    // bytesRetirable covering the (empty) file, and apply moves the 0-byte
+    // file to retired/ so the hot tail is fully clean.
+    it('retires a wholly emptied day: report is sealed-verified/eligible, apply moves the 0-byte JSONL to retired/', async () => {
+      const replicaContext = await loadOrCreateReplica(vaultRoot);
+      eventLog = createEventLog(vaultRoot, replicaContext, { now: () => now });
+      // intervalDay: ONLY interval lines for one visit — nothing else, so
+      // once compaction drops them, the shard is wholly empty.
+      await appendInterval('interval-1', 'lonely', 400);
+      await appendInterval('interval-2', 'lonely', 400);
+      const intervalDay = now.toISOString().slice(0, 10);
+
+      // aggregateDay: the visit's covering aggregate, on a different day —
+      // otherwise intervalDay's shard would keep this one surviving row.
+      now = new Date('2020-01-02T12:00:00.000Z');
+      await appendAggregate('aggregate-lonely', 'lonely', 9_000);
+      const aggregateDay = now.toISOString().slice(0, 10);
+
+      const replicaId = (await eventLog.listReplicaIds())[0];
+      if (replicaId === undefined) throw new Error('fixture replica missing');
+
+      const future = new Date('2026-07-29T12:00:00.000Z');
+      const sealPass = await runEventSealPass(vaultRoot, { now: () => future });
+      expect(sealPass.errors).toEqual([]);
+      expect(sealPass.sealed.map((entry) => entry.day).sort()).toEqual([intervalDay, aggregateDay].sort());
+
+      await eventLog.prewarmAppendIndexes();
+      const plan = await planEngagementCompaction(vaultRoot, {
+        now: future,
+        retainDays: 30,
+        onlineMaintenance: true,
+      });
+      expect(plan.wouldRewrite).toBe(true);
+      expect(plan.intervalsFolded).toBe(2);
+      const applyCompactionResult = await applyEngagementCompaction(plan, { eventLog });
+      expect(applyCompactionResult.errors).toEqual([]);
+      expect(applyCompactionResult.droppedLines).toBe(2);
+
+      const intervalShardPath = join(vaultRoot, '_BAC', 'log', replicaId, `${intervalDay}.jsonl`);
+      expect((await stat(intervalShardPath)).size).toBe(0);
+
+      await catchUpStoreMirror();
+
+      // Heal intervalDay's stale seal into an empty-day seal.
+      const resealPass = await runEventSealPass(vaultRoot, { now: () => future });
+      expect(resealPass.errors).toEqual([]);
+      expect(resealPass.unexplainedZeroRowDays).toBe(0);
+      expect(resealPass.sealed.map((entry) => entry.day)).toEqual([intervalDay]);
+
+      const report = await buildHotTailRetirementReport(vaultRoot, { now: () => future });
+      const intervalShard = report.shards.find((s) => s.replica === replicaId && s.day === intervalDay);
+      expect(intervalShard).toMatchObject({
+        verdict: 'sealed-verified',
+        retirementEligible: true,
+        eventsSealed: 0,
+        jsonlBytes: 0,
+      });
+      expect(report.totals.storeDriftShards).toBe(0);
+      expect(report.totals.shardsEligible).toBeGreaterThanOrEqual(2); // both days eligible
+
+      const applyResult = await applyHotTailRetirement(vaultRoot, { now: () => future });
+      expect(applyResult.errors).toEqual([]);
+      const intervalOutcome = applyResult.outcomes.find((o) => o.replica === replicaId && o.day === intervalDay);
+      expect(intervalOutcome).toMatchObject({ outcome: 'moved', bytes: 0 });
+
+      // Hot path gone, retired path present, still 0 bytes.
+      await expect(stat(intervalShardPath)).rejects.toThrow();
+      const retiredPath = retiredShardPath(vaultRoot, replicaId, intervalDay);
+      expect((await stat(retiredPath)).size).toBe(0);
+
+      // Receipt recorded for the empty shard too — before/after both 0
+      // bytes, hashes equal (sha256 of the empty string either way).
+      const receiptRaw = await readFile(applyResult.receiptPath, 'utf8');
+      const receipts = receiptRaw
+        .trim()
+        .split('\n')
+        .map((line) => JSON.parse(line) as Record<string, unknown>);
+      const intervalReceipt = receipts.find(
+        (r) => r['replica'] === replicaId && r['day'] === intervalDay,
+      );
+      expect(intervalReceipt).toMatchObject({ beforeBytes: 0, afterBytes: 0, eventsSealed: 0 });
+      expect(intervalReceipt?.['beforeSha256']).toBe(intervalReceipt?.['afterSha256']);
+
+      // A second report after apply still sees the day as clean: the
+      // retired tree is a sibling of the hot tail, so the (already absent)
+      // hot path contributes 0 bytes either way.
+      const afterApplyReport = await buildHotTailRetirementReport(vaultRoot, { now: () => future });
+      const afterApplyShard = afterApplyReport.shards.find(
+        (s) => s.replica === replicaId && s.day === intervalDay,
+      );
+      expect(afterApplyShard).toMatchObject({
+        verdict: 'sealed-verified',
+        retirementEligible: true,
+        jsonlBytes: 0,
+      });
+    });
   });
 });
 

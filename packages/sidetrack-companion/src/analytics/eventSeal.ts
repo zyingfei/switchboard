@@ -25,14 +25,29 @@
 //   for the event's own acceptedAtMs date) are handled by re-sealing: when
 //   the store's day stats no longer match the latest manifest entry, the day
 //   is sealed again and a superseding manifest line appended.
+// - Day discovery is a UNION, not just the store's GROUP BY: a day whose
+//   retained-row count drops to exactly zero (engagement compaction can
+//   legitimately empty an entire day, not just shrink it) disappears from
+//   sealDayStats' GROUP BY output entirely — COUNT collapses to nothing, not
+//   a zero-row group — so a raw GROUP BY diff would never revisit it and a
+//   stale (rows > 0) seal for it would never heal. Discovery therefore also
+//   walks the seal manifest's own known days per replica: a manifest day
+//   absent from the current GROUP BY output is verified against the store's
+//   `compacted_events` ledger (compactedRowCountForDay) and, ONLY if the
+//   ledger accounts for at least the previously sealed row count, re-sealed
+//   as an EMPTY-day seal (`rows: 0` + `emptyDayCompactedRows` provenance) —
+//   never a raw JSONL rescan, never assumed without ledger proof. A
+//   zero-row manifest day with insufficient ledger evidence is genuine
+//   drift: left exactly as-is, fail-closed, never auto-healed.
 // - DuckDB is loaded lazily and the instance is closed at the end of every
-//   pass ("one lazy connection, closed when idle").
+//   pass ("one lazy connection, closed when idle") — and skipped entirely
+//   when a pass only has empty-day re-seals to write (no parquet involved).
 
 import { mkdir, open, readFile, rename, unlink } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 
 import { createRevision } from '../domain/ids.js';
-import { sha256File } from '../gc/engagementCompactionManifest.js';
+import { sha256File, sha256Text } from '../gc/engagementCompactionManifest.js';
 import { getCaughtUpSharedEventStore, type SealDayStat } from '../sync/eventStore.js';
 import { syncDirectory } from '../vault/atomic.js';
 
@@ -49,6 +64,15 @@ export interface SealManifestEntry {
   readonly seqHi: number;
   readonly sha256: string;
   readonly sealedAt: string;
+  /** Present ONLY on an empty-day seal (`rows === 0`): the day previously
+   *  held `seqHi - seqLo + 1` retained rows (kept above for late-arrival
+   *  detection continuity — a new peer dot beyond `seqHi` still mismatches
+   *  this entry the normal way) that a later compaction pass legitimately
+   *  dropped. This is the `compacted_events` ledger row count the sealer
+   *  verified BEFORE writing the empty-day seal — the receipt that makes
+   *  "this day now has zero rows" provable, not merely observed. Absent on
+   *  every ordinary (rows > 0) entry. */
+  readonly emptyDayCompactedRows?: number;
 }
 
 export interface SealManifestRead {
@@ -65,6 +89,14 @@ export interface SealPassResult {
   readonly skippedAlreadySealed: number;
   /** Planned days beyond `maxDaysPerPass` left for the next pass; 0 when nothing deferred. */
   readonly deferredDays: number;
+  /** Days the manifest knows (a prior seal with rows > 0) whose retained
+   *  rows dropped to zero WITHOUT enough `compacted_events` ledger evidence
+   *  to prove the drop was legitimate compaction. Never auto-healed — the
+   *  stale seal is left exactly as-is (fail-closed) so hot-tail retirement
+   *  keeps reporting `store-drift` for it rather than a false-clean empty
+   *  seal. Persists across passes until either real ledger evidence
+   *  appears or the day's rows come back. */
+  readonly unexplainedZeroRowDays: number;
   readonly errors: readonly string[];
 }
 
@@ -93,21 +125,37 @@ const REPLICA_RE = /^[0-9a-zA-Z._-]+$/u;
 const isManifestEntry = (value: unknown): value is SealManifestEntry => {
   if (typeof value !== 'object' || value === null) return false;
   const entry = value as Record<string, unknown>;
-  return (
-    typeof entry['replica'] === 'string' &&
-    REPLICA_RE.test(entry['replica']) &&
-    entry['replica'] !== '.' &&
-    entry['replica'] !== '..' &&
-    typeof entry['day'] === 'string' &&
-    DAY_RE.test(entry['day']) &&
-    typeof entry['rows'] === 'number' &&
-    Number.isInteger(entry['rows']) &&
-    entry['rows'] > 0 &&
-    typeof entry['seqLo'] === 'number' &&
-    typeof entry['seqHi'] === 'number' &&
-    typeof entry['sha256'] === 'string' &&
-    typeof entry['sealedAt'] === 'string'
-  );
+  if (
+    !(
+      typeof entry['replica'] === 'string' &&
+      REPLICA_RE.test(entry['replica']) &&
+      entry['replica'] !== '.' &&
+      entry['replica'] !== '..' &&
+      typeof entry['day'] === 'string' &&
+      DAY_RE.test(entry['day']) &&
+      typeof entry['rows'] === 'number' &&
+      Number.isInteger(entry['rows']) &&
+      entry['rows'] >= 0 &&
+      typeof entry['seqLo'] === 'number' &&
+      typeof entry['seqHi'] === 'number' &&
+      typeof entry['sha256'] === 'string' &&
+      typeof entry['sealedAt'] === 'string'
+    )
+  ) {
+    return false;
+  }
+  // emptyDayCompactedRows is meaningful ONLY on an empty-day seal (rows===0)
+  // — required and positive there (the ledger-provenance receipt), and must
+  // be absent on every ordinary entry so the field never silently means two
+  // different things.
+  if (entry['rows'] === 0) {
+    return (
+      typeof entry['emptyDayCompactedRows'] === 'number' &&
+      Number.isInteger(entry['emptyDayCompactedRows']) &&
+      entry['emptyDayCompactedRows'] > 0
+    );
+  }
+  return entry['emptyDayCompactedRows'] === undefined;
 };
 
 export const readSealManifest = async (vaultRoot: string): Promise<SealManifestRead> => {
@@ -293,6 +341,82 @@ const sealOneDay = async (
 };
 
 /**
+ * Re-seal a day whose retained-row count dropped to exactly zero because
+ * every row a prior seal covered was legitimately compacted (F1 engagement
+ * compaction can empty an entire day's shard, not just shrink it). Writes
+ * NO parquet segment — there are zero rows to mirror, and a physically
+ * empty parquet file would be invisible to the GROUP-BY-over-glob queries
+ * `eventScan.ts`/`hotTailRetirement.ts` use to cross-check sealed segments
+ * (a zero-row file contributes no group at all), so those two readers treat
+ * `rows === 0` manifest entries as a distinct, file-less case instead. The
+ * manifest line itself — `rows: 0` plus `emptyDayCompactedRows`, the
+ * `compacted_events` ledger count this call's caller already verified — IS
+ * the seal: the durable, provenance-carrying record that this day's
+ * emptiness was proven, not merely observed. `seqLo`/`seqHi` are carried
+ * over unchanged from the prior real seal so a later peer dot beyond the
+ * old `seqHi` still mismatches this entry the normal way (late-arrival
+ * re-seal, unchanged code path).
+ */
+const sealEmptyDay = async (
+  vaultRoot: string,
+  replica: string,
+  day: string,
+  prior: SealManifestEntry,
+  compactedRows: number,
+  now: () => Date,
+): Promise<SealManifestEntry> => {
+  const entry: SealManifestEntry = {
+    replica,
+    day,
+    rows: 0,
+    seqLo: prior.seqLo,
+    seqHi: prior.seqHi,
+    sha256: sha256Text(
+      `empty-day:${replica}:${day}:${String(prior.seqLo)}:${String(prior.seqHi)}:${String(compactedRows)}`,
+    ),
+    sealedAt: now().toISOString(),
+    emptyDayCompactedRows: compactedRows,
+  };
+  await appendManifestEntry(vaultRoot, entry);
+  return entry;
+};
+
+/** One day this pass has decided needs a manifest line — either a normal
+ *  rows-mirroring seal, or a provenance-verified empty-day seal for a day
+ *  whose retained rows dropped to exactly zero. */
+type PlannedDay =
+  | { readonly kind: 'rows'; readonly replica: string; readonly stat: SealDayStat }
+  | {
+      readonly kind: 'empty';
+      readonly replica: string;
+      readonly day: string;
+      readonly prior: SealManifestEntry;
+      readonly compactedRows: number;
+    };
+
+const plannedDayToDraftEntry = (planned: PlannedDay): SealManifestEntry =>
+  planned.kind === 'rows'
+    ? {
+        replica: planned.replica,
+        day: planned.stat.day,
+        rows: planned.stat.rows,
+        seqLo: planned.stat.seqLo,
+        seqHi: planned.stat.seqHi,
+        sha256: '',
+        sealedAt: '',
+      }
+    : {
+        replica: planned.replica,
+        day: planned.day,
+        rows: 0,
+        seqLo: planned.prior.seqLo,
+        seqHi: planned.prior.seqHi,
+        sha256: '',
+        sealedAt: '',
+        emptyDayCompactedRows: planned.compactedRows,
+      };
+
+/**
  * One sealer pass: plan every closed, unsealed (or changed) replica-day, then
  * — unless dryRun — seal each one, at most `maxDaysPerPass` per pass (the
  * hourly tick drains any remainder). Individual day failures are collected,
@@ -316,18 +440,22 @@ export const runEventSealPass = async (
       skippedOpenDays: 0,
       skippedAlreadySealed: 0,
       deferredDays: 0,
+      unexplainedZeroRowDays: 0,
       errors: ['event store unavailable (SIDETRACK_EVENT_STORE off or failed to open)'],
     };
   }
   const today = now().toISOString().slice(0, 10);
   const manifest = await readSealManifest(vaultRoot);
 
-  const planned: { readonly replica: string; readonly stat: SealDayStat }[] = [];
+  const planned: PlannedDay[] = [];
   let skippedOpenDays = 0;
   let skippedAlreadySealed = 0;
+  let unexplainedZeroRowDays = 0;
   for (const replica of Object.keys(store.watermark()).sort()) {
     if (!REPLICA_RE.test(replica)) continue;
-    for (const stat of store.sealDayStats(replica)) {
+    const dayStats = store.sealDayStats(replica);
+    const rowfulDays = new Set(dayStats.map((stat) => stat.day));
+    for (const stat of dayStats) {
       // Today's day is still open; a future-dated day (peer with a fast
       // clock) is treated the same — never sealed until it is in the past.
       if (stat.day >= today) {
@@ -344,19 +472,38 @@ export const runEventSealPass = async (
         skippedAlreadySealed += 1;
         continue;
       }
-      planned.push({ replica, stat });
+      planned.push({ kind: 'rows', replica, stat });
+    }
+
+    // Zero-row days the manifest already knows about (a prior seal with
+    // rows > 0): sealDayStats' GROUP BY never re-visits these — COUNT
+    // collapses to nothing, not a zero-row group — so without this walk a
+    // stale seal here would never heal. A manifest day with LIVE rows was
+    // already handled above; a manifest day with no live rows AND no prior
+    // seal at all isn't reachable here (nothing to heal, `never-sealed`
+    // covers it downstream).
+    for (const entry of manifest.latest.values()) {
+      if (entry.replica !== replica || rowfulDays.has(entry.day) || entry.day >= today) continue;
+      if (entry.rows === 0) {
+        // Already an empty-day seal and the store still agrees (zero
+        // live rows) — consistent, nothing to redo.
+        skippedAlreadySealed += 1;
+        continue;
+      }
+      const compactedRows = store.compactedRowCountForDay(replica, entry.day);
+      if (compactedRows >= entry.rows) {
+        planned.push({ kind: 'empty', replica, day: entry.day, prior: entry, compactedRows });
+      } else {
+        // Genuine drift: the compaction ledger does not account for the
+        // missing rows. Fail closed — never auto-heal; leave the stale
+        // seal exactly as it is, so hot-tail retirement keeps (correctly)
+        // reporting `store-drift` for it instead of a false-clean seal.
+        unexplainedZeroRowDays += 1;
+      }
     }
   }
 
-  const plannedEntries: SealManifestEntry[] = planned.map(({ replica, stat }) => ({
-    replica,
-    day: stat.day,
-    rows: stat.rows,
-    seqLo: stat.seqLo,
-    seqHi: stat.seqHi,
-    sha256: '',
-    sealedAt: '',
-  }));
+  const plannedEntries: SealManifestEntry[] = planned.map(plannedDayToDraftEntry);
   // Dry-run reports the FULL plan — the day cap bounds work, not visibility.
   if (options.dryRun === true || planned.length === 0) {
     return {
@@ -365,6 +512,7 @@ export const runEventSealPass = async (
       skippedOpenDays,
       skippedAlreadySealed,
       deferredDays: 0,
+      unexplainedZeroRowDays,
       errors: [],
     };
   }
@@ -373,11 +521,20 @@ export const runEventSealPass = async (
   const deferredDays = planned.length - toSeal.length;
   const sealed: SealManifestEntry[] = [];
   const errors: string[] = [];
-  const duck = await openDuck();
+  // Lazy + conditional: a pass that only has empty-day re-seals to write
+  // never touches parquet, so it never needs to spin up DuckDB at all.
+  let duck: DuckSession | null = null;
   try {
-    for (const { replica, stat } of toSeal) {
+    for (const day of toSeal) {
       try {
-        sealed.push(await sealOneDay(vaultRoot, duck, store, replica, stat, now));
+        if (day.kind === 'rows') {
+          duck ??= await openDuck();
+          sealed.push(await sealOneDay(vaultRoot, duck, store, day.replica, day.stat, now));
+        } else {
+          sealed.push(
+            await sealEmptyDay(vaultRoot, day.replica, day.day, day.prior, day.compactedRows, now),
+          );
+        }
       } catch (error) {
         errors.push(error instanceof Error ? error.message : String(error));
       }
@@ -387,7 +544,7 @@ export const runEventSealPass = async (
       await new Promise<void>((resolve) => setImmediate(resolve));
     }
   } finally {
-    duck.close();
+    duck?.close();
   }
   return {
     planned: plannedEntries,
@@ -395,6 +552,7 @@ export const runEventSealPass = async (
     skippedOpenDays,
     skippedAlreadySealed,
     deferredDays,
+    unexplainedZeroRowDays,
     errors,
   };
 };

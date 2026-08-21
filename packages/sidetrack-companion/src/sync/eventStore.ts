@@ -156,6 +156,16 @@ export interface EventStore {
    *  fidelity just because the sealed portion has to. Purely additive —
    *  no existing method's behavior changes. */
   readonly readEventsForDay: (replicaId: string, day: string) => readonly AcceptedEvent[];
+  /** COUNT(*) of `compacted_events` rows for one replica-day, same UTC-day
+   *  bucketing as sealDayStats/readSealRows (a compaction receipt's dropped
+   *  dots are all stamped with the shard's own day by construction — see
+   *  applyCompactionReceipt below). The ledger-provenance check the sealer
+   *  runs before healing a day whose retained-row count dropped to exactly
+   *  zero (F1 compaction can legitimately empty an entire day): a count
+   *  that covers the previously sealed row count proves the drop was
+   *  ledgered, not silent data loss. Zero means no ledger evidence at all
+   *  — the fail-closed signal an empty-day seal must never be written for. */
+  readonly compactedRowCountForDay: (replicaId: string, day: string) => number;
   readonly close: () => void;
 }
 
@@ -1093,6 +1103,17 @@ export const createEventStore = async (vaultRoot: string): Promise<EventStore> =
     return rowsToEvents(rows);
   };
 
+  const compactedRowCountForDay = (replicaId: string, day: string): number => {
+    const { lo, hi } = dayBoundsMs(day);
+    const row = db
+      .query(
+        `SELECT COUNT(*) AS n FROM compacted_events
+          WHERE replica_id = ? AND accepted_at_ms >= ? AND accepted_at_ms < ?`,
+      )
+      .get(replicaId, lo, hi);
+    return numberField(row, 'n');
+  };
+
   return {
     ingest: (event) => {
       ingest(event);
@@ -1116,6 +1137,7 @@ export const createEventStore = async (vaultRoot: string): Promise<EventStore> =
     sealDayStats,
     readSealRows,
     readEventsForDay,
+    compactedRowCountForDay,
     close: () => {
       db.close?.();
     },

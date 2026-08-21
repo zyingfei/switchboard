@@ -35,7 +35,7 @@ from reality without being updated in the same PR that changes reality.
 | ID | Goal | Acceptance (coordinator-verified) | State (2026-08-15) |
 |----|------|------------------------------------|--------------------|
 | F1 | Engagement compaction runs | Report-only numbers reproduced (done: 439.7MB = 65.3% of 672.8MB reclaimable, 0 uncovered visits); gated `--apply` on test vault shrinks log with post-apply equivalence (event counts, serving probes); nightly report-only scheduled via runbook → live script | CLI + schedule merged-pending (PR #361); apply scheduled idle window |
-| F2 | JSONL hot-tail retirement | Report-only enumeration with per-day seal proofs; destructive apply behind flag + soak (~Aug 21); one-command flip documented | DONE — apply shipped (feat/f2-retire-apply, 2026-08-21): move-not-delete `retire-hot-tail --apply` + `event-store-vacuum`, same safety bar as compact-engagement (arm env + recall process-lock + per-shard fail-closed re-validation + crash-safe atomic rename + bounded receipt log); soak window executed by the coordinator |
+| F2 | JSONL hot-tail retirement | Report-only enumeration with per-day seal proofs; destructive apply behind flag + soak (~Aug 21); one-command flip documented | DONE — apply shipped (feat/f2-retire-apply, 2026-08-21): move-not-delete `retire-hot-tail --apply` + `event-store-vacuum`, same safety bar as compact-engagement (arm env + recall process-lock + per-shard fail-closed re-validation + crash-safe atomic rename + bounded receipt log); soak window executed by the coordinator; addendum (fix/seal-zero-day-rediscovery, 2026-08-21): sealer now re-discovers days fully emptied by compaction (empty-day seals with ledger provenance) — 6 permanently-blocked test-vault shards healed, see landing note |
 | F3 | No full-log walks on hot paths | Survey complete (see below); foreground-nav overlay migrated to typed reads with equivalence test; phase-log shows no full-log walk during a normal drain + nav burst | Overlay migration done; remaining hot readMerged callers (health/§15/ingestor/retrain-worker) migrated + equivalence-tested (PR TBD, 2026-08-16); default-ON flip evaluated and NOT shipped (test-fixture blocker, see landing note) |
 | F4 | Blob diet | Accumulator blob + append-index snapshot off pretty JSON (CBOR/compact or incremental); snapshot load <1s (baseline 2.5s); measured before/after | Pending (after F1–F3) |
 | F5 | Small-file stores → SQLite | page-content (703 files) + page-evidence (3,741 files) each one SQLite; one transaction per capture; #356/#357 manifest upserts deleted as obsolete; migration + rollback documented | Pending |
@@ -1068,6 +1068,123 @@ none qualified in this task's `deps`/`target`/`hlc` audit).
 4. Kick a fresh acceptance-sampler window; record numbers here.
 
 ## Landing notes (current state, dated)
+
+**2026-08-21 — F2 addendum: zero-row day re-discovery (empty-day seals with
+compaction provenance) (fix/seal-zero-day-rediscovery).** PR #407's
+verification found a gap in F2's own sealer: `runEventSealPass`
+(`analytics/eventSeal.ts`) discovered days to (re)seal via a `GROUP BY` over
+CURRENT `events` rows per replica-day. A day whose row count drops to
+exactly ZERO — F1 compaction can legitimately empty a day whole, not just
+shrink it — vanishes from that `GROUP BY` output entirely (`COUNT`
+collapses to nothing, not a zero-row group), so a stale (rows > 0) seal for
+it was never revisited. Confirmed on the test vault: 6 real days
+(`819ef08e.../2026-06-15,06-26,07-02..07-05`) had every retained row
+compacted away, ledgered in `compacted_events`, but `retire-hot-tail
+--report` fail-closed all 6 as `store-drift` forever — permanently blocked,
+never a data-loss risk (the fail-closed behavior was correct-but-stuck),
+but permanently unable to retire ~26MB of already-empty hot-tail shard
+files.
+
+**Fix.** Day discovery is now a union: the store's own `GROUP BY` (rows > 0
+days) plus every day the seal manifest already knows about per replica. A
+manifest day absent from the live `GROUP BY` output is checked against a
+new `EventStore.compactedRowCountForDay(replicaId, day)` — a `COUNT(*)`
+over `compacted_events` bucketed by the same UTC-day bounds
+`sealDayStats`/`readSealRows` already use. Only when the ledger count is
+`>=` the previously-sealed row count is the day healed into an **empty-day
+seal** — a manifest line with `rows: 0` plus a new `emptyDayCompactedRows`
+provenance field (the ledger count verified at seal time), `seqLo`/`seqHi`
+carried over unchanged from the prior real seal (so a genuine late arrival
+beyond the old `seqHi` still mismatches and re-seals normally). A zero-row
+manifest day with insufficient ledger evidence is left exactly as-is —
+fail-closed, never auto-healed, same protective `store-drift` outcome as
+before, now backed by a `SealPassResult.unexplainedZeroRowDays` counter
+instead of silence. No parquet segment is written for an empty-day seal: a
+physically empty parquet file is invisible to the `GROUP BY`-over-glob
+queries `eventScan.ts`/`hotTailRetirement.ts` use to cross-check sealed
+segments (zero rows means no group at all, not a zero-count one), so both
+readers special-case `rows === 0` manifest entries ahead of the parquet
+lookup, verifying only that the live store still agrees the day is empty
+(`sealed-verified`/eligible if so, benign `store-drift` if a new peer dot
+reopened the day since). Hot-tail retirement's apply path needed no
+changes: a compaction-emptied JSONL shard is a real 0-byte file on disk
+(compaction rewrites empty, never deletes), so the existing move-by-rename
+apply already retires it once the report marks it eligible.
+
+**Verification on a copy of the real test vault**
+(`cp -Rc ~/.sidetrack-vault-test /tmp/...` — APFS clone, ~2s, zero touch to
+the live vault or its recall process-lock; the live test companion, pid
+27442, was left untouched throughout). Before: `retire-hot-tail --report`
+→ `storeDriftShards=6`, listing exactly the 6 known days. `seal --dry-run`
+→ `planned=6` (all `empty-day-seal`, `unexplained-zero-row=0` — full ledger
+coverage for all 6). `seal --run` → `sealed=6 errors=0`; manifest lines
+confirmed `rows:0` with `emptyDayCompactedRows` 80 / 11999 / 14400 / 14400
+/ 14400 / 14400 (sums to the compacted rows per day). `retire-hot-tail
+--report` again → `storeDriftShards=0`, `shardsEligible` 234→240.
+`retire-hot-tail --apply` (armed, stale cloned lock file removed first —
+see deviations) → `shardsRetired=6 alreadyRetired=234 skipped=0
+errors=[]`; all 6 target `.jsonl` files (each genuinely 0 bytes, dated
+2026-06-15 through 2026-07-05) confirmed moved out of `_BAC/log` into
+`_BAC/retired/log`, receipts recorded (`beforeBytes=afterBytes=0`,
+`beforeSha256=afterSha256` — both the empty-string hash, as expected for a
+same-filesystem rename of a 0-byte file). Re-running `--report`,
+`--apply`, and `seal --dry-run` afterward is a clean no-op each time
+(`storeDriftShards=0`, `shardsRetired=0/alreadyRetired=240`,
+`planned=0/already-sealed=240/unexplained-zero-row=0`) — idempotent.
+
+**Tests** (`src/analytics/eventSeal.test.ts`, `src/analytics/
+hotTailRetirement.test.ts`, both using the real `planEngagementCompaction`/
+`applyEngagementCompaction` pipeline, not a synthetic shortcut): a day
+whose events are 100% `engagement.interval` (all covered by an aggregate on
+a DIFFERENT day, so the shard has nothing else to keep it non-empty) heals
+into an empty-day seal after compaction + a live-mirror catch-up, while a
+normal day sealed in the SAME pass is asserted byte-for-byte untouched; a
+day whose rows are deleted directly from the event-store mirror's own
+SQLite file (bypassing `applyCompactionReceipt` entirely, so
+`compacted_events` stays empty) is asserted to stay `unexplainedZeroRowDays
+= 1` and `store-drift` forever, never silently healed; and a full report +
+apply cycle retires the resulting 0-byte JSONL shard with the same receipt
+accounting as any other retired day. Full `bun test`: 3938 pass / 8 skip /
+0 fail across 425 files (companion package). `bun run build` (`tsconfig
+.build.json`): clean. `tsc -p tsconfig.json --noEmit`: zero errors in any
+touched file (pre-existing unrelated errors elsewhere — `bun:test` module
+resolution in workstreams/tabsession suites, an unrelated
+`connectionsMaterializer` progress-callback mismatch — untouched by this
+diff, matching this file's own standing note that the raw `tsc -p
+tsconfig.json` gate is noisy by design and `tsconfig.build.json` is the
+real gate).
+
+**Deviations from the task brief, stated plainly.** (1) The brief allowed
+"and/or canonical shard days via `listCanonicalEventShards`" for the union
+— only the seal-manifest side was implemented. `hotTailRetirement.ts`
+already imports FROM `eventSeal.ts`; importing `listCanonicalEventShards`
+back into `eventSeal.ts` would create a module cycle, and the manifest-days
+union alone already covers the reported bug exactly (a day that HAD a real
+seal, not a day that was never sealed at all — that case is `never-sealed`,
+unaffected by this fix and correctly untouched). (2) No physical parquet
+segment is written for an empty-day seal (see Fix, above) — a deliberate
+choice over forcing DuckDB to write and verify a 0-row parquet file, which
+turns out to be a dead end regardless: `COUNT/MIN/MAX` over an empty
+`read_parquet()` result yields SQL NULL for `MIN`/`MAX`, and the existing
+`GROUP BY`-over-glob aggregate used by both downstream readers cannot
+represent a zero-row group at all (no rows in, no row out) — so even a
+successfully-written empty parquet file would still need every consumer
+special-cased exactly as they are now, for zero added integrity value.
+(3) A new `SealPassResult.unexplainedZeroRowDays` counter and a CLI
+`unexplained-zero-row=` field were added (not explicitly requested) so the
+fail-closed drift case is visible in `seal --run`/`--dry-run` output rather
+than only inferable from `retire-hot-tail --report`'s `storeDriftShards`
+— directly serves the brief's own "protective intent preserved" framing
+with a one-field addition, not scope creep. (4) The real test vault's
+`_BAC/recall/.lock` file, when cloned byte-for-byte into the verification
+copy, still names the LIVE test companion's real pid (27442) — the
+process-lock check is pid-liveness-only, not path-scoped, so it would have
+refused `--apply` on the copy as a false positive. The stale cloned lock
+was deleted before `--apply` on the COPY only; the live companion and its
+real lock were never touched.
+
+PR: fix(seal): re-discover zero-row days — empty-day seals with compaction
+provenance (branch `fix/seal-zero-day-rediscovery`).
 
 **2026-08-21 — W5: topic production revival + parity instrumentation
 (fix/topic-production-revival).** Task #20 (W5) reported topics stuck at
