@@ -273,6 +273,32 @@ export interface BackgroundEmbeddingCycleResult {
   readonly skippedByReason: Readonly<Record<string, number>>;
 }
 
+/** Pure next-cycle delay decision, extracted so it is testable without
+ *  timers. Short cadence only while the cycle is doing (or blocked from
+ *  doing) REAL work:
+ *    - paused for a drain / embedder warmup → retry soon, the blocker
+ *      clears on its own within seconds;
+ *    - embedded or failed ≥1 → the backlog is moving (or burning
+ *      attempts toward quarantine, which also terminates) — keep chewing.
+ *  Everything else — empty backlog, all-quarantined, or a SKIP-ONLY
+ *  cycle — waits idleIntervalMs. A skip-only backlog ('no-page-content'
+ *  records rotating through the quarantine cooldown) is STALLED, not
+ *  busy: what unblocks it is page content ARRIVING, which no hotter poll
+ *  can accelerate. The old `backlog > embedded` condition kept the 4s
+ *  cadence forever on exactly that population — the 2026-08-22
+ *  idle-metronome (~1.9GB/h of discovery/progress rewrites on an idle
+ *  machine). */
+export const nextCycleDelayMs = (
+  result: Pick<
+    BackgroundEmbeddingCycleResult,
+    'pausedForDrain' | 'pausedForWarmup' | 'embedded' | 'failed'
+  >,
+  config: Pick<BackgroundEmbeddingLaneConfig, 'cycleIntervalMs' | 'idleIntervalMs'>,
+): number =>
+  result.pausedForDrain || result.pausedForWarmup || result.embedded > 0 || result.failed > 0
+    ? config.cycleIntervalMs
+    : config.idleIntervalMs;
+
 /** Operator-facing lane health. Surfaced on /v1/status so a silently
  *  inert lane (the 90-min soak failure) is VISIBLE instead of a mystery.
  *  Purely a snapshot of in-memory counters — synchronous, no I/O. */
@@ -394,13 +420,40 @@ export const createBackgroundEmbeddingLane = (
       .map(([reason, count]) => `${reason}:${String(count)}`)
       .join(',');
 
+  // Material fingerprint of the progress cursor: everything EXCEPT the
+  // volatile `lastRunAtMs` heartbeat, with record keys sorted so mutation
+  // order can't fake a change. WHY: persisting on every cycle solely
+  // because lastRunAtMs ticked rewrote the whole (~85KB) progress file
+  // every 4s — part of the 2026-08-22 idle-metronome disk wear. Liveness
+  // is served by the in-memory health() surface; the persisted
+  // lastRunAtMs only needs to be right as of the last MATERIAL change.
+  const sortedRecord = <T>(record: Record<string, T> | undefined): Record<string, T> => {
+    const out: Record<string, T> = {};
+    for (const key of Object.keys(record ?? {}).sort()) out[key] = (record as Record<string, T>)[key] as T;
+    return out;
+  };
+  const materialKeyOf = (p: BackgroundEmbeddingProgress): string =>
+    JSON.stringify({
+      attempts: sortedRecord(p.attemptsByCanonicalUrl),
+      quarantinedAt: sortedRecord(p.quarantinedAtMsByCanonicalUrl),
+      embeddedTotal: p.embeddedTotal,
+      lastSuccessAtMs: p.lastSuccessAtMs ?? null,
+      lastFailureReason: sortedRecord(p.lastFailureReasonByCanonicalUrl),
+    });
+  let lastPersistedMaterialKey: string | null = null;
+
   const loadProgressOnce = async (): Promise<void> => {
     if (progressLoaded) return;
     progressLoaded = true;
     if (deps.readProgress === undefined) return;
     try {
       const loaded = await deps.readProgress();
-      if (loaded !== null && loaded.schemaVersion === 1) progress = loaded;
+      if (loaded !== null && loaded.schemaVersion === 1) {
+        progress = loaded;
+        // The on-disk cursor already reflects this state — a restart with
+        // no material change must not trigger a rewrite.
+        lastPersistedMaterialKey = materialKeyOf(loaded);
+      }
     } catch {
       // Corrupt / missing progress → start clean.
     }
@@ -408,8 +461,14 @@ export const createBackgroundEmbeddingLane = (
 
   const persistProgress = async (): Promise<void> => {
     if (deps.writeProgress === undefined) return;
+    const key = materialKeyOf(progress);
+    // Skip byte-churn-only writes. On write FAILURE the last persisted
+    // key intentionally stays stale, so the very next cycle retries even
+    // without a new material change.
+    if (key === lastPersistedMaterialKey) return;
     try {
       await deps.writeProgress(progress);
+      lastPersistedMaterialKey = key;
     } catch {
       // Progress persistence is best-effort; a failure only costs a
       // re-scan on restart, never correctness.
@@ -635,7 +694,11 @@ export const createBackgroundEmbeddingLane = (
       noProgressCycles = 0;
     }
     previousCycleBacklog = backlog.length;
-    if (embedded > 0 || failed > 0) {
+    // AUDIBLE SKIPS: skip-only cycles used to log NOTHING — which is how a
+    // 4s-cadence skip loop rewrote ~2MB of artifacts per tick for days
+    // without one log line. They now log like any other working cycle;
+    // volume stays bounded because skip-only cycles run at idleIntervalMs.
+    if (embedded > 0 || failed > 0 || skipped > 0) {
       // Name the head URLs: 182 byte-identical cycle lines hid a wedge that
       // one glance at the URLs would have exposed.
       const sample = backlog
@@ -698,19 +761,7 @@ export const createBackgroundEmbeddingLane = (
     running = true;
     let nextDelayMs = config.idleIntervalMs;
     try {
-      const result = await runOnce();
-      if (result.pausedForDrain || result.pausedForWarmup) {
-        // Come back soon — the drain will finish / the embedder will warm
-        // and we want to resume promptly, but not spin. The warmup wait
-        // uses the SAME short cadence so an inert lane recovers within
-        // seconds of the child reporting ready (not the 60 s idle poll).
-        nextDelayMs = config.cycleIntervalMs;
-      } else if (result.backlog > result.embedded) {
-        // More backlog remains — keep the shorter cadence.
-        nextDelayMs = config.cycleIntervalMs;
-      } else {
-        nextDelayMs = config.idleIntervalMs;
-      }
+      nextDelayMs = nextCycleDelayMs(await runOnce(), config);
     } catch (error) {
       // runOnce is designed never to throw, but belt-and-braces: a throw
       // here must not kill the loop.

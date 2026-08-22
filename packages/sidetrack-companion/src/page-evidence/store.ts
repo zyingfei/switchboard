@@ -1046,6 +1046,14 @@ export interface BackgroundEmbeddingDiscovery {
   readonly totalFiles: number;
   /** How many files were actually JSON-read this cycle (the delta). */
   readonly filesRead: number;
+  /** Whether the refreshed index differs from `priorIndex`. Exact, not a
+   *  heuristic: entries are only ever (a) freshly read (filesRead > 0) or
+   *  (b) carried forward as the identical remembered object — so with
+   *  zero reads and an unchanged key set the index is provably identical.
+   *  WHY THIS EXISTS: the candidate source used to persist the ~2MB index
+   *  after EVERY cycle; at the lane's 4s cadence that alone was ~1.9GB/h
+   *  of byte-identical rewrites (the 2026-08-22 idle-metronome incident). */
+  readonly changed: boolean;
 }
 
 const entryToCandidate = (
@@ -1156,6 +1164,10 @@ export const discoverBackgroundEmbeddingBacklog = async (
     index: { schemaVersion: 1, byFileName: nextByFileName },
     totalFiles: fingerprints.length,
     filesRead,
+    changed:
+      priorIndex === null ||
+      filesRead > 0 ||
+      Object.keys(nextByFileName).length !== Object.keys(prior.byFileName).length,
   };
 };
 
@@ -1192,6 +1204,12 @@ export const createIncrementalBackgroundEmbeddingCandidateSource = (
   let loaded = false;
   let lastTotalFiles = 0;
   let lastFilesRead = 0;
+  // The in-memory index can run ahead of the on-disk one: a persist is
+  // owed whenever a cycle changed the index OR a previous owed persist
+  // failed. Without this flag a failed write followed by quiet cycles
+  // would leave the cursor stale until the next real change (unbounded
+  // re-read window on restart).
+  let persistOwed = false;
   return {
     listCandidates: async () => {
       if (!loaded) {
@@ -1202,9 +1220,19 @@ export const createIncrementalBackgroundEmbeddingCandidateSource = (
       index = discovery.index;
       lastTotalFiles = discovery.totalFiles;
       lastFilesRead = discovery.filesRead;
-      // Best-effort persist — a failure only costs a re-read of the
-      // delta next cycle, never correctness.
-      await writeBackgroundEmbeddingDiscoveryIndex(vaultRoot, discovery.index).catch(() => undefined);
+      // Persist ONLY when the index actually changed (or a prior persist
+      // is still owed). The unconditional write here was the 2026-08-22
+      // idle-metronome: ~2MB byte-identical JSON every 4s ≈ 1.9GB/h of
+      // disk wear from a companion doing nothing. Best-effort — a failure
+      // only costs a re-read of the delta next cycle, never correctness.
+      if (discovery.changed || persistOwed) {
+        persistOwed = true;
+        await writeBackgroundEmbeddingDiscoveryIndex(vaultRoot, discovery.index)
+          .then(() => {
+            persistOwed = false;
+          })
+          .catch(() => undefined);
+      }
       return discovery.candidates;
     },
     lastScan: () => ({ totalFiles: lastTotalFiles, filesRead: lastFilesRead }),

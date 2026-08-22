@@ -1,4 +1,4 @@
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, rm, stat } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -300,6 +300,62 @@ describe('incremental background-embedding discovery', () => {
     const c3 = await restarted.listCandidates();
     expect(c3).toHaveLength(5);
     expect(restarted.lastScan().filesRead).toBe(0);
+  });
+
+  it('flags `changed` exactly: cold scan, quiet scan, growth, and removal', async () => {
+    await writeBacklogRecord('https://ch.test/0');
+    await writeBacklogRecord('https://ch.test/1');
+    const cold = await discoverBackgroundEmbeddingBacklog(root, null);
+    expect(cold.changed).toBe(true);
+
+    const quiet = await discoverBackgroundEmbeddingBacklog(root, cold.index);
+    expect(quiet.filesRead).toBe(0);
+    expect(quiet.changed).toBe(false);
+
+    await writeBacklogRecord('https://ch.test/2');
+    const grown = await discoverBackgroundEmbeddingBacklog(root, quiet.index);
+    expect(grown.changed).toBe(true);
+
+    // Removal-only: the prior index remembers a record whose backing row
+    // no longer exists. Zero files are re-read (nothing changed on disk to
+    // read), but the entry must be dropped — and that IS a change.
+    const ghost = {
+      mtimeMs: 1,
+      size: 1,
+      canonicalUrl: null,
+      url: '',
+      evidenceTier: 'metadata_only' as const,
+      hasDocEmbeddingRef: false,
+    };
+    const withGhost = {
+      schemaVersion: 1 as const,
+      byFileName: { ...grown.index.byFileName, 'ghost.json': ghost },
+    };
+    const removed = await discoverBackgroundEmbeddingBacklog(root, withGhost);
+    expect(removed.filesRead).toBe(0);
+    expect(removed.changed).toBe(true);
+    expect(Object.keys(removed.index.byFileName)).not.toContain('ghost.json');
+  });
+
+  it('does NOT rewrite the persisted cursor when nothing changed (idle-metronome guard)', async () => {
+    await writeBacklogRecord('https://nr.test/0');
+    const cursorPath = join(root, '_BAC', 'page-evidence', 'embed-lane-discovery.json');
+    const source = createIncrementalBackgroundEmbeddingCandidateSource(root);
+    await source.listCandidates();
+    const first = await stat(cursorPath);
+
+    // Quiet cycles: the on-disk cursor must not be touched at all.
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    await source.listCandidates();
+    await source.listCandidates();
+    const afterQuiet = await stat(cursorPath);
+    expect(afterQuiet.mtimeMs).toBe(first.mtimeMs);
+
+    // A real change persists again.
+    await writeBacklogRecord('https://nr.test/1');
+    await source.listCandidates();
+    const afterChange = await stat(cursorPath);
+    expect(afterChange.mtimeMs).toBeGreaterThan(first.mtimeMs);
   });
 });
 

@@ -35,7 +35,7 @@ case "$SMART_JSON" in *nvme_smart_health_information_log*) ;; *) exit 0 ;; esac
 export SMART_JSON
 
 BREACH="$(python3 - "$LOG" "$REPORT" "$RETAIN" "$HOURLY_ALERT_BYTES" "$SIXHOUR_ALERT_BYTES" <<'PYEOF'
-import json, os, subprocess, sys, time
+import json, os, re, subprocess, sys, time
 log_path, report_path, retain, hourly_alert, sixhour_alert = (
     sys.argv[1], sys.argv[2], int(sys.argv[3]), int(sys.argv[4]),
     int(sys.argv[5]))
@@ -86,6 +86,53 @@ for name, port in (("proc_test", 17374), ("proc_daily", 17373)):
     except Exception:
         pass
 
+# MACHINE-WIDE attribution (2026-08-22): a 57.7GB breach hour where BOTH
+# companions accounted for under 7GB was unattributable after the fact —
+# the per-pid counters existed for the companions only. Capture the top
+# writers across ALL readable pids (cumulative lifetime counters; readers
+# diff across entries for stable pids) plus swap pressure, so the NEXT
+# spike names its writer in the log itself. Root-owned daemons and
+# kernel_task are invisible without sudo — a large machine-wide delta
+# with no matching top_io growth plus rising swap points at the kernel.
+try:
+    r = subprocess.run(["bun", "-e", (
+        "import{dlopen,FFIType,ptr}from'bun:ffi';"
+        "import{execSync}from'child_process';"
+        "const l=dlopen('/usr/lib/libproc.dylib',{proc_pid_rusage:{args:[FFIType.i32,FFIType.i32,FFIType.ptr],returns:FFIType.i32}});"
+        "const pids=execSync('ps -axo pid=').toString().trim().split('\\n').map(s=>parseInt(s));"
+        "const out=[];"
+        "for(const pid of pids){const b=new BigUint64Array(64);"
+        "if(l.symbols.proc_pid_rusage(pid,4,ptr(b))===0)out.push([pid,Number(b[18]),Number(b[19])]);}"
+        "out.sort((a,z)=>z[2]-a[2]);"
+        "for(const [p,rd,wr] of out.slice(0,12))process.stdout.write(p+' '+rd+' '+wr+'\\n');"
+    )], capture_output=True, text=True, timeout=60,
+        env={**os.environ, "PATH": os.path.expanduser("~/.bun/bin") + ":" + os.environ.get("PATH", "")})
+    top = []
+    for line in r.stdout.splitlines():
+        parts = line.split()
+        if len(parts) != 3:
+            continue
+        pid = int(parts[0])
+        try:
+            comm = subprocess.run(["ps", "-p", str(parts[0]), "-o", "comm="],
+                                  capture_output=True, text=True, timeout=5).stdout.strip()
+        except Exception:
+            comm = ""
+        top.append({"pid": pid, "comm": comm.rsplit("/", 1)[-1][:48],
+                    "r": int(parts[1]), "w": int(parts[2])})
+    if top:
+        entry["top_io"] = top
+except Exception:
+    pass
+try:
+    swap = subprocess.run(["sysctl", "-n", "vm.swapusage"],
+                          capture_output=True, text=True, timeout=5).stdout
+    m = re.search(r"used = ([0-9.]+)M", swap)
+    if m:
+        entry["swap_used_mb"] = float(m.group(1))
+except Exception:
+    pass
+
 lines = []
 if os.path.exists(log_path):
     with open(log_path) as f:
@@ -133,6 +180,21 @@ if not breach and len(window) >= 2:
 if breach:
     st_delta = sum(entry.get(f"{k}_delta_1h") or 0 for k in ("vault", "vault_test"))
     breach = f"machine {breach}; sidetrack dirs {st_delta/1e6:+.0f}MB"
+    # Name the top per-pid write deltas since the previous entry, so a
+    # breach line is self-attributing instead of a mystery number.
+    try:
+        prev_top = {t["pid"]: t for t in (prev or {}).get("top_io", [])}
+        deltas = []
+        for t in entry.get("top_io", []):
+            p = prev_top.get(t["pid"])
+            if p is not None and isinstance(p.get("w"), int) and t["w"] >= p["w"]:
+                deltas.append((t["w"] - p["w"], t["comm"], t["pid"]))
+        deltas.sort(reverse=True)
+        named = ", ".join(f"{c}({p})={d/1e9:.1f}G" for d, c, p in deltas[:3] if d > 0)
+        if named:
+            breach = f"{breach}; top writers: {named}"
+    except Exception:
+        pass
     attribution = ", ".join(
         f"{k}={entry[f'{k}_delta_1h']/1e6:+.0f}MB"
         for k in ("vault", "vault_test", "conn", "conn_test")
