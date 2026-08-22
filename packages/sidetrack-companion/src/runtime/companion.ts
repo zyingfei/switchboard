@@ -56,6 +56,7 @@ import { createExtractionMaterializer } from '../sync/contract/extractionMateria
 import { createConnectionsMaterializer } from '../sync/contract/connectionsMaterializer.js';
 import { createConnectionsStore, SqliteConnectionsStore } from '../connections/snapshot.js';
 import { wrapTopicRevisionStoreForProduction } from '../connections/topicProductionRevival.js';
+import { createIncrementalTopicStateCarry } from '../connections/topicIncrementalStateCarry.js';
 import { createTopicRevisionStore } from '../producers/topic-revision.js';
 import { createTimelineMaterializer } from '../sync/contract/timelineMaterializer.js';
 import { createTimelineStore } from '../timeline/projection.js';
@@ -729,6 +730,10 @@ export const startCompanion = async (
       store: connectionsStore,
       topicRevisionStore: wrapTopicRevisionStoreForProduction(
         createTopicRevisionStore(options.vaultPath),
+        // State carry for the incremental shadow lane (see
+        // topicIncrementalStateCarry.ts) — persisted prior + delta per
+        // cycle instead of the stateless-per-drain zero marks.
+        { stateCarry: createIncrementalTopicStateCarry(options.vaultPath) },
       ),
       // Drain-time workGraph health artifact. The scheduler is defined
       // below (next to the server wiring — it shares the route's dep

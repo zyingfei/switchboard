@@ -94,6 +94,17 @@
 //      slot and the incremental-shadow candidate slot, so both producers'
 //      churn accumulates in the log stream the same way (the parity
 //      instrument the W5 shadow was always supposed to produce).
+//   3. (post-#404 follow-up) STATE CARRY for the incremental shadow lane —
+//      when `options.stateCarry` is wired (all four production
+//      composition roots do), the incremental candidate-shadow read
+//      serves the carried, persisted state (topicIncrementalStateCarry.ts)
+//      instead of the raw slot, and the write folds each cycle's output
+//      into that state with a membership change-gate and collapse-guard
+//      semantics. The `[topic.cycle] producer=incremental` mark gains
+//      `carried= priorTopics= priorMembers= delta= partial=
+//      collapse-suspect= action=` fields. See that module's header for
+//      the measured root cause (sticky-empty prior + fork-per-drain
+//      statelessness) and the W7 argument (no event-log reads at all).
 
 import {
   TOPIC_INCREMENTAL_REVISION_KEY,
@@ -102,6 +113,10 @@ import {
   type TopicRevisionStore,
 } from '../producers/topic-revision.js';
 import { buildServedTopicProducerReport } from './servedTopicProducer.js';
+import type {
+  IncrementalTopicStateCarry,
+  IncrementalTopicStateSeedSource,
+} from './topicIncrementalStateCarry.js';
 
 // Referenced only in the collapse-suppressed log line below (an
 // informational pointer to the manual escape hatch) — see the module
@@ -115,27 +130,23 @@ const memberCount = (revision: TopicRevision): number =>
 const formatChurn = (churnP50: number | null, churnP90: number | null): string =>
   `p50:${churnP50 === null ? 'n/a' : String(churnP50)},p90:${churnP90 === null ? 'n/a' : String(churnP90)}`;
 
-/**
- * Emits the `[topic.cycle]` parity mark for one producer's write. Pure
- * w.r.t. its inputs (no I/O) so it's independently testable; the wrapper
- * below supplies `previous` via a store read before delegating the write.
- */
-export const logTopicCycleMark = (
-  producer: 'leiden' | 'incremental',
-  revision: TopicRevision,
-  previous: TopicRevision | null,
-): void => {
-  const report = buildServedTopicProducerReport('leiden-cpm', revision, previous);
-  console.warn(
-    `[topic.cycle] producer=${producer} topics=${String(revision.topics.length)} ` +
-      `members=${String(memberCount(revision))} churn=${formatChurn(report.churnP50, report.churnP90)} ` +
-      `revision=${revision.revisionId}`,
-  );
-};
-
 export interface TopicProductionGuardOptions {
   /** Test seam — swap in a spy instead of console.warn. */
   readonly log?: (line: string) => void;
+  /**
+   * State carry for the incremental shadow lane (see
+   * topicIncrementalStateCarry.ts's header). When present, the
+   * incremental candidate-shadow READ serves the carried state (an empty
+   * persisted slot is treated as absent, with a cycle-legit seed
+   * fallback: legacy slot, then the served active revision — never a
+   * backlog scan), and the incremental candidate-shadow WRITE folds each
+   * cycle's output into the carried state (adopt / update / cursor-only
+   * / collapse-suspect), emitting the extended `[topic.cycle]` parity
+   * mark (carried= priorTopics= priorMembers= delta= partial=
+   * collapse-suspect=). Omitted (existing tests / bespoke tooling): the
+   * pre-state-carry behavior is byte-identical.
+   */
+  readonly stateCarry?: IncrementalTopicStateCarry;
 }
 
 /**
@@ -150,6 +161,83 @@ export const wrapTopicRevisionStoreForProduction = (
   options: TopicProductionGuardOptions = {},
 ): TopicRevisionStore => {
   const log = options.log ?? ((line: string) => console.warn(line));
+  const stateCarry = options.stateCarry;
+
+  // What the incremental read path last served as the shadow's prior —
+  // the same value the materializer used as `previousRevision` for this
+  // cycle's build, so the parity mark's churn is computed against the
+  // ACTUAL base, not whatever happens to be in the legacy slot. Seed
+  // marks are logged once per (process, source) — production drains are
+  // fork-per-drain children, so this is at most one line per drain
+  // during the bootstrap window.
+  let lastIncrementalPrior: TopicRevision | null = null;
+  let lastIncrementalSeedSource: IncrementalTopicStateSeedSource = 'none';
+  let lastIncrementalReadDone = false;
+  const seedSourcesLogged = new Set<string>();
+
+  const canSeedIncrementalFrom = (revision: TopicRevision): boolean =>
+    revision.topics.length > 0 &&
+    (revision.algorithmVersion === TOPIC_LEIDEN_CPM_REVISION_KEY ||
+      revision.algorithmVersion === TOPIC_INCREMENTAL_REVISION_KEY);
+
+  const readIncrementalPrior = async (): Promise<TopicRevision | null> => {
+    if (stateCarry === undefined) {
+      return inner.readCandidateShadowRevision(TOPIC_INCREMENTAL_REVISION_KEY);
+    }
+    const carried = await stateCarry.readCarriedRevision();
+    if (carried !== null) {
+      lastIncrementalPrior = carried;
+      lastIncrementalSeedSource = 'state';
+      lastIncrementalReadDone = true;
+      return carried;
+    }
+    // No carried state yet — seed from the first populated cycle-legit
+    // artifact. An EMPTY legacy slot is treated as absent (the
+    // sticky-empty trap this module kills); the served active revision
+    // is only a valid refinement base when it is leiden-built (or a
+    // prior incremental) — never a foreign producer's clustering.
+    const legacy = await inner.readCandidateShadowRevision(TOPIC_INCREMENTAL_REVISION_KEY);
+    if (legacy !== null && canSeedIncrementalFrom(legacy)) {
+      if (!seedSourcesLogged.has('legacy-slot')) {
+        seedSourcesLogged.add('legacy-slot');
+        log(
+          `[topic.state] seed base=legacy-slot topics=${String(legacy.topics.length)} ` +
+            `revision=${legacy.revisionId}`,
+        );
+      }
+      lastIncrementalPrior = legacy;
+      lastIncrementalSeedSource = 'legacy-slot';
+      lastIncrementalReadDone = true;
+      return legacy;
+    }
+    const active = await inner.readActiveRevision();
+    if (active !== null && canSeedIncrementalFrom(active)) {
+      if (!seedSourcesLogged.has('active-leiden')) {
+        seedSourcesLogged.add('active-leiden');
+        log(
+          `[topic.state] seed base=active-leiden topics=${String(active.topics.length)} ` +
+            `revision=${active.revisionId}`,
+        );
+      }
+      lastIncrementalPrior = active;
+      lastIncrementalSeedSource = 'active-leiden';
+      lastIncrementalReadDone = true;
+      return active;
+    }
+    lastIncrementalPrior = null;
+    lastIncrementalSeedSource = 'none';
+    lastIncrementalReadDone = true;
+    return null;
+  };
+
+  const readCandidateShadowRevision = async (
+    candidate: string,
+  ): Promise<TopicRevision | null> => {
+    if (candidate !== TOPIC_INCREMENTAL_REVISION_KEY || stateCarry === undefined) {
+      return inner.readCandidateShadowRevision(candidate);
+    }
+    return readIncrementalPrior();
+  };
 
   const putActiveRevision = async (revision: TopicRevision): Promise<void> => {
     if (revision.algorithmVersion !== TOPIC_LEIDEN_CPM_REVISION_KEY) {
@@ -192,19 +280,70 @@ export const wrapTopicRevisionStoreForProduction = (
       await inner.putCandidateShadowRevision(candidate, revision);
       return;
     }
-    const previous = await inner.readCandidateShadowRevision(candidate);
+    if (stateCarry === undefined) {
+      // Pre-state-carry behavior, byte-identical (tests / bespoke tooling
+      // that wrap without a carry).
+      const previous = await inner.readCandidateShadowRevision(candidate);
+      const report = buildServedTopicProducerReport('leiden-cpm', revision, previous);
+      log(
+        `[topic.cycle] producer=incremental topics=${String(revision.topics.length)} ` +
+          `members=${String(memberCount(revision))} churn=${formatChurn(report.churnP50, report.churnP90)} ` +
+          `revision=${revision.revisionId}`,
+      );
+      await inner.putCandidateShadowRevision(candidate, revision);
+      return;
+    }
+    // Churn vs the ACTUAL prior this cycle's build refined from (the
+    // value the read path served); fall back to a fresh read when the
+    // caller wrote without reading first (bespoke tooling).
+    const previous = lastIncrementalReadDone ? lastIncrementalPrior : await readIncrementalPrior();
+    const seedSource = lastIncrementalSeedSource;
+    // Consume the memo: the next cycle's put must not reuse this cycle's
+    // prior if the caller skips the read (the carry itself stays fresh).
+    lastIncrementalReadDone = false;
     const report = buildServedTopicProducerReport('leiden-cpm', revision, previous);
+    const active = await inner.readActiveRevision();
+    const decision = await stateCarry.recordCycleResult(revision, {
+      activeRevision: active,
+      seedSource,
+    });
     log(
       `[topic.cycle] producer=incremental topics=${String(revision.topics.length)} ` +
         `members=${String(memberCount(revision))} churn=${formatChurn(report.churnP50, report.churnP90)} ` +
-        `revision=${revision.revisionId}`,
+        `carried=${String(decision.carried)} priorTopics=${String(decision.priorTopicCount)} ` +
+        `priorMembers=${String(decision.priorMemberCount)} delta=${String(decision.membershipDelta)} ` +
+        `partial=${String(decision.partial)} collapse-suspect=${String(
+          decision.action === 'collapse-suspect',
+        )} action=${decision.action} revision=${revision.revisionId}`,
     );
-    await inner.putCandidateShadowRevision(candidate, revision);
+    switch (decision.action) {
+      case 'collapse-suspect':
+        // Never persist empty-over-populated on the shadow lane: the
+        // carried state and the legacy slot keep the prior; the empty
+        // build is persisted for audit/lineage only (mirrors the leiden
+        // active-slot guard above).
+        await inner.putRevision(revision);
+        return;
+      case 'adopt':
+      case 'update':
+        // Membership changed — mirror the carried state into the legacy
+        // candidate slot so raw readers (workGraphHealth) stay in sync.
+        await inner.putCandidateShadowRevision(candidate, revision);
+        return;
+      case 'cursor-only':
+      case 'observe-empty':
+        // Change-gate: membership identical (or nothing to keep) — no
+        // slot rewrite. The cursor (when ids advanced) already persisted
+        // inside recordCycleResult, so the next drain's skip-gate still
+        // sees the fresh revisionId via the carried read.
+        return;
+    }
   };
 
   return {
     ...inner,
     putActiveRevision,
     putCandidateShadowRevision,
+    readCandidateShadowRevision,
   };
 };

@@ -1,3 +1,6 @@
+import { mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 
 import {
@@ -8,6 +11,7 @@ import {
   type TopicRevision,
   type TopicRevisionStore,
 } from '../producers/topic-revision.js';
+import { createIncrementalTopicStateCarry } from './topicIncrementalStateCarry.js';
 import { wrapTopicRevisionStoreForProduction } from './topicProductionRevival.js';
 
 const revision = (
@@ -228,5 +232,217 @@ describe('wrapTopicRevisionStoreForProduction — parity/cycle marks', () => {
     // The second mark should report a non-trivial churn value (the topic
     // split changed co-membership for every shared page), not 'n/a'.
     expect(marks[1]).not.toContain('churn=p50:n/a,p90:n/a');
+  });
+});
+
+describe('wrapTopicRevisionStoreForProduction — incremental state carry', () => {
+  const withVault = async (
+    run: (vaultRoot: string) => Promise<void>,
+  ): Promise<void> => {
+    const vaultRoot = await mkdtemp(join(tmpdir(), 'sidetrack-revival-carry-'));
+    try {
+      await run(vaultRoot);
+    } finally {
+      await rm(vaultRoot, { recursive: true, force: true });
+    }
+  };
+
+  const wrap = (
+    inner: TopicRevisionStore,
+    vaultRoot: string,
+    logs: string[],
+  ): TopicRevisionStore => {
+    const log = (line: string): void => {
+      logs.push(line);
+    };
+    return wrapTopicRevisionStoreForProduction(inner, {
+      log,
+      stateCarry: createIncrementalTopicStateCarry(vaultRoot, { log }),
+    });
+  };
+
+  it('treats an EMPTY legacy incremental slot as absent and seeds from the populated active revision (kills the sticky-empty trap)', async () => {
+    await withVault(async (vaultRoot) => {
+      const activeLeiden = revision('rev-active', [
+        { topicId: 'topic:a', members: ['u1', 'u2', 'u3'] },
+      ]);
+      const emptySlot = revision('rev-empty-slot', [], {
+        algorithmVersion: TOPIC_INCREMENTAL_REVISION_KEY,
+      });
+      const inner = createMemoryStore({
+        active: activeLeiden,
+        candidateShadows: { [TOPIC_INCREMENTAL_REVISION_KEY]: emptySlot },
+      });
+      const logs: string[] = [];
+      const wrapped = wrap(inner, vaultRoot, logs);
+
+      const prior = await wrapped.readCandidateShadowRevision(TOPIC_INCREMENTAL_REVISION_KEY);
+      // NOT the sticky empty slot — the populated served revision.
+      expect(prior).toBe(activeLeiden);
+      expect(logs.some((l) => l.includes('seed base=active-leiden'))).toBe(true);
+    });
+  });
+
+  it('prefers a POPULATED legacy slot over the active revision when no carried state exists', async () => {
+    await withVault(async (vaultRoot) => {
+      const activeLeiden = revision('rev-active', [{ topicId: 'topic:a', members: ['u1'] }]);
+      const populatedSlot = revision(
+        'rev-slot',
+        [{ topicId: 'topic:b', members: ['u2', 'u3'] }],
+        { algorithmVersion: TOPIC_INCREMENTAL_REVISION_KEY },
+      );
+      const inner = createMemoryStore({
+        active: activeLeiden,
+        candidateShadows: { [TOPIC_INCREMENTAL_REVISION_KEY]: populatedSlot },
+      });
+      const logs: string[] = [];
+      const wrapped = wrap(inner, vaultRoot, logs);
+      expect(await wrapped.readCandidateShadowRevision(TOPIC_INCREMENTAL_REVISION_KEY)).toBe(
+        populatedSlot,
+      );
+      expect(logs.some((l) => l.includes('seed base=legacy-slot'))).toBe(true);
+    });
+  });
+
+  it('adopts the first populated write, then serves the carried state on subsequent reads with the extended mark fields', async () => {
+    await withVault(async (vaultRoot) => {
+      const activeLeiden = revision('rev-active', [
+        { topicId: 'topic:a', members: ['u1', 'u2', 'u3'] },
+      ]);
+      const inner = createMemoryStore({ active: activeLeiden });
+      const logs: string[] = [];
+      const wrapped = wrap(inner, vaultRoot, logs);
+
+      // Cycle 1: read (seed) then write a populated incremental build.
+      await wrapped.readCandidateShadowRevision(TOPIC_INCREMENTAL_REVISION_KEY);
+      const built = revision('rev-inc-1', [{ topicId: 'topic:a', members: ['u1', 'u2', 'u3'] }], {
+        algorithmVersion: TOPIC_INCREMENTAL_REVISION_KEY,
+      });
+      await wrapped.putCandidateShadowRevision(TOPIC_INCREMENTAL_REVISION_KEY, built);
+
+      const adoptMark = logs.find((l) => l.startsWith('[topic.cycle] producer=incremental'));
+      expect(adoptMark).toContain('carried=false');
+      expect(adoptMark).toContain('action=adopt');
+      expect(adoptMark).toContain('collapse-suspect=false');
+      // Coverage reached the active revision (3/3) ⇒ not partial.
+      expect(adoptMark).toContain('partial=false');
+      // Legacy slot mirrored for raw readers.
+      expect(
+        await inner.readCandidateShadowRevision(TOPIC_INCREMENTAL_REVISION_KEY),
+      ).toBe(built);
+
+      // Cycle 2: the carried state is the prior now.
+      const prior = await wrapped.readCandidateShadowRevision(TOPIC_INCREMENTAL_REVISION_KEY);
+      expect(prior?.revisionId).toBe('rev-inc-1');
+      expect(prior?.topics.length).toBe(1);
+    });
+  });
+
+  it('collapse-suspect: an empty incremental build over a carried prior keeps the slot and state, audibly', async () => {
+    await withVault(async (vaultRoot) => {
+      const activeLeiden = revision('rev-active', [{ topicId: 'topic:a', members: ['u1', 'u2'] }]);
+      const inner = createMemoryStore({ active: activeLeiden });
+      const logs: string[] = [];
+      const wrapped = wrap(inner, vaultRoot, logs);
+
+      const built = revision('rev-inc-1', [{ topicId: 'topic:a', members: ['u1', 'u2'] }], {
+        algorithmVersion: TOPIC_INCREMENTAL_REVISION_KEY,
+      });
+      await wrapped.readCandidateShadowRevision(TOPIC_INCREMENTAL_REVISION_KEY);
+      await wrapped.putCandidateShadowRevision(TOPIC_INCREMENTAL_REVISION_KEY, built);
+
+      const empty = revision('rev-inc-empty', [], {
+        algorithmVersion: TOPIC_INCREMENTAL_REVISION_KEY,
+        visitSimilarityRevisionId: 'sim-2',
+      });
+      await wrapped.readCandidateShadowRevision(TOPIC_INCREMENTAL_REVISION_KEY);
+      await wrapped.putCandidateShadowRevision(TOPIC_INCREMENTAL_REVISION_KEY, empty);
+
+      const marks = logs.filter((l) => l.startsWith('[topic.cycle] producer=incremental'));
+      expect(marks[1]).toContain('collapse-suspect=true');
+      expect(marks[1]).toContain('carried=true');
+      expect(marks[1]).toContain('priorTopics=1');
+      // The slot still holds the populated build (never empty-over-populated).
+      expect(
+        (await inner.readCandidateShadowRevision(TOPIC_INCREMENTAL_REVISION_KEY))?.revisionId,
+      ).toBe('rev-inc-1');
+      // The empty build is persisted for audit only.
+      expect(await inner.readRevision('rev-inc-empty')).not.toBeNull();
+      // And the carried read still serves the populated prior.
+      const carried = await wrapped.readCandidateShadowRevision(TOPIC_INCREMENTAL_REVISION_KEY);
+      expect(carried?.topics.length).toBe(1);
+    });
+  });
+
+  it('change-gate: identical membership under a new revisionId skips the slot write but advances the carried revisionId (skip-gate continuity)', async () => {
+    await withVault(async (vaultRoot) => {
+      const activeLeiden = revision('rev-active', [{ topicId: 'topic:a', members: ['u1', 'u2'] }]);
+      const inner = createMemoryStore({ active: activeLeiden });
+      const logs: string[] = [];
+      const wrapped = wrap(inner, vaultRoot, logs);
+
+      const built = revision('rev-inc-1', [{ topicId: 'topic:a', members: ['u1', 'u2'] }], {
+        algorithmVersion: TOPIC_INCREMENTAL_REVISION_KEY,
+      });
+      await wrapped.readCandidateShadowRevision(TOPIC_INCREMENTAL_REVISION_KEY);
+      await wrapped.putCandidateShadowRevision(TOPIC_INCREMENTAL_REVISION_KEY, built);
+      const writesAfterAdopt = inner.writes.length;
+
+      const sameContent = revision(
+        'rev-inc-2',
+        [{ topicId: 'topic:a', members: ['u1', 'u2'] }],
+        { algorithmVersion: TOPIC_INCREMENTAL_REVISION_KEY, visitSimilarityRevisionId: 'sim-2' },
+      );
+      await wrapped.readCandidateShadowRevision(TOPIC_INCREMENTAL_REVISION_KEY);
+      await wrapped.putCandidateShadowRevision(TOPIC_INCREMENTAL_REVISION_KEY, sameContent);
+
+      // No inner writes at all for the unchanged-content cycle.
+      expect(inner.writes.length).toBe(writesAfterAdopt);
+      const marks = logs.filter((l) => l.startsWith('[topic.cycle] producer=incremental'));
+      expect(marks[1]).toContain('action=cursor-only');
+      expect(marks[1]).toContain('delta=0');
+
+      // But the carried read serves the ADVANCED revisionId, so the
+      // materializer's skip-gate can cache-hit next drain.
+      const carried = await wrapped.readCandidateShadowRevision(TOPIC_INCREMENTAL_REVISION_KEY);
+      expect(carried?.revisionId).toBe('rev-inc-2');
+    });
+  });
+
+  it('carries state across wrapper instances via disk (fork-per-drain shape)', async () => {
+    await withVault(async (vaultRoot) => {
+      const activeLeiden = revision('rev-active', [{ topicId: 'topic:a', members: ['u1', 'u2'] }]);
+      const built = revision('rev-inc-1', [{ topicId: 'topic:a', members: ['u1', 'u2'] }], {
+        algorithmVersion: TOPIC_INCREMENTAL_REVISION_KEY,
+      });
+      {
+        const inner = createMemoryStore({ active: activeLeiden });
+        const logs: string[] = [];
+        const wrapped = wrap(inner, vaultRoot, logs);
+        await wrapped.readCandidateShadowRevision(TOPIC_INCREMENTAL_REVISION_KEY);
+        await wrapped.putCandidateShadowRevision(TOPIC_INCREMENTAL_REVISION_KEY, built);
+      }
+      // A NEW wrapper + NEW inner store (the child process shape): the
+      // carried prior comes from the state artifact, not process memory.
+      const inner2 = createMemoryStore({ active: activeLeiden });
+      const logs2: string[] = [];
+      const wrapped2 = wrap(inner2, vaultRoot, logs2);
+      const carried = await wrapped2.readCandidateShadowRevision(TOPIC_INCREMENTAL_REVISION_KEY);
+      expect(carried).not.toBeNull();
+      expect(carried!.revisionId).toBe('rev-inc-1');
+      expect(logs2.some((l) => l.startsWith('[topic.state] loaded'))).toBe(true);
+    });
+  });
+
+  it('never seeds from a non-leiden active revision (foreign producer clustering is not a refinement base)', async () => {
+    await withVault(async (vaultRoot) => {
+      const activeUnionFind = revision('rev-active-uf', [{ topicId: 'topic:a', members: ['u1'] }], {
+        algorithmVersion: TOPIC_UNION_FIND_REVISION_KEY,
+      });
+      const inner = createMemoryStore({ active: activeUnionFind });
+      const logs: string[] = [];
+      const wrapped = wrap(inner, vaultRoot, logs);
+      expect(await wrapped.readCandidateShadowRevision(TOPIC_INCREMENTAL_REVISION_KEY)).toBeNull();
+    });
   });
 });
