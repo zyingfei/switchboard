@@ -97,7 +97,9 @@ export interface CaptureTextFtsStore {
   readonly matchWholeWord: (query: string) => readonly CaptureTextMatch[];
   /** Stream the JSONL shards and repopulate facts (cold rebuild /
    *  repair). Recovery-only — never called from an operational path. */
-  readonly rebuildFromJsonl: (logRoot: string) => Promise<void>;
+  /** `priorRoots` (e.g. the F2 retired-log mirror) are walked before
+   *  `logRoot` — see the implementation for why. */
+  readonly rebuildFromJsonl: (logRoot: string, priorRoots?: readonly string[]) => Promise<void>;
   /** Per-replica max ingested seq. */
   readonly watermark: () => VersionVector;
   readonly close: () => void;
@@ -393,7 +395,19 @@ export const createCaptureTextFtsStore = async (
     return out;
   };
 
-  const rebuildFromJsonl = async (logRoot: string): Promise<void> => {
+  // F2 seam (2026-08-21): `priorRoots` (e.g. the F2 retired-log mirror,
+  // analytics/hotTailRetirement.ts:retiredEventLogRoot) are walked BEFORE
+  // `logRoot`. Order is not load-bearing for THIS store — rebuild always
+  // calls the unconditional, idempotent `ingestMany` per file (INSERT OR
+  // IGNORE keyed by replica+seq); the watermark-gated filter only exists
+  // on the separate `catchUp(events)` in-memory path, never on this JSONL
+  // read. Retired-first is kept anyway to match the ordering contract
+  // eventStore.ts's catchUpFromJsonl DOES require, keeping the convention
+  // uniform across every typed-store cold-repair entrypoint.
+  const rebuildFromJsonl = async (
+    logRoot: string,
+    priorRoots: readonly string[] = [],
+  ): Promise<void> => {
     // True rebuild/repair: clear derived facts + watermark so stale
     // rows from a prior state can't survive. JSONL stays authoritative.
     // Recovery-only — see plan doc "Binding rule".
@@ -401,39 +415,41 @@ export const createCaptureTextFtsStore = async (
       DELETE FROM capture_text_doc;
       DELETE FROM ingest_watermark;
     `);
-    let replicaDirs: string[];
-    try {
-      replicaDirs = await readdir(logRoot);
-    } catch {
-      return;
-    }
-    for (const replicaDir of replicaDirs) {
-      let files: string[];
+    for (const root of [...priorRoots, logRoot]) {
+      let replicaDirs: string[];
       try {
-        files = (await readdir(join(logRoot, replicaDir)))
-          .filter((f) => f.endsWith('.jsonl'))
-          .sort();
+        replicaDirs = await readdir(root);
       } catch {
         continue;
       }
-      for (const file of files) {
-        let raw: string;
+      for (const replicaDir of replicaDirs) {
+        let files: string[];
         try {
-          raw = await readFile(join(logRoot, replicaDir, file), 'utf8');
+          files = (await readdir(join(root, replicaDir)))
+            .filter((f) => f.endsWith('.jsonl'))
+            .sort();
         } catch {
           continue;
         }
-        const events: AcceptedEvent[] = [];
-        for (const line of raw.split('\n')) {
-          const trimmed = line.trim();
-          if (trimmed.length === 0) continue;
+        for (const file of files) {
+          let raw: string;
           try {
-            events.push(JSON.parse(trimmed) as AcceptedEvent);
+            raw = await readFile(join(root, replicaDir, file), 'utf8');
           } catch {
-            // skip malformed line; JSONL stays authoritative
+            continue;
           }
+          const events: AcceptedEvent[] = [];
+          for (const line of raw.split('\n')) {
+            const trimmed = line.trim();
+            if (trimmed.length === 0) continue;
+            try {
+              events.push(JSON.parse(trimmed) as AcceptedEvent);
+            } catch {
+              // skip malformed line; JSONL stays authoritative
+            }
+          }
+          ingestMany(events);
         }
-        ingestMany(events);
       }
     }
   };
