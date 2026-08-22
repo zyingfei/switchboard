@@ -4,6 +4,7 @@ import {
   DEFAULT_BACKGROUND_EMBEDDING_CONFIG,
   createBackgroundEmbeddingLane,
   isBackgroundEmbeddingBacklog,
+  nextCycleDelayMs,
   resolveEmbedBatchCapFromEnv,
   type BackgroundEmbeddingCandidate,
   type BackgroundEmbeddingLaneDeps,
@@ -633,5 +634,82 @@ describe('resolveEmbedBatchCapFromEnv', () => {
 
   it('a custom fallback is used instead of the lane default', () => {
     expect(resolveEmbedBatchCapFromEnv(undefined, 5)).toBe(5);
+  });
+});
+
+describe('nextCycleDelayMs', () => {
+  const config = { cycleIntervalMs: 4_000, idleIntervalMs: 60_000 };
+  const base = { pausedForDrain: false, pausedForWarmup: false, embedded: 0, failed: 0 };
+
+  it('keeps the short cadence while blocked or making real progress', () => {
+    expect(nextCycleDelayMs({ ...base, pausedForDrain: true }, config)).toBe(4_000);
+    expect(nextCycleDelayMs({ ...base, pausedForWarmup: true }, config)).toBe(4_000);
+    expect(nextCycleDelayMs({ ...base, embedded: 1 }, config)).toBe(4_000);
+    expect(nextCycleDelayMs({ ...base, failed: 1 }, config)).toBe(4_000);
+  });
+
+  it('waits the idle interval for skip-only and empty cycles', () => {
+    // The 2026-08-22 idle-metronome: a skip-only backlog kept the 4s
+    // cadence forever. Skips do not constitute progress a hotter poll
+    // could accelerate — content arrival unblocks them, not polling.
+    expect(nextCycleDelayMs(base, config)).toBe(60_000);
+  });
+});
+
+describe('progress persistence gating', () => {
+  it('persists once for repeated skip-only cycles, again on a material change', async () => {
+    let writes = 0;
+    let mode: 'skip' | 'fail' = 'skip';
+    const lane = createBackgroundEmbeddingLane(
+      deps({
+        listCandidates: async () => [candidate({ canonicalUrl: 'https://gate.test' })],
+        embedCanonicalUrl: async () =>
+          mode === 'skip'
+            ? { outcome: 'skipped' as const, reason: 'no-page-content' }
+            : { outcome: 'failed' as const, reason: 'embed-error' },
+        writeProgress: async () => {
+          writes += 1;
+        },
+      }),
+      DEFAULT_BACKGROUND_EMBEDDING_CONFIG,
+    );
+    // First cycle establishes the on-disk cursor (no prior read).
+    await lane.runOnce();
+    expect(writes).toBe(1);
+    // Further skip-only cycles change nothing material (skip strikes are
+    // in-memory until graduation) — the byte-churn write must be skipped.
+    await lane.runOnce();
+    await lane.runOnce();
+    expect(writes).toBe(1);
+    // A failure bumps the attempt counter — material, so it persists.
+    mode = 'fail';
+    await lane.runOnce();
+    expect(writes).toBe(2);
+  });
+
+  it('a restart with unchanged material state does not rewrite the cursor', async () => {
+    let writes = 0;
+    const persisted = {
+      schemaVersion: 1 as const,
+      attemptsByCanonicalUrl: { 'https://x.test': 1 },
+      embeddedTotal: 3,
+      lastRunAtMs: 500,
+      lastSuccessAtMs: 400,
+    };
+    const lane = createBackgroundEmbeddingLane(
+      deps({
+        listCandidates: async () => [],
+        embedCanonicalUrl: async () => 'embedded',
+        readProgress: async () => persisted,
+        writeProgress: async () => {
+          writes += 1;
+        },
+      }),
+      DEFAULT_BACKGROUND_EMBEDDING_CONFIG,
+    );
+    // Empty backlog cycle: only lastRunAtMs would tick — not material.
+    await lane.runOnce();
+    await lane.runOnce();
+    expect(writes).toBe(0);
   });
 });
