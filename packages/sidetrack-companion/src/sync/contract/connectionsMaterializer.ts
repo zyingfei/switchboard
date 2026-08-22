@@ -6248,12 +6248,15 @@ export const createConnectionsMaterializer = (
       servedTopicRevision = leidenRevision;
       await topicRevisionStore.putActiveRevision(leidenRevision);
     }
-    // Non-leiden producers ('idf-rkn-split' default, 'union-find')
-    // keep the EXACT pre-W2 path: shadow-off ⇒ the selected baseline
-    // is served (G1 guard); shadow-on ⇒ the idf-rkn flip below. The
-    // only W2 change is excluding the case where leiden already served.
+    // Non-leiden, non-incremental producers ('idf-rkn-split' default,
+    // 'union-find') keep the EXACT pre-W2 path: shadow-off ⇒ the
+    // selected baseline is served (G1 guard); shadow-on ⇒ the idf-rkn
+    // flip below. W2 excluded leiden (served above); W5 (post-#404)
+    // excludes 'incremental' the same way — it is served from its own
+    // dedicated block below, not this baseline path.
     if (
       servedProducer !== 'leiden-cpm' &&
+      servedProducer !== 'incremental' &&
       !shouldBuildTopicShadowCandidate() &&
       topicRevision !== previousTopicRevision
     ) {
@@ -6266,6 +6269,7 @@ export const createConnectionsMaterializer = (
     // we persist active + feed into the served snapshot.
     if (
       servedProducer !== 'leiden-cpm' &&
+      servedProducer !== 'incremental' &&
       !topicCadenceSkipped &&
       shouldBuildTopicShadowCandidate()
     ) {
@@ -6350,21 +6354,36 @@ export const createConnectionsMaterializer = (
         mark('topicShadowCandidate->active (flip)');
       }
     }
-    // W5 Phase B — incremental topic-revision SHADOW (observe-only,
-    // default OFF via SIDETRACK_TOPIC_INCREMENTAL_SHADOW). Runs
-    // buildIncrementalTopicRevision alongside the served leiden-cpm
-    // producer on every drain; publishes ONLY to the dedicated
-    // TOPIC_INCREMENTAL_REVISION_KEY candidate-shadow slot — never
-    // active/served — so churn/quality diagnostics accumulate in
+    // W5 Phase B — incremental topic-revision builder (default OFF via
+    // SIDETRACK_TOPIC_INCREMENTAL_SHADOW, runs alongside the served
+    // leiden-cpm producer on every drain, publishing ONLY to the
+    // dedicated TOPIC_INCREMENTAL_REVISION_KEY candidate-shadow slot —
+    // never active/served — so churn/quality diagnostics accumulate in
     // workGraphHealth's Experiments row (topic.incremental-shadow) with
-    // zero serving-path risk. Lineage chains across drains by reading
-    // its OWN prior candidate-shadow revision back each drain; the very
-    // first activation (no prior shadow yet) seeds off whichever
-    // leiden-cpm candidate is currently on disk (built above this drain,
-    // or carried from an earlier one).
+    // zero serving-path risk).
+    //
+    // W5 seam (post-#404) — the SAME build additionally runs, and its
+    // result is PROMOTED to active/served, whenever
+    // SIDETRACK_TOPIC_PRODUCER=incremental (servedIncremental below):
+    // this is the one bespoke call site buildIncrementalTopicRevision
+    // uses (topicRevisionBuilderFor's registry deliberately excludes it,
+    // see that function's TOPIC_INCREMENTAL_REVISION_KEY case), so
+    // "select the incremental producer" means "run this block and
+    // persist its output" rather than a registry-lookup swap. Serving is
+    // still OFF by default (DEFAULT_SERVED_TOPIC_PRODUCER stays
+    // 'leiden-cpm'); this only makes the flip possible via env + restart.
+    // Lineage chains across drains by reading its OWN prior
+    // candidate-shadow revision back each drain; the very first
+    // activation (no prior shadow yet) seeds off whichever leiden-cpm
+    // candidate is currently on disk (built above this drain, or carried
+    // from an earlier one) — so flipping to 'incremental' cold, before
+    // leiden-cpm has ever produced a candidate, serves nothing new this
+    // drain (servedTopicRevision keeps its prior value; self-heals once
+    // a leiden-cpm candidate exists to seed from).
+    const servedIncremental = servedProducer === 'incremental';
     {
       const shadowStartedAtMs = Date.now();
-      if (!topicIncrementalShadowEnabled()) {
+      if (!topicIncrementalShadowEnabled() && !servedIncremental) {
         topicIncrementalShadowDiagnostics = {
           enabled: false,
           ranThisDrain: false,
@@ -6423,6 +6442,13 @@ export const createConnectionsMaterializer = (
               mark(
                 `topicIncremental.shadow dt=${String(Date.now() - shadowStartedAtMs)} topics=${String(previousIncrementalShadow.topics.length)} promoted=0 overflow=0 (cacheHit)`,
               );
+              if (servedIncremental) {
+                servedTopicRevision = previousIncrementalShadow;
+                await topicRevisionStore.putActiveRevision(previousIncrementalShadow);
+                mark(
+                  `servedProducer=incremental cacheHit topics=${String(previousIncrementalShadow.topics.length)}`,
+                );
+              }
             } else {
               const shadowDirtyVisitKeys = collectTouchedVisits(dirtyScopes, pendingEventsForDrain);
               // Eligibility lookup over the FULL corpus. A per-drain
@@ -6560,7 +6586,19 @@ export const createConnectionsMaterializer = (
                     shadowResult.revision.topics.length,
                   )} promoted=${String(shadowResult.promotedCount)} overflow=0`,
                 );
+                if (servedIncremental) {
+                  servedTopicRevision = shadowResult.revision;
+                  await topicRevisionStore.putActiveRevision(shadowResult.revision);
+                  mark(
+                    `servedProducer=incremental build topics=${String(shadowResult.revision.topics.length)}`,
+                  );
+                }
               }
+              // overflow branch intentionally does NOT promote — overflow
+              // means result.revision IS the previous (unchanged) revision;
+              // serving stays whatever putActiveRevision last persisted, no
+              // clobber (matches the shadow's own "don't serve/persist"
+              // contract above).
             }
           }
         } catch (error) {

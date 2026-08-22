@@ -6,13 +6,25 @@
 // change); W2's auto-flip changes the default to 'leiden-cpm' ONLY
 // after the acceptance gate passes. 'union-find' is the conservative
 // fallback (baseline, no shadow).
-
-export type ServedTopicProducer = 'idf-rkn-split' | 'leiden-cpm' | 'union-find';
+//
+// W5 (post-#404) — 'incremental' added: buildIncrementalTopicRevision
+// (connections/incrementalTopicRevision.ts), the local-refinement
+// producer that has run as an observe-only candidate-shadow since W5
+// Phase B (SIDETRACK_TOPIC_INCREMENTAL_SHADOW=1, see
+// connectionsMaterializer.ts's "W5 Phase B" block). Selecting it here
+// makes connectionsMaterializer.ts promote that SAME build to the
+// active/served revision instead of only the shadow slot — same
+// instant-rollback shape as the idf-rkn->leiden-cpm cutover (env value +
+// restart). NOT the default: parity vs. leiden-cpm is still
+// accumulating post-#404 (real-vault run showed the shadow needs a
+// leiden-built base to refine from; it structurally cannot cold-start).
+export type ServedTopicProducer = 'idf-rkn-split' | 'leiden-cpm' | 'union-find' | 'incremental';
 
 const VALID: ReadonlySet<string> = new Set<ServedTopicProducer>([
   'idf-rkn-split',
   'leiden-cpm',
   'union-find',
+  'incremental',
 ]);
 
 // W2 default. AUTO-FLIPPED to 'leiden-cpm' (W2.4) after the gate
