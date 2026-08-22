@@ -4538,3 +4538,20 @@ report lines name the top per-pid write deltas. First instrumented entry
 already reframed the spikes: every 40–84G hour in the 147-entry history
 coincides with an agent dev arc (builds/tests), stacked on the companion
 metronome — the metronome was ours to kill, the rest now self-attributes.
+
+## 2026-08-22 — embed-lane fresh-first ordering (starvation found during #414 live verify)
+
+Live verification of #414 stalled: two CDP-forced real captures flowed
+through content drains and the body lane, but never reached embedding —
+`[page-evidence.embed-lane] cycle ... skipped=16 backlog=2163
+skippedByReason=no-page-content:16` with the SAME alphabetical head every
+cycle. Root cause: discovery returns candidates sorted by canonicalUrl,
+the batch cap takes the head, and the head is a ~2,100-record
+`no-page-content` wall; skip strikes are in-memory, so every restart
+resets the churn. New browsing sat HOURS behind junk — similarity never
+advanced, the topic cycle never fired, and (pre-#412) the 4s spin that
+masked this was itself the 1.9GB/h metronome. Fix: order the backlog by
+demonstrated junk-ness ascending (persisted failed attempts + session
+skip strikes; stable sort keeps URL order within tiers) so fresh records
+always land in front. The junk wall still churns — one batch head per
+cycle behind any fresh work — and quarantine keeps retiring it.
