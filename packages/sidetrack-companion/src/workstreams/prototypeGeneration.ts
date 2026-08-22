@@ -67,6 +67,7 @@ import { createHash } from 'node:crypto';
 
 import type { ConnectionsStore } from '../connections/snapshot.js';
 import { loadGistLookup } from '../enrichment/contentEnrichment.js';
+import { readPageEvidenceMap, readPageEvidenceVectorMap } from '../page-evidence/store.js';
 import {
   APPLE_GENERATION_TIMEOUT_MS,
   appleFmStatus,
@@ -400,38 +401,105 @@ const boundedCandidatePool = (
 };
 
 /**
- * Embed the bounded candidate pool ONCE — the SAME embed call medoid
- * selection needs, and the resulting vectors are reused DIRECTLY as the
- * chosen medoids' prototype vectors (a medoid's text IS the member's own
- * excerpt verbatim, so it never needs a second embed pass). Never throws;
- * a failed or dimension-mismatched batch degrades to [] (the caller treats
- * that as embedder-unavailable, the one fatal failure mode in this tier).
+ * Read-only lookup of already-cached page-evidence doc vectors for the
+ * candidate pool's canonicalUrls — the SAME accessors ranker/retrain.ts and
+ * connectionsMaterializer.ts already use to consult the shared embed cache
+ * (page-evidence/store.ts's readPageEvidenceMap + readPageEvidenceVectorMap,
+ * backed by recall/embeddingCache.ts, keyed by the page's own content hash
+ * via docEmbeddingRef.vectorId). Never writes — a page only gets a
+ * docEmbeddingRef via the page-evidence extraction pipeline, never from
+ * here — so a miss just means "not opportunistically indexed yet", not an
+ * error. Best-effort: any lookup failure degrades to zero hits (every
+ * candidate falls through to embedCandidatePool's normal embed path).
+ */
+const readCachedCandidateVectors = async (
+  vaultRoot: string,
+  pool: readonly WorkstreamEvidenceItem[],
+): Promise<ReadonlyMap<string, Float32Array>> => {
+  if (pool.length === 0) return new Map();
+  try {
+    const recordsByCanonicalUrl = await readPageEvidenceMap(
+      vaultRoot,
+      pool.map((item) => item.canonicalUrl),
+    );
+    if (recordsByCanonicalUrl.size === 0) return new Map();
+    const vectorsByVectorId = await readPageEvidenceVectorMap(
+      vaultRoot,
+      recordsByCanonicalUrl.values(),
+    );
+    const out = new Map<string, Float32Array>();
+    for (const [canonicalUrl, record] of recordsByCanonicalUrl) {
+      const ref = record.content?.docEmbeddingRef;
+      if (ref === undefined) continue;
+      const vector = vectorsByVectorId.get(ref.vectorId);
+      if (vector !== undefined) out.set(canonicalUrl, vector);
+    }
+    return out;
+  } catch {
+    return new Map();
+  }
+};
+
+/**
+ * Embed the bounded candidate pool — the SAME embed call medoid selection
+ * needs, and the resulting vectors are reused DIRECTLY as the chosen
+ * medoids' prototype vectors (a medoid's text IS the member's own excerpt
+ * verbatim, so it never needs a second embed pass). Never throws; a failed
+ * or dimension-mismatched batch degrades to [] (the caller treats that as
+ * embedder-unavailable, the one fatal failure mode in this tier).
  *
- * DELIBERATE SCOPE CUT: does not attempt to reuse embeddings already
- * present in recall-v2's docs_vec for members that happen to be indexed
- * there (~16% coverage per the keyword-clustering PR's own measurement).
- * Reading raw vector VALUES back out of a sqlite-vec vec0 table is not a
- * pattern this codebase uses anywhere today (every existing caller only
- * ever reads back a MATCH distance, never the stored vector), so doing it
- * here would be new, unverified surface area for a speculative optimization
- * — always (re-)embedding the bounded candidate pool is simpler, always
- * correct, and still bounded (MEDOID_CANDIDATE_POOL_CAP per workstream per
- * dirty tick, which only fires past the debounce). Flagged here as a
- * documented deviation rather than a silent gap.
+ * REUSE (post-#389): when `vaultRoot` is supplied, a candidate whose
+ * canonicalUrl already has a cached page-evidence doc vector
+ * (readCachedCandidateVectors, read-only) reuses that vector instead of
+ * being sent to `embed()` — only cache MISSES are embedded, in one batched
+ * call across just the misses (never one embed call per candidate). A
+ * fully-cached pool costs zero embed calls. NOTE (kept from the original
+ * scope-cut this replaces): the cached vector is the page's own
+ * quality-weighted BODY vector, not a re-embedding of the excerpt
+ * (gist/title) text used for members that miss — both live in the same
+ * embedding model's vector space, but a cache hit and a fresh embed are not
+ * guaranteed byte-identical for the same URL. `vaultRoot` omitted (e.g. in
+ * unit tests with no vault) preserves the pre-#389-fix behaviour: embed
+ * every candidate, no lookup attempted.
  */
 const embedCandidatePool = async (
   pool: readonly WorkstreamEvidenceItem[],
   embed: EmbedFn,
+  vaultRoot?: string,
 ): Promise<readonly MedoidCandidate[]> => {
   const texts = pool.map((item) => evidenceExcerpt(item)!);
   if (texts.length === 0) return [];
-  let vectors: readonly Float32Array[];
-  try {
-    vectors = await embed(texts);
-  } catch {
-    return [];
+  const cachedVectorByCanonicalUrl =
+    vaultRoot === undefined ? new Map<string, Float32Array>() : await readCachedCandidateVectors(vaultRoot, pool);
+  const misses: { readonly index: number; readonly text: string }[] = [];
+  const vectors: (Float32Array | undefined)[] = pool.map((item, index) => {
+    const cached = cachedVectorByCanonicalUrl.get(item.canonicalUrl);
+    if (cached !== undefined) return cached;
+    misses.push({ index, text: texts[index]! });
+    return undefined;
+  });
+  if (cachedVectorByCanonicalUrl.size > 0) {
+    // Audible: fires at most once per workstream per generation tick
+    // (hours-scale) — the reuse ratio is the acceptance signal for this
+    // branch, and a silent cache would be indistinguishable from the
+    // always-re-embed behaviour it replaces.
+    // eslint-disable-next-line no-console -- structured lane evidence
+    console.info(
+      `[prototype-gen] medoid embed reuse hits=${String(pool.length - misses.length)} misses=${String(misses.length)} pool=${String(pool.length)}`,
+    );
   }
-  if (vectors.length !== pool.length) return [];
+  if (misses.length > 0) {
+    let embedded: readonly Float32Array[];
+    try {
+      embedded = await embed(misses.map((miss) => miss.text));
+    } catch {
+      return [];
+    }
+    if (embedded.length !== misses.length) return [];
+    misses.forEach((miss, missIndex) => {
+      vectors[miss.index] = embedded[missIndex]!;
+    });
+  }
   return pool.map((item, index) => ({
     canonicalUrl: item.canonicalUrl,
     text: texts[index]!,
@@ -506,10 +574,17 @@ export type ProductionOutcome =
 export const produceWorkstreamPrototypes = async (
   items: readonly WorkstreamEvidenceItem[],
   medoidCount: number,
-  deps: { readonly embed: EmbedFn; readonly client?: AppleFmClient },
+  deps: {
+    readonly embed: EmbedFn;
+    readonly client?: AppleFmClient;
+    /** Enables the cached-doc-vector reuse lookup in embedCandidatePool
+     *  (see its doc comment). Omitted in most unit tests — embeds every
+     *  candidate, matching pre-reuse behaviour. */
+    readonly vaultRoot?: string;
+  },
 ): Promise<ProductionOutcome> => {
   const pool = boundedCandidatePool(items);
-  const candidates = await embedCandidatePool(pool, deps.embed);
+  const candidates = await embedCandidatePool(pool, deps.embed, deps.vaultRoot);
   if (candidates.length === 0) {
     return {
       kind: 'embedder-unavailable',
@@ -767,6 +842,9 @@ export const generatePrototypesForWorkstream = async (
     readonly embed: EmbedFn;
     readonly store: PrototypeStore;
     readonly client?: AppleFmClient;
+    /** See produceWorkstreamPrototypes — threaded through for the cached
+     *  doc-vector reuse lookup. */
+    readonly vaultRoot?: string;
   },
 ): Promise<WorkstreamGenerationResult> => {
   const watermark = computeEvidenceWatermark(input.items);
@@ -778,6 +856,7 @@ export const generatePrototypesForWorkstream = async (
   const outcome = await produceWorkstreamPrototypes(input.items, input.count, {
     embed: deps.embed,
     ...(deps.client === undefined ? {} : { client: deps.client }),
+    ...(deps.vaultRoot === undefined ? {} : { vaultRoot: deps.vaultRoot }),
   });
   if (outcome.kind === 'embedder-unavailable') {
     return {
@@ -1002,7 +1081,7 @@ export const runPrototypeGenerationTick = async (
         nowMs,
         count,
       },
-      { eventLog, ...deps },
+      { eventLog, vaultRoot, ...deps },
     );
     results.push(result);
     switch (result.outcome) {
