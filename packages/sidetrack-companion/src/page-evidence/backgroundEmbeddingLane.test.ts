@@ -713,3 +713,64 @@ describe('progress persistence gating', () => {
     expect(writes).toBe(0);
   });
 });
+
+describe('fresh-first backlog ordering', () => {
+  it('a newly captured embeddable record jumps ahead of the skip-churning junk wall', async () => {
+    const attempted: string[] = [];
+    // Alphabetical head is junk (skips: no content payload yet); the fresh
+    // embeddable record sorts LAST by URL — the exact live starvation shape.
+    const lane = createBackgroundEmbeddingLane(
+      deps({
+        listCandidates: async () => [
+          candidate({ canonicalUrl: 'https://aaa-junk.test' }),
+          candidate({ canonicalUrl: 'https://zzz-fresh.test' }),
+        ],
+        embedCanonicalUrl: async (url) => {
+          attempted.push(url);
+          return url.includes('junk')
+            ? { outcome: 'skipped' as const, reason: 'no-page-content' }
+            : 'embedded';
+        },
+      }),
+      { ...DEFAULT_BACKGROUND_EMBEDDING_CONFIG, batchCap: 1 },
+    );
+    // Cycle 1: no strikes anywhere yet — deterministic URL order holds and
+    // the junk head is attempted (and strikes once).
+    await lane.runOnce();
+    expect(attempted).toEqual(['https://aaa-junk.test']);
+    // Cycle 2: the struck junk record now sorts BEHIND the fresh one; the
+    // batch slot goes to the fresh record and it embeds. Under the old
+    // fixed-URL order this slot re-churned the junk head forever.
+    const second = await lane.runOnce();
+    expect(attempted).toEqual(['https://aaa-junk.test', 'https://zzz-fresh.test']);
+    expect(second.embedded).toBe(1);
+  });
+
+  it('persisted failed attempts deprioritize junk across a restart', async () => {
+    const attempted: string[] = [];
+    const lane = createBackgroundEmbeddingLane(
+      deps({
+        listCandidates: async () => [
+          candidate({ canonicalUrl: 'https://aaa-junk.test' }),
+          candidate({ canonicalUrl: 'https://zzz-fresh.test' }),
+        ],
+        embedCanonicalUrl: async (url) => {
+          attempted.push(url);
+          return 'embedded';
+        },
+        // Simulates the post-restart shape: skip strikes are gone (they are
+        // in-memory) but the junk record's graduated attempt survived in the
+        // persisted progress cursor.
+        readProgress: async () => ({
+          schemaVersion: 1 as const,
+          attemptsByCanonicalUrl: { 'https://aaa-junk.test': 1 },
+          embeddedTotal: 0,
+          lastRunAtMs: null,
+        }),
+      }),
+      { ...DEFAULT_BACKGROUND_EMBEDDING_CONFIG, batchCap: 1 },
+    );
+    await lane.runOnce();
+    expect(attempted).toEqual(['https://zzz-fresh.test']);
+  });
+});

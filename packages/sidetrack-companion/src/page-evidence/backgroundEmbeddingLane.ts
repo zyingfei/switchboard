@@ -561,6 +561,23 @@ export const createBackgroundEmbeddingLane = (
       return true;
     });
 
+    // FRESH-FIRST ordering (2026-08-22): the discovery source returns
+    // candidates sorted by canonicalUrl and the batch cap takes the head.
+    // On the real vault that head is a wall of ~2,100 'no-page-content'
+    // records, so a NEWLY captured, fully-embeddable page sat hours behind
+    // junk that re-churns from scratch after every restart (skip strikes
+    // are in-memory) — new browsing never reached embedding, so
+    // similarity/topics never advanced. Order the backlog by demonstrated
+    // junk-ness ASCENDING: persisted failed attempts (survives restarts)
+    // plus this session's skip strikes. Fresh records (0/0) always land in
+    // front of the junk wall; the sort is stable, so the deterministic URL
+    // order is preserved within each tier.
+    const junkScore = (url: string): number =>
+      (attempts[url] ?? 0) + (skipStrikes.get(url) ?? 0);
+    const orderedBacklog = [...backlog].sort(
+      (left, right) => junkScore(left.canonicalUrl) - junkScore(right.canonicalUrl),
+    );
+
     let embedded = 0;
     let skipped = 0;
     let failed = 0;
@@ -581,7 +598,7 @@ export const createBackgroundEmbeddingLane = (
         log(`[page-evidence.embed-lane] first occurrence of reason=${reason} url=${canonicalUrl}`);
       }
     };
-    for (const candidate of backlog) {
+    for (const candidate of orderedBacklog) {
       // VISIT-counted cap: successes + failures + reconstruction skips all
       // consume the cap. A features-only record requires a real page-content
       // store read before `embedCanonicalUrl` can return skipped; after R3
@@ -701,7 +718,7 @@ export const createBackgroundEmbeddingLane = (
     if (embedded > 0 || failed > 0 || skipped > 0) {
       // Name the head URLs: 182 byte-identical cycle lines hid a wedge that
       // one glance at the URLs would have exposed.
-      const sample = backlog
+      const sample = orderedBacklog
         .slice(0, 3)
         .map((candidate) => candidate.canonicalUrl)
         .join(' | ');
