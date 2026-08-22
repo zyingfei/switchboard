@@ -4405,3 +4405,43 @@ PR: fix(store): event-store mirror day repair — unblock store-drift
 retirement shards (branch `fix/event-store-day-repair`). Not merged —
 coordinator review pending per this task's "one PR; do not merge"
 instruction.
+
+## 2026-08-22 — idle metronome #2: embed-lane cursor rewrites (PR #412)
+
+**User-felt symptom:** 57.7GB machine-wide written in one hour on a mostly
+idle machine; hourly telemetry showed the TEST companion writing a
+metronomic 1955±5MB/h for 12 straight hours (`proc_pid_rusage` kernel
+counters — the honest measure after the du-delta correction).
+
+**Attribution, exact:** a 2s-cadence file sampler caught
+`embed-lane-discovery.json` (2.06MB) + `embed-lane-progress.json` (85KB)
+being rewritten 15×/min, byte-identical → 2.15MB × 900/h = **1.94GB/h**,
+matching the metronome to within 1%. Same disease as the diff-aware
+putCurrent (#391) and the HNSW sig-gate (#405): wholesale rewrite of an
+unchanged artifact — this one at a 4-second cadence.
+
+**Three stacked causes, three gates (PR #412):**
+1. the incremental candidate source persisted the ~2MB discovery index
+   after EVERY `listCandidates()` — `discoverBackgroundEmbeddingBacklog`
+   now returns an exact `changed` flag (fresh reads OR key-set delta;
+   carried-forward entries are the identical objects, so equality is
+   provable, not hashed) and clean cycles skip the write (persist-owed
+   retry on failure);
+2. `persistProgress` wrote every cycle because volatile `lastRunAtMs`
+   always ticked — now gated on a sorted-key MATERIAL fingerprint
+   (attempts/quarantine/totals/lastSuccess), the M3 lesson (never hash a
+   volatile value) applied to a write gate;
+3. the scheduler held the 4s cadence whenever `backlog > embedded` —
+   permanently true for a skip-only `no-page-content` backlog rotating
+   through quarantine cooldown. Skip-only cycles now wait
+   `idleIntervalMs` (content ARRIVAL unblocks them; polling cannot) and
+   are LOGGED — they were entirely silent, which is how a 4s loop
+   rewrote 2MB/tick for days without one log line.
+
+**Telemetry upgrade (same PR):** the 57.7G hour had ~50GB not from either
+companion and was unattributable after the fact. Hourly entries now
+capture the top-12 pids by cumulative kernel bytes-written + swap; breach
+report lines name the top per-pid write deltas. First instrumented entry
+already reframed the spikes: every 40–84G hour in the 147-entry history
+coincides with an agent dev arc (builds/tests), stacked on the companion
+metronome — the metronome was ours to kill, the rest now self-attributes.
