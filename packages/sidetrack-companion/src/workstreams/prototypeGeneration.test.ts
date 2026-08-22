@@ -3,6 +3,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'bun:test';
 
+import { writeExtractedPageEvidence } from '../page-evidence/store.js';
+import type { PageEvidenceExtractedRequest } from '../page-evidence/types.js';
 import { createEventLog, type EventLog } from '../sync/eventLog.js';
 import { loadOrCreateReplica } from '../sync/replicaId.js';
 import { WORKSTREAM_PROTOTYPE_GENERATED, isPrototypeGeneratedSnapshot } from './events.js';
@@ -358,6 +360,197 @@ const fakePrototypeStore = (): PrototypeStore & {
     },
   };
 };
+
+// ---- medoid embed reuse (post-#389 deviation) ------------------------------
+//
+// prototypeMedoids.ts's candidate pool used to re-embed every generation
+// even when a candidate's page already had a cached page-evidence doc
+// vector (page-evidence/embedding.ts's readPageEvidenceDocVector, the SAME
+// read-only accessor ranker/retrain.ts and connectionsMaterializer.ts
+// already consult). embedCandidatePool now looks up that cache (via
+// vaultRoot) and only calls embed() for candidates that MISS.
+
+describe('produceWorkstreamPrototypes — cached doc-vector reuse (post-#389)', () => {
+  let vaultRoot: string;
+
+  beforeEach(async () => {
+    vaultRoot = await mkdtemp(join(tmpdir(), 'sidetrack-prototype-embed-reuse-'));
+  });
+
+  afterEach(async () => {
+    await rm(vaultRoot, { recursive: true, force: true });
+  });
+
+  // 384-dim (the real e5-small width page-evidence caches at) vs the
+  // fresh-embed tracker's 4-dim output below — dimensionality, not a raw
+  // scalar, is what tells "reused the cache" apart from "freshly
+  // embedded": page-evidence/embedding.ts's weightedMean L2-normalizes
+  // its output, so a distinctive scalar sentinel would collapse to the
+  // same unit value regardless of source. A cache HIT medoid vector must
+  // be 384-wide; a MISS (routed through trackingEmbed below) is 4-wide.
+  const CACHED_DIMENSIONS = 384;
+  const cachingEmbedder = async (texts: readonly string[]): Promise<readonly Float32Array[]> =>
+    texts.map(() => {
+      const v = new Float32Array(CACHED_DIMENSIONS);
+      v[0] = 1;
+      return v;
+    });
+
+  const evidencePayload = (
+    canonicalUrl: string,
+    contentHash: string,
+  ): PageEvidenceExtractedRequest => ({
+    payloadVersion: 1,
+    canonicalUrl,
+    url: canonicalUrl,
+    title: `Page for ${canonicalUrl}`,
+    extractedAt: '2026-08-21T10:00:00.000Z',
+    extractionSource: 'reader-mode',
+    extractionPolicy: { trigger: 'attention-gate' },
+    quality: 'high',
+    qualitySignals: {
+      extractedWordCount: 300,
+      contentToDomRatio: 0.6,
+      boilerplateFraction: 0.05,
+      extractionStrategy: 'reader-mode',
+    },
+    content: {
+      text: `Full extracted body text for ${canonicalUrl} repeated for evidence purposes here.`,
+      contentHash,
+      charCount: 900,
+    },
+    storageMode: 'features_only',
+  });
+
+  /** Tracks how many embed() calls happened and exactly which texts were
+   *  sent — the "embed only misses" contract under test. */
+  const trackingEmbed = (): { readonly fn: EmbedFn; calls: number; texts: string[] } => {
+    const tracker = { calls: 0, texts: [] as string[] } as {
+      fn: EmbedFn;
+      calls: number;
+      texts: string[];
+    };
+    tracker.fn = async (texts) => {
+      tracker.calls += 1;
+      tracker.texts.push(...texts);
+      return texts.map(() => new Float32Array(4).fill(1));
+    };
+    return tracker;
+  };
+
+  it('every candidate already cached: zero new embeds, medoid vectors ARE the cached vectors', async () => {
+    const items: readonly WorkstreamEvidenceItem[] = [
+      item('https://cache.test/1', { gist: 'first cached gist about kv-cache compression' }),
+      item('https://cache.test/2', { gist: 'second cached gist about speculative decoding' }),
+      item('https://cache.test/3', { gist: 'third cached gist about paged attention memory' }),
+    ];
+    for (const it_ of items) {
+      await writeExtractedPageEvidence(
+        vaultRoot,
+        evidencePayload(it_.canonicalUrl, `hash-${it_.canonicalUrl}`),
+        { embedder: cachingEmbedder },
+      );
+    }
+    const tracker = trackingEmbed();
+    const client = fakeClient(false); // generation tier irrelevant here
+    const outcome = await produceWorkstreamPrototypes(items, 3, {
+      embed: tracker.fn,
+      client,
+      vaultRoot,
+    });
+    expect(outcome.kind).toBe('produced');
+    if (outcome.kind !== 'produced') throw new Error('unreachable');
+    // The whole point: zero embed() calls when every candidate hits cache.
+    expect(tracker.calls).toBe(0);
+    const medoids = outcome.prototypes.filter((p) => p.angle === 'medoid');
+    expect(medoids.length).toBeGreaterThan(0);
+    for (const medoid of medoids) expect(medoid.vec).toHaveLength(CACHED_DIMENSIONS);
+  });
+
+  it('partial cache coverage: embeds ONLY the misses, in one batched call', async () => {
+    const cached = item('https://cache.test/cached-1', { gist: 'a cached gist about attention' });
+    const missA = item('https://cache.test/miss-1', { gist: 'an uncached gist about decoding' });
+    const missB = item('https://cache.test/miss-2', { gist: 'another uncached gist about quantization' });
+    await writeExtractedPageEvidence(
+      vaultRoot,
+      evidencePayload(cached.canonicalUrl, `hash-${cached.canonicalUrl}`),
+      { embedder: cachingEmbedder },
+    );
+    const tracker = trackingEmbed();
+    const client = fakeClient(false);
+    const outcome = await produceWorkstreamPrototypes([cached, missA, missB], 3, {
+      embed: tracker.fn,
+      client,
+      vaultRoot,
+    });
+    expect(outcome.kind).toBe('produced');
+    // Exactly one batched embed() call, covering only the 2 misses — never
+    // one call per candidate, never re-embedding the cache hit.
+    expect(tracker.calls).toBe(1);
+    expect(tracker.texts).toHaveLength(2);
+    expect(tracker.texts).toEqual(
+      expect.arrayContaining(['an uncached gist about decoding', 'another uncached gist about quantization']),
+    );
+  });
+
+  it('vaultRoot omitted: falls back to embedding every candidate (pre-reuse behaviour preserved)', async () => {
+    const items: readonly WorkstreamEvidenceItem[] = [
+      item('https://cache.test/1', { gist: 'first gist' }),
+      item('https://cache.test/2', { gist: 'second gist' }),
+    ];
+    // Populate a cache entry anyway — must be ignored since vaultRoot is
+    // not supplied to produceWorkstreamPrototypes below.
+    await writeExtractedPageEvidence(
+      vaultRoot,
+      evidencePayload(items[0]!.canonicalUrl, `hash-${items[0]!.canonicalUrl}`),
+      { embedder: cachingEmbedder },
+    );
+    const tracker = trackingEmbed();
+    const client = fakeClient(false);
+    const outcome = await produceWorkstreamPrototypes(items, 2, { embed: tracker.fn, client });
+    expect(outcome.kind).toBe('produced');
+    expect(tracker.calls).toBe(1);
+    expect(tracker.texts).toHaveLength(2);
+  });
+
+  it('regeneration with UNCHANGED evidence does zero new embeds across two ticks', async () => {
+    const items: readonly WorkstreamEvidenceItem[] = [
+      item('https://cache.test/1', { gist: 'first cached gist about kv-cache compression' }),
+      item('https://cache.test/2', { gist: 'second cached gist about speculative decoding' }),
+      item('https://cache.test/3', { gist: 'third cached gist about paged attention memory' }),
+      item('https://cache.test/4', { gist: 'fourth cached gist about int8 quantization notes' }),
+    ];
+    for (const it_ of items) {
+      await writeExtractedPageEvidence(
+        vaultRoot,
+        evidencePayload(it_.canonicalUrl, `hash-${it_.canonicalUrl}`),
+        { embedder: cachingEmbedder },
+      );
+    }
+    const tracker = trackingEmbed();
+    const client = fakeClient(false);
+    // Tick 1 — first-ever generation, evidence already fully cached from
+    // page-evidence extraction (simulating a workstream whose members were
+    // all already embedded by the background embedding lane before the
+    // prototype lane ever ran).
+    const first = await produceWorkstreamPrototypes(items, 4, {
+      embed: tracker.fn,
+      client,
+      vaultRoot,
+    });
+    expect(first.kind).toBe('produced');
+    expect(tracker.calls).toBe(0);
+    // Tick 2 — regeneration against the SAME (unchanged) evidence set.
+    const second = await produceWorkstreamPrototypes(items, 4, {
+      embed: tracker.fn,
+      client,
+      vaultRoot,
+    });
+    expect(second.kind).toBe('produced');
+    // Still zero — no new embeds were ever needed across either tick.
+    expect(tracker.calls).toBe(0);
+  });
+});
 
 describe('generatePrototypesForWorkstream — end-to-end with a fake engine + fake store', () => {
   let vaultRoot: string;

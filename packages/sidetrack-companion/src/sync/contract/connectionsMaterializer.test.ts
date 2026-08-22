@@ -2990,4 +2990,156 @@ describe('connectionsMaterializer (Class B, consumer-only)', () => {
       warnSpy.mockRestore();
     });
   });
+
+  describe('W5 seam (post-#404) — SIDETRACK_TOPIC_PRODUCER=incremental serves the incremental builder', () => {
+    let priorIncrementalShadow: string | undefined;
+
+    beforeEach(() => {
+      priorIncrementalShadow = process.env['SIDETRACK_TOPIC_INCREMENTAL_SHADOW'];
+      // Producer selection alone must be sufficient — leave the separate
+      // observe-only shadow flag OFF throughout this block, proving the
+      // seam does not depend on it.
+      delete process.env['SIDETRACK_TOPIC_INCREMENTAL_SHADOW'];
+    });
+
+    afterEach(() => {
+      if (priorIncrementalShadow === undefined) {
+        delete process.env['SIDETRACK_TOPIC_INCREMENTAL_SHADOW'];
+      } else {
+        process.env['SIDETRACK_TOPIC_INCREMENTAL_SHADOW'] = priorIncrementalShadow;
+      }
+    });
+
+    // Same fixture shape as the "W5 Phase B" describe block above (kept
+    // local — that block's helpers are scoped to it, not exported).
+    const seamVisitEvent = (input: {
+      seq: number;
+      slug: string;
+      observedAt: string;
+    }): AcceptedEvent =>
+      buildEvent({
+        seq: input.seq,
+        type: BROWSER_TIMELINE_OBSERVED,
+        payload: {
+          eventId: `seam-${input.slug}`,
+          observedAt: input.observedAt,
+          url: `https://example.test/${input.slug}`,
+          canonicalUrl: `https://example.test/${input.slug}`,
+          title: `visit-${input.slug}`,
+          provider: 'generic',
+          transition: 'activated',
+          payloadVersion: 1,
+          dimensions: { engagement: { focusedWindowMs: 10_000 } },
+        },
+      });
+
+    const seamEmbedder = (slugs: readonly string[]): VisitSimilarityEmbedder =>
+      embedFromVectors(new Map(slugs.map((slug) => [`visit-${slug}`, unit([1, 0])])));
+
+    it('flips the SERVED/active revision to the incremental builder end-to-end, no protected-file dispatch change needed at the flag level', async () => {
+      // Seed: producer=leiden-cpm builds+serves the leiden candidate the
+      // incremental builder needs as its base ("it structurally needs
+      // leiden to seed structure before it can refine" — #404).
+      process.env['SIDETRACK_TOPIC_PRODUCER'] = 'leiden-cpm';
+      const replica = await loadOrCreateReplica(vaultRoot);
+      const eventLog = createEventLog(vaultRoot, replica);
+      const timelineStore = createTimelineStore(vaultRoot);
+      const store = createConnectionsStore(vaultRoot);
+      const embed = seamEmbedder(['alpha', 'bravo', 'charlie', 'delta']);
+      const m = createConnectionsMaterializer({ vaultRoot, eventLog, timelineStore, store, embed });
+
+      await eventLog.importPeerEvent(
+        seamVisitEvent({ seq: 1, slug: 'alpha', observedAt: '2026-05-07T10:00:00.000Z' }),
+      );
+      await eventLog.importPeerEvent(
+        seamVisitEvent({ seq: 2, slug: 'bravo', observedAt: '2026-05-07T10:01:00.000Z' }),
+      );
+      await eventLog.importPeerEvent(
+        seamVisitEvent({ seq: 3, slug: 'charlie', observedAt: '2026-05-07T10:02:00.000Z' }),
+      );
+      await m.catchUp(eventLog);
+      await m.awaitIdle();
+
+      const revisionStore = createTopicRevisionStore(vaultRoot);
+      const servedAfterSeed = await revisionStore.readActiveRevision();
+      expect(servedAfterSeed?.algorithmVersion).toBe(TOPIC_LEIDEN_CPM_REVISION_KEY);
+
+      // Flip — SIDETRACK_TOPIC_PRODUCER=incremental, instant (no restart,
+      // no code path re-selection beyond the next drain's
+      // resolveServedTopicProducer() read) — same rollback shape as the
+      // idf-rkn->leiden-cpm cutover this mirrors.
+      process.env['SIDETRACK_TOPIC_PRODUCER'] = 'incremental';
+      const deltaEvent = seamVisitEvent({
+        seq: 4,
+        slug: 'delta',
+        observedAt: '2026-05-07T10:03:00.000Z',
+      });
+      await eventLog.importPeerEvent(deltaEvent);
+      m.onAccepted(deltaEvent, { origin: 'peer' });
+      await m.awaitIdle();
+
+      const servedAfterFlip = await revisionStore.readActiveRevision();
+      expect(servedAfterFlip?.algorithmVersion).toBe(TOPIC_INCREMENTAL_REVISION_KEY);
+      expect([...(servedAfterFlip?.topics[0]?.memberCanonicalUrls ?? [])].sort()).toEqual([
+        'https://example.test/alpha',
+        'https://example.test/bravo',
+        'https://example.test/charlie',
+        'https://example.test/delta',
+      ]);
+
+      // The idf-rkn-split/union-find fallback path must NOT have clobbered
+      // the incremental result — the whole point of excluding 'incremental'
+      // from that branch's guard alongside 'leiden-cpm'.
+      expect(servedAfterFlip?.algorithmVersion).not.toBe(TOPIC_UNION_FIND_REVISION_KEY);
+    });
+
+    it('flipping back to leiden-cpm re-serves it on the next drain (bidirectional instant rollback)', async () => {
+      process.env['SIDETRACK_TOPIC_PRODUCER'] = 'leiden-cpm';
+      const replica = await loadOrCreateReplica(vaultRoot);
+      const eventLog = createEventLog(vaultRoot, replica);
+      const timelineStore = createTimelineStore(vaultRoot);
+      const store = createConnectionsStore(vaultRoot);
+      const embed = seamEmbedder(['alpha', 'bravo', 'charlie', 'delta', 'echo']);
+      const m = createConnectionsMaterializer({ vaultRoot, eventLog, timelineStore, store, embed });
+
+      await eventLog.importPeerEvent(
+        seamVisitEvent({ seq: 1, slug: 'alpha', observedAt: '2026-05-07T10:00:00.000Z' }),
+      );
+      await eventLog.importPeerEvent(
+        seamVisitEvent({ seq: 2, slug: 'bravo', observedAt: '2026-05-07T10:01:00.000Z' }),
+      );
+      await m.catchUp(eventLog);
+      await m.awaitIdle();
+
+      process.env['SIDETRACK_TOPIC_PRODUCER'] = 'incremental';
+      const deltaEvent = seamVisitEvent({
+        seq: 3,
+        slug: 'delta',
+        observedAt: '2026-05-07T10:02:00.000Z',
+      });
+      await eventLog.importPeerEvent(deltaEvent);
+      m.onAccepted(deltaEvent, { origin: 'peer' });
+      await m.awaitIdle();
+
+      const revisionStore = createTopicRevisionStore(vaultRoot);
+      expect((await revisionStore.readActiveRevision())?.algorithmVersion).toBe(
+        TOPIC_INCREMENTAL_REVISION_KEY,
+      );
+
+      // Roll back.
+      process.env['SIDETRACK_TOPIC_PRODUCER'] = 'leiden-cpm';
+      const echoEvent = seamVisitEvent({
+        seq: 4,
+        slug: 'echo',
+        observedAt: '2026-05-07T10:03:00.000Z',
+      });
+      await eventLog.importPeerEvent(echoEvent);
+      m.onAccepted(echoEvent, { origin: 'peer' });
+      await m.awaitIdle();
+
+      expect((await revisionStore.readActiveRevision())?.algorithmVersion).toBe(
+        TOPIC_LEIDEN_CPM_REVISION_KEY,
+      );
+    });
+  });
 });

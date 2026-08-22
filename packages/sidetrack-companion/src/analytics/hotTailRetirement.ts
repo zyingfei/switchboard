@@ -51,6 +51,9 @@ import { appendFile, mkdir, readdir, readFile, rename, stat } from 'node:fs/prom
 import { dirname, join } from 'node:path';
 
 import { sha256File } from '../gc/engagementCompactionManifest.js';
+import type { AcceptedEvent } from '../sync/causal.js';
+import { sortAcceptedEvents } from '../sync/causal.js';
+import { isAcceptedEvent } from '../sync/eventLog.js';
 import { writeFileAtomic } from '../vault/atomic.js';
 import {
   entryMatches,
@@ -101,18 +104,32 @@ const eventStoreDbPath = (vaultRoot: string): string =>
 // A THIRD reader family — `rebuildFromJsonl(logRoot)` / `catchUpFromJsonl
 // (logRoot)` on 7 typed stores (event store, engagement-facts,
 // timeline-facts, search-query-index, capture-text-fts, thread-register,
-// workstream-parent) — also only walks the single `logRoot` it is handed.
-// `grep -rn '\.rebuildFromJsonl\('` across the package (excluding tests)
-// found ZERO production call sites today, so there is no LIVE regression.
-// But `sync/lineage.ts` documents `rebuildFromJsonl` as each store's
-// cold-repair entrypoint; a future wiring (or an operator invoking one by
-// hand) that reads only `_BAC/log` would silently miss any already-
-// retired day. Flagged here and in `sync/lineage.ts`'s `event-log` node
-// rather than fixed speculatively across 7 unwired modules: if any of
-// these gets a real call site, it must catch up from BOTH roots, RETIRED
-// FIRST (these stores gate re-ingestion of a seq at/below their own
-// per-replica watermark as "out of order", so ingesting the newer hot root
-// first would cause the older retired root's rows to be skipped).
+// workstream-parent) — used to only walk the single `logRoot` it was
+// handed. `grep -rn '\.rebuildFromJsonl\('` across the package (excluding
+// tests) found ZERO production call sites at the time this was flagged, so
+// it was a dormant risk, not a live regression; `sync/lineage.ts` documents
+// `rebuildFromJsonl` as each store's cold-repair entrypoint.
+//
+// FIXED (post-#403 seam): every one of the 7 stores' `rebuildFromJsonl` /
+// `catchUpFromJsonl` now takes an optional second `priorRoots` parameter,
+// walked to completion BEFORE the primary `logRoot` — see
+// `canonicalEventLogRootsForRebuild` below, the ordering-safe counterpart
+// to `listCanonicalEventShards` a cold-repair caller should use to get
+// `[retiredRoot, logRoot]`. RETIRED FIRST is load-bearing for
+// `eventStore.ts` specifically (its `catchUpFromJsonl` gates re-ingestion
+// of a seq at/below a replica's own watermark as "out of order" — walking
+// the newer hot root first would permanently skip the older retired root's
+// rows once the watermark advances past them); the other 6 stores'
+// `rebuildFromJsonl` always calls the unconditional, idempotent
+// `ingestMany` per file (never the watermark-gated `catchUp` path), so
+// order is not correctness-sensitive for them, but the same convention is
+// used uniformly. The one LIVE call site
+// (`eventStore.ts`'s `startCoalescedEventStoreCatchUp`, the per-drain hot
+// path) is deliberately left calling `catchUpFromJsonl` with ONLY the hot
+// `logRoot` — re-scanning `_BAC/retired/log` on every drain would be an
+// unbounded-growth perf regression on a path this codebase has already
+// paid hard for (see the F1 boot-warm-walk history above); `priorRoots` is
+// for cold-repair/rebuild callers only.
 
 const RETIRED_LOG_ROOT_SEGMENTS = ['_BAC', 'retired', 'log'] as const;
 
@@ -147,6 +164,79 @@ export const listCanonicalEventShards = async (vaultRoot: string): Promise<reado
     }
   }
   return paths;
+};
+
+/**
+ * The ordering-safe counterpart to `listCanonicalEventShards` for a COLD
+ * REPAIR / rebuild pass: `[retiredRoot, hotRoot]`, retired FIRST. Do not
+ * reuse `listCanonicalEventShards`'s own hot-then-retired order for this —
+ * that order is fine for its existing read-only "does this shard exist"
+ * proofs (storageRetirement.ts, ingressRetention.ts), but WRONG for a
+ * sequential, per-replica-watermark-gated ingester: see the header comment
+ * above ("RETIRED FIRST is load-bearing for eventStore.ts specifically").
+ * Feed the result straight to a typed store's `rebuildFromJsonl(logRoot,
+ * priorRoots)` / `catchUpFromJsonl(logRoot, priorRoots)` as
+ * `(hotRoot, [retiredRoot])`, i.e. `canonicalEventLogRootsForRebuild(vaultRoot)`
+ * returns `priorRoots` first, `logRoot` last — callers pass the LAST
+ * element as `logRoot` and everything before it as `priorRoots`.
+ */
+export const canonicalEventLogRootsForRebuild = (
+  vaultRoot: string,
+): { readonly logRoot: string; readonly priorRoots: readonly string[] } => ({
+  logRoot: eventLogRoot(vaultRoot),
+  priorRoots: [retiredEventLogRoot(vaultRoot)],
+});
+
+/**
+ * Full canonical event history INCLUDING F2-retired days — the
+ * retirement-aware counterpart to `sync/eventLog.ts`'s `readMerged()`
+ * (which, by construction, only ever walks `_BAC/log`; see this file's
+ * header). Deliberately NOT a replacement for `readMerged()` and NOT
+ * wired into it: `readMerged()` backs ~50 call sites across the package,
+ * several on request/serving paths, with its own memoization keyed off a
+ * cheap _BAC/log-only filesystem signature. `_BAC/retired/log` only grows
+ * over a vault's lifetime (retirement moves, never deletes) and this
+ * function has no memo of its own — making every `readMerged()` caller
+ * (or every one of connectionsMaterializer.ts's internal
+ * `deps.eventLog.readMerged()` call sites, several of which run every
+ * drain) pay an ever-growing, unmemoized retired-tail re-read would
+ * reintroduce exactly the "hold hundreds of MB / hundreds of seconds"
+ * class of regression F1 fixed for the hot tail (see
+ * project_capture_banner_chain history) — for the retired tail instead.
+ * Reserve this for genuine full-corpus, cold/rare needs that must survive
+ * retirement: a typed-store cold-repair rebuild (paired with
+ * `canonicalEventLogRootsForRebuild` above) or an offline/CLI full-history
+ * read. NOT sorted-and-deduped the way `readMerged()`'s per-replica
+ * dot-tracking is — this reads every canonical shard's lines in
+ * shard-path order and sorts by `sortAcceptedEvents`, matching
+ * `readMerged()`'s own output ordering contract for any consumer that
+ * only needs "every event, in causal order" (which is what a full-history
+ * rebuild needs) rather than per-replica dedup bookkeeping.
+ */
+export const readCanonicalEventHistoryIncludingRetired = async (
+  vaultRoot: string,
+): Promise<readonly AcceptedEvent[]> => {
+  const shardPaths = await listCanonicalEventShards(vaultRoot);
+  const all: AcceptedEvent[] = [];
+  for (const path of shardPaths) {
+    let text: string;
+    try {
+      text = await readFile(path, 'utf8');
+    } catch {
+      continue;
+    }
+    for (const line of text.split('\n')) {
+      const trimmed = line.trim();
+      if (trimmed.length === 0) continue;
+      try {
+        const parsed = JSON.parse(trimmed) as unknown;
+        if (isAcceptedEvent(parsed)) all.push(parsed);
+      } catch {
+        // skip malformed line; JSONL stays authoritative
+      }
+    }
+  }
+  return sortAcceptedEvents(all);
 };
 
 export type ShardRetirementVerdict =

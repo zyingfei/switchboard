@@ -72,10 +72,15 @@ export interface EventStore {
   readonly ingestMany: (events: readonly AcceptedEvent[]) => number;
   /** Ingest only events past the persisted per-replica watermark. */
   readonly catchUp: (events: readonly AcceptedEvent[]) => Promise<number>;
-  /** Stream JSONL shards and ingest only events past the store watermark. */
-  readonly catchUpFromJsonl: (logRoot: string) => Promise<number>;
-  /** True rebuild/repair: clear derived rows first, then stream JSONL. */
-  readonly rebuildFromJsonl: (logRoot: string) => Promise<void>;
+  /** Stream JSONL shards and ingest only events past the store watermark.
+   *  `priorRoots` (e.g. the F2 retired-log mirror), when supplied, are
+   *  walked to completion — including their own watermark-advancing
+   *  flush — BEFORE `logRoot`; see the implementation's header comment
+   *  for why that order is load-bearing, not cosmetic. */
+  readonly catchUpFromJsonl: (logRoot: string, priorRoots?: readonly string[]) => Promise<number>;
+  /** True rebuild/repair: clear derived rows first, then stream JSONL.
+   *  Same `priorRoots` ordering contract as catchUpFromJsonl. */
+  readonly rebuildFromJsonl: (logRoot: string, priorRoots?: readonly string[]) => Promise<void>;
   /** Ordered like readMerged().filter(event => event.dot.seq > frontier[replica] ?? 0). */
   readonly readSince: (frontier: VersionVector) => readonly AcceptedEvent[];
   /** All retained events for one aggregate, ordered like readSince —
@@ -680,7 +685,34 @@ export const createEventStore = async (vaultRoot: string): Promise<EventStore> =
     return count;
   };
 
-  const catchUpFromJsonl = async (logRoot: string): Promise<number> => {
+  // F2 seam (2026-08-21): `priorRoots`, when supplied, are walked to
+  // completion — including their own flush() cycles — BEFORE `logRoot`.
+  // This is NOT optional ordering: `wm` (the per-replica watermark) only
+  // ever advances forward via flush(), and any later-seen event at or
+  // below a replica's current watermark is treated as an already-committed
+  // redelivery and PERMANENTLY skipped (see the `<=` check below). Once
+  // any hot-tail shard for a replica has been flushed, that replica's
+  // watermark can be at/above older retired-day seqs, so walking the hot
+  // root before an as-yet-unprocessed retired root would silently drop the
+  // retired root's rows. The one production caller
+  // (companion.ts/lineage's boot warm-walk) still passes a single logRoot
+  // and no priorRoots — unaffected, identical behaviour to before this
+  // change. A cold-repair/rebuild caller that wants full history including
+  // any F2-retired days (analytics/hotTailRetirement.ts) passes
+  // `priorRoots: [retiredEventLogRoot(vaultRoot)]`.
+  const catchUpFromJsonl = async (
+    logRoot: string,
+    priorRoots: readonly string[] = [],
+  ): Promise<number> => {
+    if (priorRoots.length > 0) {
+      // Audible: only cold-repair/rebuild callers supply priorRoots — the
+      // per-drain hot path never does, so this line firing per drain would
+      // itself be the regression signal.
+      // eslint-disable-next-line no-console -- structured cold-repair evidence
+      console.info(
+        `[event-store] jsonl catch-up order=prior-first priorRoots=${String(priorRoots.length)} logRoot=${logRoot}`,
+      );
+    }
     const vaultRoot = join(logRoot, '..', '..');
     const manifestRead = await readEngagementCompactionManifest(vaultRoot);
     const manifestEntries =
@@ -704,12 +736,6 @@ export const createEventStore = async (vaultRoot: string): Promise<EventStore> =
       manifestReceiptIds.has(stringField(row, 'receipt_sha256')),
     );
     setCompactionReceiptTrust.run(receiptsTrusted ? 1 : 0);
-    let replicaDirs: string[];
-    try {
-      replicaDirs = (await readdir(logRoot)).sort();
-    } catch {
-      return 0;
-    }
     let count = 0;
     let wm = watermark();
     let pending: AcceptedEvent[] = [];
@@ -720,125 +746,139 @@ export const createEventStore = async (vaultRoot: string): Promise<EventStore> =
       wm = watermark();
       await new Promise((resolve) => setTimeout(resolve, 0));
     };
-    for (const replicaDir of replicaDirs) {
-      let files: string[];
+    for (const root of [...priorRoots, logRoot]) {
+      let replicaDirs: string[];
       try {
-        files = (await readdir(join(logRoot, replicaDir)))
-          .filter((file) => file.endsWith('.jsonl'))
-          .sort();
+        replicaDirs = (await readdir(root)).sort();
       } catch {
         continue;
       }
-      for (const file of files) {
-        const shardPath = join(logRoot, replicaDir, file);
-        let shardStat: Awaited<ReturnType<typeof stat>>;
+      for (const replicaDir of replicaDirs) {
+        let files: string[];
         try {
-          shardStat = await stat(shardPath);
+          files = (await readdir(join(root, replicaDir)))
+            .filter((file) => file.endsWith('.jsonl'))
+            .sort();
         } catch {
           continue;
         }
-        if (!shardStat.isFile()) continue;
-        const size = shardStat.size;
-        const mtimeMs = Math.trunc(shardStat.mtimeMs);
-        const progressRow = selectShardProgress.get(shardPath);
-        const progress: ShardProgress | null =
-          progressRow === null || progressRow === undefined
-            ? null
-            : {
-                size: numberField(progressRow, 'size'),
-                mtimeMs: numberField(progressRow, 'mtime_ms'),
-                readOffset: numberField(progressRow, 'read_offset'),
-              };
-        if (progress !== null && progress.size === size && progress.mtimeMs === mtimeMs) {
-          continue;
-        }
-
-        const receipt = manifestEntries.get(shardPath);
-        const receiptState =
-          receipt === undefined ? null : await verifyCompactionShardState(vaultRoot, receipt);
-        if (receiptState === 'mismatch' || receiptState === 'missing') {
-          setCompactionReceiptTrust.run(0);
-        }
-        if (
-          progress !== null &&
-          receipt !== undefined &&
-          receiptState === 'compacted' &&
-          progress.size === receipt.sourceBytes &&
-          progress.readOffset <= receipt.sourceBytes &&
-          (await mirrorContainsEveryShardEvent(shardPath))
-        ) {
-          // Recognised intentional shrink: account for the exact removed dots,
-          // prune their stale mirror rows, and advance straight to the new EOF.
-          // Unknown/tampered shrinks do not enter this branch and retain the
-          // legacy reparse + anomaly-counter behavior.
-          applyCompactionReceipt(receipt);
-          upsertShardProgress.run(shardPath, size, mtimeMs, size);
-          continue;
-        }
-
-        const readOffset =
-          progress === null || progress.readOffset > size ? 0 : Math.max(0, progress.readOffset);
-        const byteLength = size - readOffset;
-        if (byteLength <= 0) {
-          upsertShardProgress.run(shardPath, size, mtimeMs, readOffset);
-          continue;
-        }
-
-        let tail: Buffer;
-        try {
-          const handle = await open(shardPath, 'r');
+        for (const file of files) {
+          const shardPath = join(root, replicaDir, file);
+          let shardStat: Awaited<ReturnType<typeof stat>>;
           try {
-            tail = Buffer.alloc(byteLength);
-            const result = await handle.read(tail, 0, byteLength, readOffset);
-            tail = tail.subarray(0, result.bytesRead);
-          } finally {
-            await handle.close();
-          }
-        } catch {
-          continue;
-        }
-
-        const lastNewline = tail.lastIndexOf(0x0a);
-        if (lastNewline < 0) {
-          upsertShardProgress.run(shardPath, size, mtimeMs, readOffset);
-          continue;
-        }
-        const nextReadOffset = readOffset + lastNewline + 1;
-        const raw = tail.subarray(0, lastNewline + 1).toString('utf8');
-        for (const line of raw.split('\n')) {
-          const trimmed = line.trim();
-          if (trimmed.length === 0) continue;
-          try {
-            const parsed = JSON.parse(trimmed) as unknown;
-            if (!isAcceptedEvent(parsed)) continue;
-            if (parsed.dot.seq <= (wm[parsed.dot.replicaId] ?? 0)) {
-              // Below the per-replica watermark: an out-of-order /
-              // already-committed shard event, permanently skipped.
-              incrementStoreSkippedOutOfOrder();
-              continue;
-            }
-            pending.push(parsed);
-            if (pending.length >= CATCHUP_CHUNK) await flush();
+            shardStat = await stat(shardPath);
           } catch {
-            // skip malformed line; JSONL stays authoritative
+            continue;
           }
-        }
-        upsertShardProgress.run(shardPath, size, mtimeMs, nextReadOffset);
-        if (progress === null && receipt !== undefined && receiptState === 'compacted') {
-          // Fresh/rebuilt store: ingest the retained file first, then advance
-          // the watermark across exactly the receipt-covered dots. This avoids
-          // classifying retained lower-sequence rows as out-of-order.
-          await flush();
-          applyCompactionReceipt(receipt);
-          wm = watermark();
+          if (!shardStat.isFile()) continue;
+          const size = shardStat.size;
+          const mtimeMs = Math.trunc(shardStat.mtimeMs);
+          const progressRow = selectShardProgress.get(shardPath);
+          const progress: ShardProgress | null =
+            progressRow === null || progressRow === undefined
+              ? null
+              : {
+                  size: numberField(progressRow, 'size'),
+                  mtimeMs: numberField(progressRow, 'mtime_ms'),
+                  readOffset: numberField(progressRow, 'read_offset'),
+                };
+          if (progress !== null && progress.size === size && progress.mtimeMs === mtimeMs) {
+            continue;
+          }
+
+          const receipt = manifestEntries.get(shardPath);
+          const receiptState =
+            receipt === undefined ? null : await verifyCompactionShardState(vaultRoot, receipt);
+          if (receiptState === 'mismatch' || receiptState === 'missing') {
+            setCompactionReceiptTrust.run(0);
+          }
+          if (
+            progress !== null &&
+            receipt !== undefined &&
+            receiptState === 'compacted' &&
+            progress.size === receipt.sourceBytes &&
+            progress.readOffset <= receipt.sourceBytes &&
+            (await mirrorContainsEveryShardEvent(shardPath))
+          ) {
+            // Recognised intentional shrink: account for the exact removed dots,
+            // prune their stale mirror rows, and advance straight to the new EOF.
+            // Unknown/tampered shrinks do not enter this branch and retain the
+            // legacy reparse + anomaly-counter behavior.
+            applyCompactionReceipt(receipt);
+            upsertShardProgress.run(shardPath, size, mtimeMs, size);
+            continue;
+          }
+
+          const readOffset =
+            progress === null || progress.readOffset > size ? 0 : Math.max(0, progress.readOffset);
+          const byteLength = size - readOffset;
+          if (byteLength <= 0) {
+            upsertShardProgress.run(shardPath, size, mtimeMs, readOffset);
+            continue;
+          }
+
+          let tail: Buffer;
+          try {
+            const handle = await open(shardPath, 'r');
+            try {
+              tail = Buffer.alloc(byteLength);
+              const result = await handle.read(tail, 0, byteLength, readOffset);
+              tail = tail.subarray(0, result.bytesRead);
+            } finally {
+              await handle.close();
+            }
+          } catch {
+            continue;
+          }
+
+          const lastNewline = tail.lastIndexOf(0x0a);
+          if (lastNewline < 0) {
+            upsertShardProgress.run(shardPath, size, mtimeMs, readOffset);
+            continue;
+          }
+          const nextReadOffset = readOffset + lastNewline + 1;
+          const raw = tail.subarray(0, lastNewline + 1).toString('utf8');
+          for (const line of raw.split('\n')) {
+            const trimmed = line.trim();
+            if (trimmed.length === 0) continue;
+            try {
+              const parsed = JSON.parse(trimmed) as unknown;
+              if (!isAcceptedEvent(parsed)) continue;
+              if (parsed.dot.seq <= (wm[parsed.dot.replicaId] ?? 0)) {
+                // Below the per-replica watermark: an out-of-order /
+                // already-committed shard event, permanently skipped.
+                incrementStoreSkippedOutOfOrder();
+                continue;
+              }
+              pending.push(parsed);
+              if (pending.length >= CATCHUP_CHUNK) await flush();
+            } catch {
+              // skip malformed line; JSONL stays authoritative
+            }
+          }
+          upsertShardProgress.run(shardPath, size, mtimeMs, nextReadOffset);
+          if (progress === null && receipt !== undefined && receiptState === 'compacted') {
+            // Fresh/rebuilt store: ingest the retained file first, then advance
+            // the watermark across exactly the receipt-covered dots. This avoids
+            // classifying retained lower-sequence rows as out-of-order.
+            await flush();
+            applyCompactionReceipt(receipt);
+            wm = watermark();
+          }
         }
       }
+      // Flush at each root boundary (not just chunk boundaries) so a
+      // subsequent root's watermark reads reflect everything this root
+      // just contributed — required for the ordering guarantee above.
+      await flush();
     }
-    await flush();
     return count;
   };
 
-  const rebuildFromJsonl = async (logRoot: string): Promise<void> => {
+  const rebuildFromJsonl = async (
+    logRoot: string,
+    priorRoots: readonly string[] = [],
+  ): Promise<void> => {
     db.exec(`
       DELETE FROM events;
       DELETE FROM ingest_watermark;
@@ -846,7 +886,7 @@ export const createEventStore = async (vaultRoot: string): Promise<EventStore> =
       DELETE FROM compacted_events;
       UPDATE compaction_receipt_trust SET trusted = 1 WHERE singleton = 1;
     `);
-    await catchUpFromJsonl(logRoot);
+    await catchUpFromJsonl(logRoot, priorRoots);
   };
 
   const readSince = (frontier: VersionVector): readonly AcceptedEvent[] => {
