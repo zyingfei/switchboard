@@ -1069,6 +1069,99 @@ none qualified in this task's `deps`/`target`/`hlc` audit).
 
 ## Landing notes (current state, dated)
 
+**2026-08-22 — W5 follow-up: STATE CARRY for the incremental topic
+producer — real parity marks (feat/topic-incremental-state-carry).**
+Task #24 reported the incremental shadow emitting `[topic.cycle]
+producer=incremental topics=0 members=0` on EVERY real-data cycle (17/17
+marks on the daily vault, same on test), leaving the leiden→incremental
+flip gate with no evidence to accumulate. Root cause, measured on both
+real vaults' on-disk state (NOT the previously-reverted full-timeline
+theory): (1) **sticky-empty prior** — both vaults still hold a
+zero-topic revision in `current.topic-revision_v4_incremental.shadow
+.json` (persisted during the pre-#404 collapse era), and the protected
+materializer's base selection `previousIncrementalShadow ??
+leidenCandidate` treats `{topics: []}` as present, so the empty slot
+permanently shadowed every leiden base; a zero-topic base can never grow
+through refinement because Tier A assignment needs an existing PRIMARY
+member to attach to. (2) **fork-per-drain statelessness** — every live
+`[topic.cycle]` mark is `[reconcile.child]`-prefixed: drains run in a
+fresh child process, so `lastIncrementalShadowEdgePairs` is null on
+every drain, `addedEdges`/`removedEdges` are always empty, and the only
+topic-BIRTH path (a mutually-new edge) never fires in production.
+
+**Fix (new `connections/topicIncrementalStateCarry.ts` + integration in
+`topicProductionRevival.ts`, wired at all 4 composition roots;
+`connectionsMaterializer.ts` untouched):** the incremental producer's
+own output state is persisted as a schema-versioned artifact under
+`_BAC/connections/topics/incremental-state/` — `state.v1.json` (heavy
+membership content, rewritten ONLY when the membership fingerprint
+changes) + `cursor.v1.json` (volatile revision ids, ~200 bytes; the #412
+embed-lane cursor-gate split, and the fingerprint excludes
+producedAt/lineage/metadata timestamps per the #391 diff-aware rule).
+The shadow's candidate-slot READ serves the carried state; an EMPTY
+persisted slot is treated as ABSENT (the one rule that kills the
+sticky-empty trap), with a cycle-legit seed fallback — populated legacy
+slot, then the served ACTIVE revision (leiden or prior-incremental only)
+— never a backlog scan. The WRITE classifies each cycle
+adopt/update/cursor-only/collapse-suspect/observe-empty:
+empty-over-populated is NEVER persisted (#404 collapse-guard semantics
+extended to the shadow lane, visible as `collapse-suspect=true` in the
+mark), and cursor-only cycles skip the slot rewrite entirely while still
+advancing the carried revisionId so the materializer's skip-gate
+cache-hits the next drain (no rebuild metronome, no idle-write
+metronome). Parity marks now carry `carried= priorTopics= priorMembers=
+delta= partial=` — `partial` is a live coverage ratio vs the served
+active revision.
+
+**W7**: the state carry does zero event-log I/O (two small JSON
+artifacts + `current.json` reads only). Re-verified against the honest
+oracle in the exact ordering that caught the last regression
+(`companion.test.ts` then `connectionsMaterializer.contentLane.test.ts`):
+30 pass / 0 fail. Serving unchanged: `DEFAULT_SERVED_TOPIC_PRODUCER`
+stays leiden-cpm; the flip stays gated.
+
+**Real-scale verification (read-only, APFS clone of ~/.sidetrack-vault-test
+— 2.4 GB, 5,159-visit similarity corpus, 81,238 persisted edges; live
+vaults and companions untouched)**: harness pre-seeds a populated ACTIVE
+leiden revision from 4 real similarity clusters (26 members;
+cactuscompute docs / kernel.org docs / stratus-red-team / github PRs) —
+the healthy-serving precondition the shadow refines by design — then
+drives the REAL materializer. Measured: **seed → adopt topics=64
+members=606** (the 4 dirty topics + their real 1-hop >=0.90 boundary,
+652 nodes, re-clustered by the real bounded leidenCpmPartition);
+**disk carry** — a fresh materializer instance (fork-per-drain shape)
+logs `[topic.state] loaded topics=64 members=606` and a subsequent
+rebuild emits `carried=true priorTopics=64 priorMembers=606
+action=cursor-only` with ONLY the ~200-byte cursor written
+(change-gate live); the #404 guard live-suppressed a window-poor
+`topics=0` leiden build over the populated active mid-run. THREE
+findings for the flip gate, honestly: (1) `buildLeidenCpmTopicRevision`
+at a 75-day/5,159-visit window burned >12 CPU-minutes without
+completing, three attempts — the served producer's global rebuild is
+minutes-scale at real vault shape, which is the whole case for the
+incremental producer; (2) `SIDETRACK_TOPIC_SUBGRAPH_CAP`'s default 500
+is too tight at real scale (a 4-topic seed's 1-hop boundary is 652
+nodes — the harness ran with 1500); (3) a brand-new page's
+embed-lane → similarity-edge → Tier-A-promotion flow spans multiple
+async sessions and could not be exercised in a single-drain harness
+(`action=update`/`delta>0` growth is pinned by the e2e instead); ALSO:
+the test-vault clone's typed event-store mirror is 257k events behind
+`_BAC/log` — worth an idle-window look, since `SIDETRACK_EVENT_STORE=1`
+consumers there serve a corpus frozen at that watermark.
+
+**Known limitations, honest**: engagement-only drains carry
+`visit:`-prefixed dirty-scope ids that don't match the shadow's
+canonical-url keying (pre-existing, inside the protected file), so a
+requalified-but-never-revisited page joins the carried state on the next
+structural touch, not the same drain — pinned in the e2e. Brand-new
+topic BIRTH in the shadow still depends on the in-materializer edge diff
+(empty under fork-per-drain); with a carried base, growth flows through
+Tier A/B assignment + dirty-topic re-clustering, and leiden-vs-shadow
+divergence is now VISIBLE in the parity marks — which is exactly the
+evidence the flip gate needs, in both directions. On cursor-only cycles
+the legacy slot file lags by revisionId only (workGraphHealth's
+Experiments row; content stays correct).
+
 **2026-08-21 — reachedFromHub structural gating — dangerous-direction
 closure (fix/reached-from-hub).** Task: the pre-existing `reachedFromHub`
 signal in `ranker/learnedAggregatorStats.ts` (PR #373's original opener-chain

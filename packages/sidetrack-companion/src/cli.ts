@@ -1944,6 +1944,9 @@ const runConnectionsRebuildSubcommand = async (
     const { wrapTopicRevisionStoreForProduction } = await import(
       './connections/topicProductionRevival.js'
     );
+    const { createIncrementalTopicStateCarry } = await import(
+      './connections/topicIncrementalStateCarry.js'
+    );
     const { createTopicRevisionStore } = await import('./producers/topic-revision.js');
 
     const replica = await loadOrCreateReplica(vaultPath);
@@ -1956,7 +1959,9 @@ const runConnectionsRebuildSubcommand = async (
       eventLog,
       timelineStore,
       store: connectionsStore,
-      topicRevisionStore: wrapTopicRevisionStoreForProduction(createTopicRevisionStore(vaultPath)),
+      topicRevisionStore: wrapTopicRevisionStoreForProduction(createTopicRevisionStore(vaultPath), {
+        stateCarry: createIncrementalTopicStateCarry(vaultPath),
+      }),
     });
 
     if (!json) {

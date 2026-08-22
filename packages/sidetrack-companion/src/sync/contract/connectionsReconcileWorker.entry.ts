@@ -22,6 +22,7 @@ import { createTimelineStore } from '../../timeline/projection.js';
 import { createConnectionsMaterializer } from './connectionsMaterializer.js';
 import type { ReconcileWorkerJob, ReconcileWorkerResult } from './connectionsReconcileWorker.js';
 import { wrapTopicRevisionStoreForProduction } from '../../connections/topicProductionRevival.js';
+import { createIncrementalTopicStateCarry } from '../../connections/topicIncrementalStateCarry.js';
 import { createTopicRevisionStore } from '../../producers/topic-revision.js';
 
 // W5 — topic production revival (see topicProductionRevival.ts's header).
@@ -51,6 +52,9 @@ const run = async (): Promise<void> => {
       store,
       topicRevisionStore: wrapTopicRevisionStoreForProduction(
         createTopicRevisionStore(job.vaultRoot),
+        // Per-job worker: the carried state is the cross-drain memory
+        // for the incremental shadow. See topicIncrementalStateCarry.ts.
+        { stateCarry: createIncrementalTopicStateCarry(job.vaultRoot) },
       ),
     });
     await materializer.catchUp(eventLog);

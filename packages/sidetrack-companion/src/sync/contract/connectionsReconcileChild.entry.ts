@@ -20,6 +20,7 @@ import { createConnectionsMaterializer } from './connectionsMaterializer.js';
 import type { ReconcileWorkerResult } from './connectionsReconcileWorker.js';
 import { readOwnDiskIoRusage } from '../../process/procRusage.js';
 import { wrapTopicRevisionStoreForProduction } from '../../connections/topicProductionRevival.js';
+import { createIncrementalTopicStateCarry } from '../../connections/topicIncrementalStateCarry.js';
 import { createTopicRevisionStore } from '../../producers/topic-revision.js';
 
 // W5 — topic production revival. This child is the actual WRITER for the
@@ -165,6 +166,10 @@ const run = async (msg: ReconcileMessage): Promise<void> => {
       store,
       topicRevisionStore: wrapTopicRevisionStoreForProduction(
         createTopicRevisionStore(msg.vaultRoot),
+        // Fork-per-drain child: the carried state IS the cross-drain
+        // memory for the incremental shadow (in-process memos die with
+        // this child). See topicIncrementalStateCarry.ts.
+        { stateCarry: createIncrementalTopicStateCarry(msg.vaultRoot) },
       ),
     });
     await materializer.catchUp(eventLog);
